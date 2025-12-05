@@ -1,0 +1,213 @@
+\documentclass[english, a4paper, 11pt]{article}
+\usepackage{graphicx}
+\usepackage{float}
+\usepackage{microtype}
+\usepackage[T1]{fontenc}
+\usepackage[utf8]{inputenc}
+\usepackage{csquotes}
+\usepackage{babel}
+
+\usepackage[bookmarks=true,bookmarksnumbered]{hyperref}
+\hypersetup{
+	pdftitle={SSD - BOTTON Lab2},
+	pdfauthor={BOTTON David },
+	pdfkeywords={SSD, BO},
+	bookmarksnumbered,
+    breaklinks=true,
+    colorlinks=true,
+    linkcolor=blue,
+    citecolor=black,
+    urlcolor=blue,
+}
+
+\usepackage{lmodern}
+\usepackage{amsmath,amssymb,textcomp}
+\usepackage[style=ieee]{biblatex}
+\bibliography{references}
+
+\usepackage{booktabs,caption}
+\captionsetup[table]{skip=1ex}
+
+\usepackage{tikz}
+\graphicspath{{figures/}}
+
+\usepackage{tocloft}
+\renewcommand{\cftsecleader}{\cftdotfill{\cftdotsep}}
+\renewcommand{\cftsecfont}{\bfseries\large}
+\renewcommand{\cftsecpagefont}{\bfseries\large}
+\cftsetindents{section}{1.5em}{3.5em}
+\setlength{\cftbeforesecskip}{8pt}
+
+\usepackage[
+headheight=16mm,
+     bottom=30mm,
+     top=15mm,
+     bottom=20mm,
+    includeheadfoot
+]{geometry}
+
+\usepackage[
+	per-mode=symbol,
+	separate-uncertainty=true,
+]{siunitx}
+
+\usepackage{booktabs}
+\usepackage{caption}
+\captionsetup[table]{skip=1ex}
+
+\usepackage{tikz}
+\usepackage{graphicx}
+\graphicspath{{figures/}}
+
+\usepackage{pgfgantt}
+
+\usepackage{cleveref}
+
+\usepackage{fancyhdr}
+\fancypagestyle{unicamp}{
+\renewcommand{\headrule}{}
+\renewcommand{\footrule}{}
+\fancyhead{}
+\fancyfoot{}
+\fancyhead[C]{\sffamily%
+{\bfseries\fontsize{15.5pt}{1em}\selectfont\uppercase{Free University of Brussels}}\\
+\fontsize{11.3pt}{1.2em}\selectfont\uppercase{Faculty of Sciences}\\
+\uppercase{Master of Cybersecurity \\ 2025-2026}}\\
+\fancyfoot[C]{\sffamily\fontsize{9pt}{1em}\selectfont%
+ULB CP260, 50 F.D. Roosevelt Avenue, 1050 Brussels, Belgium\\
+Tel: +32 (0)2 650 31 46\\
+    }
+}
+
+\pagestyle{plain}
+
+\usepackage{setspace}
+
+\usepackage{listings}  % For code listings
+\usepackage{xcolor}    % For colors (if not already included)
+
+\definecolor{codegreen}{rgb}{0,0.6,0}
+\definecolor{codegray}{rgb}{0.5,0.5,0.5}
+\definecolor{codepurple}{rgb}{0.58,0,0.82}
+\definecolor{codeblue}{rgb}{0,0,1}
+\definecolor{codebg}{rgb}{0.95,0.95,0.95}
+
+\lstset{
+  language=sh,                  % Change from C to sh (for Bash/shell commands)
+  basicstyle=\ttfamily\small,   % Monospace font, small size
+  keywordstyle=\color{codeblue}\bfseries,  % Keywords in bold blue
+  stringstyle=\color{codepurple},          % Strings in purple
+  commentstyle=\color{codegreen}\itshape,  % Comments in italic green
+  identifierstyle=\color{black},           % Identifiers in black
+  morekeywords={if,then,else,fi,for,do,done,while,until,case,esac,break,continue,return,exit,echo,sudo,chmod,gcc,python,angr,pwntools},  % Add Bash-specific keywords (extend as needed for angr/bash commands)
+  sensitive=false,              % Case insensitive
+  numbers=left,                 % Line numbers on left
+  numberstyle=\tiny\color{codegray},  % Small gray line numbers
+  stepnumber=1,                 % Number every line
+  numbersep=5pt,                % Spacing from code
+  backgroundcolor=\color{codebg},  % Light gray background
+  showspaces=false,             % No visible spaces
+  showstringspaces=false,       % No visible string spaces
+  showtabs=false,               % No visible tabs
+  frame=single,                 % Single frame around code
+  rulecolor=\color{black},      % Black frame
+  tabsize=2,                    % Tab size
+  captionpos=b,                 % Caption below
+  breaklines=true,              % Auto break long lines
+  breakatwhitespace=false,      % Break anywhere
+  escapeinside={\%*}{*)},       % Allow LaTeX escapes inside code
+}
+\begin{document}
+
+\thispagestyle{unicamp}
+
+\begin{center}
+
+\null\vfill
+
+{\scshape\large Secure Software Design \& Web Security\par}
+{\scshape\large Computer Project\par}
+
+\vskip 3\baselineskip
+
+{\LARGE\bfseries E2EE Health\par}
+
+\vskip 3\baselineskip
+
+Candidates:\\[1.5ex]
+{\large\bfseries\begin{tabular}{@{}r@{\hspace{1.5em}}l@{}}
+    615056 & BOTTON David \\
+    XXXX & GERDAY Léandre \\
+    XXXX & VARGA Ferenc \\
+
+\\
+\end{tabular}}
+
+
+Advisor:\\[1ex]
+{\large\bfseries Pr. R. Absil\par}
+
+\end{center}
+
+\vfill
+
+\newpage
+
+
+\pagenumbering{arabic}
+\pagestyle{fancy}
+\fancyhf{}
+\renewcommand{\headrulewidth}{0.4pt}
+\fancyfoot[C]{\thepage}
+\clearpage
+\begingroup
+    \hypersetup{linkcolor=black}
+    \tableofcontents
+\endgroup
+\clearpage
+\pagenumbering{arabic}
+\pagestyle{fancy}
+\fancyhead[L]{\sffamily\small SSD -- Computer Project}
+\fancyhead[R]{\sffamily\small Group X}
+\fancyfoot[C]{\thepage}
+\newpage
+
+\section{Secret String in \textit{secret-str}} \label{sec:q1}
+
+I extract human readable text from the binary using a simple \hyperref[lst:A1_strings_command]{command} and discover the secret string. 
+
+\section{Stack Smashing Protection in a Code Snippet} \label{sec:q2}
+
+The code provided implements a stack canary mechanism using the guard and secret variables 
+to detect buffer overflows by verifying the integrity of guard. This mechanism can be bypassed in two 
+ways: 
+
+1. \texttt{Information Leak}: 
+
+2. \texttt{Brute Forcing}: 
+
+
+\appendix
+\addtocontents{toc}{\protect\vspace{10pt}\noindent\hrulefill\par\vspace{10pt}}
+
+\clearpage
+\section{A1 Additional Material} \label{annex:q1}
+\begin{lstlisting}[caption={Command solving Q1}, label={lst:A1_strings_command}]
+strings secret-str | grep -i secret
+\end{lstlisting}
+
+% \begin{figure}[H]
+% % \centering
+% %     \includegraphics[width=1\linewidth]{figures/A1_strings_output.png}
+% %     \caption{Secret String Q1}
+% %     \label{fig:A1_secret_string}
+% % \end{figure}
+
+% \hyperref[sec:q1]{Back to X}
+% \clearpage
+
+
+
+\printbibliography
+
+\end{document}
