@@ -1,3 +1,5 @@
+'use client'
+
 import { useState } from 'react'
 import { createFileRoute, useNavigate } from '@tanstack/react-router'
 import { Button } from '@/components/ui/button'
@@ -6,7 +8,9 @@ import { Label } from '@/components/ui/label'
 import { RadioGroup, RadioGroupItem } from '@/components/ui/radio-group'
 import { Card, CardContent, CardDescription, CardFooter, CardHeader, CardTitle } from '@/components/ui/card'
 import { Alert, AlertDescription } from '@/components/ui/alert'
-import { Shield, User, Stethoscope } from 'lucide-react'
+import { Loader2, Shield, User, Stethoscope, Fingerprint } from 'lucide-react'
+import { startRegistration } from '@simplewebauthn/browser'
+import { encode } from 'cbor-x'
 
 export const Route = createFileRoute('/register')({
   component: RegisterPage,
@@ -17,41 +21,69 @@ function RegisterPage() {
   const [userType, setUserType] = useState<'patient' | 'doctor'>('patient')
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState<string | null>(null)
+  const [webauthnStarted, setWebauthnStarted] = useState(false)
 
   const handleSubmit = async (e: React.FormEvent<HTMLFormElement>) => {
     e.preventDefault()
+    if (loading) return
+
     setLoading(true)
     setError(null)
-    
+
     const formData = new FormData(e.currentTarget)
-    const data = {
-      userType,
-      firstName: formData.get('firstName'),
-      lastName: formData.get('lastName'),
-      dateOfBirth: userType === 'patient' ? formData.get('dateOfBirth') : undefined,
-      medicalOrganization: userType === 'doctor' ? formData.get('medicalOrganization') : undefined,
+
+    const payload = {
+      email: (formData.get('email') as string).trim().toLowerCase(),
+      first_name: formData.get('firstName') as string,
+      last_name: formData.get('lastName') as string,
+      type: userType,
+      ...(userType === 'patient' && { date_of_birth: formData.get('dateOfBirth') as string }),
+      ...(userType === 'doctor' && { medical_organization: formData.get('medicalOrganization') as string }),
     }
 
     try {
-      // TODO: Replace with WebAuthn registration flow
-      // This is a placeholder for the WebAuthn + PRF flow
-      console.log('Registration data (will be secured with WebAuthn + PRF):', data)
-      
-      // Simulate API call
-      await new Promise(resolve => setTimeout(resolve, 1000))
-      
-      alert('Registration submitted. WebAuthn + PRF flow will be implemented here.')
-      navigate({ to: '/login' })
+      // 1. Start registration on server
+      const startResp = await fetch('/api/webauthn/register/start/', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/cbor' },
+        body: encode(payload),
+      })
+
+      if (!startResp.ok) {
+        const err = await startResp.json()
+        throw new Error(err.error || 'Server error during registration start')
+      }
+
+      const options = await startResp.json()
+
+      // 2. Show WebAuthn prompt
+      setWebauthnStarted(true)
+
+      // 2. Trigger device prompt
+      const credential = await startRegistration(options)
+
+      // 3. Finish registration
+      const finishResp = await fetch('/api/webauthn/register/finish/', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/cbor' },
+        body: encode(credential),
+      })
+
+      if (!finishResp.ok) {
+        const err = await finishResp.json()
+        throw new Error(err.error || 'Registration failed on server')
+      }
+
+      // Success!
+      alert('🎉 Successfully registered and logged in with passkey!')
+      navigate({ to: '/' })
     } catch (err) {
+      console.error(err)
       setError(err instanceof Error ? err.message : 'Registration failed')
+      setWebauthnStarted(false)
     } finally {
       setLoading(false)
     }
-  }
-
-  const initiateWebAuthn = async () => {
-    // TODO: Implement actual WebAuthn registration
-    alert('WebAuthn registration will be implemented here')
   }
 
   return (
@@ -66,7 +98,7 @@ function RegisterPage() {
             Secure medical records access with WebAuthn authentication
           </CardDescription>
         </CardHeader>
-        
+
         <form onSubmit={handleSubmit}>
           <CardContent className="space-y-6">
             {error && (
@@ -74,6 +106,19 @@ function RegisterPage() {
                 <AlertDescription>{error}</AlertDescription>
               </Alert>
             )}
+
+            {/* Email */}
+            <div className="space-y-2">
+              <Label htmlFor="email">Email Address *</Label>
+              <Input
+                id="email"
+                name="email"
+                type="email"
+                required
+                placeholder={userType === 'doctor' ? 'doctor@hospital.com' : 'patient@example.com'}
+                autoComplete="email"
+              />
+            </div>
 
             {/* User Type Selection */}
             <div className="space-y-4">
@@ -163,53 +208,48 @@ function RegisterPage() {
               </div>
             )}
 
-            {/* WebAuthn Section */}
-            <div className="pt-4 border-t">
-              <div className="space-y-3">
-                <div className="flex items-center space-x-2">
-                  <div className="flex-shrink-0 w-2 h-2 rounded-full bg-green-500"></div>
-                  <span className="text-sm font-medium">WebAuthn Authentication</span>
-                </div>
-                <p className="text-xs text-muted-foreground">
-                  Your credentials will be secured using WebAuthn with PRF extension. 
-                  No passwords are stored on the server.
-                </p>
-                <Button
-                  type="button"
-                  variant="outline"
-                  onClick={initiateWebAuthn}
-                  className="w-full"
-                >
-                  Register Security Key / Biometric
-                </Button>
-              </div>
-            </div>
+            {/* WebAuthn Status */}
+            {webauthnStarted && (
+              <Alert className="bg-blue-50 border-blue-200 animate-pulse">
+                <Fingerprint className="h-4 w-4" />
+                <AlertDescription>
+                  Waiting for your device… Use Face ID, Touch ID, Windows Hello, or security key
+                </AlertDescription>
+              </Alert>
+            )}
 
             {/* Security Notice */}
             <Alert className="bg-amber-50 border-amber-200">
               <AlertDescription className="text-xs text-amber-800">
-                <strong>Security Notice:</strong> All sensitive data is encrypted client-side before transmission. 
+                <strong>Security Notice:</strong> All sensitive data is encrypted client-side before transmission.
                 The server never receives plaintext medical information or authentication secrets.
               </AlertDescription>
             </Alert>
           </CardContent>
 
-          <CardFooter className="flex-col space-y-4">
-            <Button 
-              type="submit" 
-              className="w-full"
-              disabled={loading}
-            >
-              {loading ? 'Securing Registration...' : 'Complete Secure Registration'}
-            </Button>
-            
-            <div className="text-center text-sm text-muted-foreground">
-              Already have an account?{' '}
-              <a href="/login" className="text-blue-600 hover:text-blue-500 font-medium">
-                Sign in with WebAuthn
-              </a>
-            </div>
-          </CardFooter>
+            <CardFooter className="flex-col space-y-4">
+              <Button
+                type="submit"
+                className="w-full h-12 text-base font-medium"
+                disabled={loading}
+              >
+                {loading ? (
+                  <>
+                    <Loader2 className="mr-3 h-5 w-5 animate-spin" />
+                    {webauthnStarted ? 'Waiting for your device…' : 'Preparing secure registration...'}
+                  </>
+                ) : (
+                  'Complete Secure Registration'
+                )}
+              </Button>
+
+              <div className="text-center text-sm text-muted-foreground">
+                Already have an account?{' '}
+                <a href="/login" className="text-blue-600 hover:text-blue-500 font-medium">
+                  Sign in with WebAuthn
+                </a>
+              </div>
+            </CardFooter>
         </form>
       </Card>
     </div>
