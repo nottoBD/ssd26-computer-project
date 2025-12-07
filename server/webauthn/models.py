@@ -14,15 +14,18 @@ class WebAuthnCredential(models.Model):
     transports = models.JSONField(default=list, blank=True)
     name = models.CharField(max_length=100, default="My device")
     prf_enabled = models.BooleanField(default=False)
-
     created_at = models.DateTimeField(auto_now_add=True)
 
-    def credential_id_b64(self):
-        return base64.b64encode(self.credential_id).decode()
+    class Meta:
+            verbose_name = "WebAuthn Credential"
+            verbose_name_plural = "WebAuthn Credentials"
 
     def __str__(self):
-        return f"{self.user.email} – {self.name}"
+        return f"{self.user.email} – {self.name} ({'PRF' if self.prf_enabled else 'no PRF'})"
 
     def get_credential_data(self):
-        from fido2.webauthn import AttestedCredentialData
-        return AttestedCredentialData(self.credential_id, self.public_key, self.sign_count)
+        return AttestedCredentialData(
+            self.credential_id,
+            self.public_key,
+            self.sign_count,
+        )

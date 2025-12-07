@@ -1,5 +1,10 @@
 from django.urls import path
-from .views import StartRegistration, FinishRegistration
+from .views import (
+    StartRegistration,
+    FinishRegistration,
+    StartAuthentication,
+    FinishAuthentication,
+)
 
 urlpatterns = [
     path("register/start/", StartRegistration.as_view(), name="webauthn_register_start"),

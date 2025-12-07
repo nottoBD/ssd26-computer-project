@@ -7,7 +7,6 @@ import { Card, CardContent, CardDescription, CardFooter, CardHeader, CardTitle }
 import { Alert, AlertDescription } from '@/components/ui/alert'
 import { Shield, Fingerprint, Loader2 } from 'lucide-react'
 import { startAuthentication } from '@simplewebauthn/browser'
-import { decode } from 'cbor-x'
 
 export const Route = createFileRoute('/login')({
   component: LoginPage,
@@ -46,8 +45,8 @@ function LoginPage() {
       // Step 3: Send back to server
       const finishResp = await fetch('/api/webauthn/login/finish/', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/cbor' },
-        body: encode(credential),
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(credential),
       })
 
       const result = await finishResp.json()
