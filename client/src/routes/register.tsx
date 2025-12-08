@@ -25,6 +25,7 @@ function RegisterPage() {
     
     const formData = new FormData(e.currentTarget)
     const data = {
+      email: (formData.get("email") as string).trim().toLowerCase(),
       userType,
       firstName: formData.get('firstName'),
       lastName: formData.get('lastName'),
@@ -104,6 +105,23 @@ function RegisterPage() {
                   </Label>
                 </div>
               </RadioGroup>
+            </div>
+
+            {/* Email */}
+            <div className="space-y-2">
+              <Label htmlFor="email">Email Address *</Label>
+              <Input
+                id="email"
+                name="email"
+                type="email"
+                required
+                placeholder={
+                  userType === "doctor"
+                    ? "doctor@hospital.com"
+                    : "patient@example.com"
+                }
+                autoComplete="email"
+              />
             </div>
 
             {/* Common Fields */}
