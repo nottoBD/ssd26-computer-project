@@ -1,6 +1,8 @@
 from django.db import models
 from django.conf import settings
 import base64
+from fido2.webauthn import AttestedCredentialData
+import cbor2
 
 class WebAuthnCredential(models.Model):
     user = models.ForeignKey(
@@ -24,8 +26,14 @@ class WebAuthnCredential(models.Model):
         return f"{self.user.email} – {self.name} ({'PRF' if self.prf_enabled else 'no PRF'})"
 
     def get_credential_data(self):
-        return AttestedCredentialData(
+        """
+        Return a proper AttestedCredentialData object using the create() factory
+        This is the only correct way when attestation="none" (aaguid is ignored by the lib anyway)
+        We store the public key CBOR-encoded to keep it as compact bytes in BinaryField
+        """
+        import cbor2
+        return AttestedCredentialData.create(
+            b"\x00" * 16,
             self.credential_id,
-            self.public_key,
-            self.sign_count,
+            cbor2.loads(self.public_key),
         )

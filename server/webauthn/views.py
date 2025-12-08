@@ -8,16 +8,22 @@ from django.views.decorators.csrf import csrf_exempt
 from django.utils.decorators import method_decorator
 from django.contrib.auth import login
 
-from fido2.webauthn import PublicKeyCredentialRpEntity, AttestedCredentialData, CollectedClientData, AttestationObject
+from fido2.webauthn import PublicKeyCredentialRpEntity, AttestedCredentialData, CollectedClientData, AttestationObject, AuthenticatorData
 from fido2.server import Fido2Server
 from fido2 import cbor
 from fido2.utils import websafe_encode, websafe_decode
-
+import cbor2
+from hashlib import sha512
 from accounts.models import User, PatientRecord
 from .models import WebAuthnCredential
 
-rp = PublicKeyCredentialRpEntity(id="localhost", name="HealthSecure Project")
+# Using sha512 of a unique string → always the same salts → same PRF output on every device for the same credential
+ # This guarantees stable KEK across sessions and synced devices (Apple/Google/1Password/Bitwarden all sync the PRF secret)
+ # Using two salts + XOR = maximum compatibility (Apple sometimes only returns one, but XOR still works if both present)
+PRF_SALT_FIRST = sha512(b"HealthSecure Project - PRF salt v1 - first").digest()
+PRF_SALT_SECOND = sha512(b"HealthSecure Project - PRF salt v1 - second").digest()
 
+rp = PublicKeyCredentialRpEntity(id="healthsecure.local", name="HealthSecure Project")
 server = Fido2Server(rp, attestation="none")
 
 def to_serializable(obj):
@@ -97,15 +103,14 @@ class FinishRegistration(View):
         client_data = CollectedClientData(client_data_json)
         att_obj = AttestationObject(attestation_object)
 
-        auth_data = server.register_complete(state, client_data, att_obj)
-
+        auth_data = server.register_complete(state, client_data, att_obj)  # returns AuthenticatorData in fido2==1.1.3
         prf_enabled = response.get("clientExtensionResults", {}).get("prf", {}).get("enabled", False)
 
         WebAuthnCredential.objects.create(
             user=user,
             credential_id=auth_data.credential_data.credential_id,
-            public_key=auth_data.credential_data.public_key,
-            sign_count=auth_data.credential_data.sign_count,
+            public_key=cbor2.dumps(auth_data.credential_data.public_key),  # COSE key dict to CBOR bytes
+            sign_count=auth_data.counter,  # fido2 1.1.3
             transports=response.get("transports", []),
             prf_enabled=prf_enabled,
         )
@@ -126,7 +131,8 @@ class StartAuthentication(View):
         options, state = server.authenticate_begin(
             credentials=[],  # discoverable/resident keys
             user_verification="preferred",
-            extensions={"prf": {"eval": {"first": b"\x00" * 32}}},
+            # 2 salts required by APPLE
+            extensions={"prf": {"eval": {"first": PRF_SALT_FIRST, "second": PRF_SALT_SECOND}}},
         )
 
         pk_options = dict(options.public_key)
@@ -149,32 +155,47 @@ class FinishAuthentication(View):
         client_data_json = websafe_decode(response["response"]["clientDataJSON"])
         authenticator_data = websafe_decode(response["response"]["authenticatorData"])
         signature = websafe_decode(response["response"]["signature"])
-
         client_data = CollectedClientData(client_data_json)
+        authenticator_data_obj = AuthenticatorData(authenticator_data)  # required for fido2 ≤1.1.x
 
-        server.authenticate_complete(
+        auth_data = server.authenticate_complete(
             state,
             [credential.get_credential_data()],
             credential_id,
-            client_data.hash,
-            authenticator_data,
+            client_data,
+            authenticator_data_obj,
             signature,
         )
 
-        # sign count
-        credential.sign_count = auth_data.sign_count
+
+        # ----- Sign count check – protect against cloned authenticators -----
+        if auth_data.counter != 0 and auth_data.counter <= credential.sign_count:
+            raise ValueError("Possible cloned authenticator detected (sign count did not increase)")
+        credential.sign_count = auth_data.counter
         credential.save()
 
-        # PRF result
-        prf_hex = None
+        # ----- PRF extension results (multi-device ready KEK) -----
         ext_results = response.get("clientExtensionResults", {}).get("prf", {}).get("results", {})
-        if "first" in ext_results:
-            prf_hex = urlsafe_b64decode(ext_results["first"] + "==").hex()
+        prf_first = ext_results.get("first")
+        prf_second = ext_results.get("second")
+
+        if prf_first and prf_second:
+            # Apple/Google compatible XOR both values for maximum entropy
+            prf_bytes = bytes(a ^ b for a, b in zip(prf_first, prf_second))
+        elif prf_first:
+            prf_bytes = prf_first
+        elif prf_second:
+            prf_bytes = prf_second
+        else:
+            prf_bytes = None  # fallback to no KEK on very old authenticators
+
+
+        prf_hex = prf_bytes.hex() if prf_bytes else None
 
         login(request, credential.user)
         request.session.flush()
 
         return JsonResponse({
             "status": "OK",
-            "prf_hex": prf_hex or None,
+            "prf_hex": prf_hex, # used to derive/store encrypted X25519 key
         })

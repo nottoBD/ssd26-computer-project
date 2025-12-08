@@ -1,103 +1,38 @@
-# 1. First time
-something along the lines, adapt to your OS
-```
-git clone https://github.com/nottoBD/ssd26-computer-project.git
-cd ssd26-computer-project
-copy .env.example .env      # Windows
-pip install uv && uv --version
-cd server
-sudo rm -rf .venv           # Linux
-uv venv .venv
-source .venv/bin/activate   # Bash
-uv sync
-cd ../client
-npm install -g corepack@latest
-corepack enable pnpm
-corepack prepare pnpm@latest --activate
+# WebAuthn Login & Register System
+
+[See basic commands in skeleton-index README](https://github.com/nottoBD/ssd26-computer-project/blob/skeleton-index/README.md)
+
+## Prerequisites
+
+**Important**: Password managers (like Bitwarden) refuse to create passkeys for `localhost` due to security reasons. You must configure a local domain for testing.
+
+### Step 1: Configure Local Domain
+Add this entry to your `/etc/hosts` file:
+
+```bash
+# Static table lookup for hostnames
+# See hosts(5) for details
+127.0.0.1        healthsecure.local
+::1              localhost
 ```
 
-# 2. Start
-```
-docker compose up --build
-```
+## Access Registration
 
-# 3. Stop everything
-```
-docker compose down
-```
+Navigate to: https://healthsecure.local/register
 
-# 4. Full reset 
-(database + volumes) after model changes
-```
-docker compose down -v
-```
+**Note**: While `https://localhost` remains accessible, passkey registration and login will not function through this address.
 
-# 5. Rebuild only backend only 
-(after adding Python packages or model changes)
-```
-docker compose build server
-docker compose up server
-```
+## Current Status
 
-# 6. Rebuild frontend only 
-(after adding shadcn components, tailwind, etc.)
-```
-docker compose build client
-docker compose up client
-```
+### ✅ Registration
+- Fully functional with passkeys when using `healthsecure.local`
+- Bitwarden example: https://pasteboard.co/ggYuNqiRSJFM.png
 
-# 7. Enter backend container 
-(for migrations, superuser, shell…)
-```
-docker compose exec server bash
-```
+### ⚠️ Login
+- Currently minor FIDO2-related issues
+- To address actively!
 
-# Inside the container Django commands
-```
-uv run python manage.py migrate
-uv run python manage.py makemigrations
-uv run python manage.py createsuperuser
-uv run python manage.py shell
-uv run python manage.py test
-```
+## Future Integration
+- Full PKI implementation will follow after resolving login & multi-device access
+- This will eliminate the need for `/etc/hosts` modification
 
-# 8. Add/remove Python packages 
-(inside backend container OR on host)
-```
-uv add django-cors-headers
-uv add djangorestframework
-uv add fido2
-uv add --dev black ruff
-uv remove some-package
-```
-
-# 9. Frontend packages 
-(from client/ folder)
-```
-cd client
-pnpm add zod @tanstack/react-query axios
-pnpm add -D @types/node
-npx shadcn@latest add dialog sheet toast dropdown-menu avatar badge
-```
-
-# 10. Prune everything 
-when Docker gets too fat
-```
-docker system prune -a --volumes
-docker builder prune -f
-docker volume prune -f
-```
-
-# 11. View logs 
-for specific service
-```
-docker compose logs -f server
-docker compose logs -f client
-docker compose logs -f db
-```
-
-# 12. One-liner 
-to nuke everything and start fresh
-```
-docker compose down -v && docker system prune -f --volumes && docker compose up --build
-```
