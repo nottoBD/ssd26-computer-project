@@ -156,7 +156,9 @@ class FinishAuthentication(View):
         authenticator_data = websafe_decode(response["response"]["authenticatorData"])
         signature = websafe_decode(response["response"]["signature"])
         client_data = CollectedClientData(client_data_json)
-        authenticator_data_obj = AuthenticatorData(authenticator_data)  # required for fido2 ≤1.1.x
+        authenticator_data_obj = AuthenticatorData(authenticator_data)
+        #print(f"Counter brut: {authenticator_data_obj.counter}")
+        #print(f"Counter stocké en DB: {credential.sign_count}")
 
         auth_data = server.authenticate_complete(
             state,
@@ -165,13 +167,16 @@ class FinishAuthentication(View):
             client_data,
             authenticator_data_obj,
             signature,
-        )
+            )
 
 
         # ----- Sign count check – protect against cloned authenticators -----
-        if auth_data.counter != 0 and auth_data.counter <= credential.sign_count:
+        # Most of password managers let count to 0 https://github.com/bitwarden/clients/pull/8024#top
+        # Hardware key like yubikey use the counter
+        # auth_date does not countains a counter attribut but the authenticator_data_obj does
+        if authenticator_data_obj.counter != 0 and authenticator_data_obj.counter <= credential.sign_count:
             raise ValueError("Possible cloned authenticator detected (sign count did not increase)")
-        credential.sign_count = auth_data.counter
+        credential.sign_count = authenticator_data_obj.counter
         credential.save()
 
         # ----- PRF extension results (multi-device ready KEK) -----
