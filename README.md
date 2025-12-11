@@ -24,13 +24,16 @@ Navigate to: https://healthsecure.local/register
 
 ## Current Status
 
-### ✅ Registration
+### ✅ Login & Registration
 - Fully functional with passkeys when using `healthsecure.local`
 - Bitwarden example: https://pasteboard.co/ggYuNqiRSJFM.png
+- Any additional device can login with a password manager
+- No password
+- No account recovery
+- No multidevice with primary/secondary system (yet!)
 
-### ⚠️ Login
-- Currently minor FIDO2-related issues
-- To address actively!
+### Current Issues
+- Must fix dependency problems client's CryptoUtils.ts and vite.config.ts...
 
 ## Future Integration
 - Full PKI implementation will follow after resolving login & multi-device access

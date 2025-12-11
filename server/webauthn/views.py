@@ -13,15 +13,15 @@ from fido2.server import Fido2Server
 from fido2 import cbor
 from fido2.utils import websafe_encode, websafe_decode
 import cbor2
-from hashlib import sha512
+from hashlib import sha256
 from accounts.models import User, PatientRecord
 from .models import WebAuthnCredential
 
-# Using sha512 of a unique string → always the same salts → same PRF output on every device for the same credential
+# Using sha256 of a unique string → always the same salts → same PRF output on every device for the same credential
  # This guarantees stable KEK across sessions and synced devices (Apple/Google/1Password/Bitwarden all sync the PRF secret)
  # Using two salts + XOR = maximum compatibility (Apple sometimes only returns one, but XOR still works if both present)
-PRF_SALT_FIRST = sha512(b"HealthSecure Project - PRF salt v1 - first").digest()
-PRF_SALT_SECOND = sha512(b"HealthSecure Project - PRF salt v1 - second").digest()
+PRF_SALT_FIRST = sha256(b"HealthSecure Project - PRF salt v1 - first").digest()
+PRF_SALT_SECOND = sha256(b"HealthSecure Project - PRF salt v1 - second").digest()
 
 rp = PublicKeyCredentialRpEntity(id="healthsecure.local", name="HealthSecure Project")
 server = Fido2Server(rp, attestation="none")
@@ -67,7 +67,7 @@ class StartRegistration(View):
                 "displayName": f"{user.first_name} {user.last_name}",
             },
             credentials=[],
-            user_verification="preferred",
+            user_verification="required",
         )
 
         # discoverable credential
@@ -76,7 +76,7 @@ class StartRegistration(View):
         pk_options["authenticatorSelection"] = {
             "requireResidentKey": True,
             "residentKey": "required",
-            "userVerification": "preferred",
+            "userVerification": "required",
         }
         pk_options["extensions"] = {"prf": {}}
 
@@ -110,6 +110,7 @@ class FinishRegistration(View):
             user=user,
             credential_id=auth_data.credential_data.credential_id,
             public_key=cbor2.dumps(auth_data.credential_data.public_key),  # COSE key dict to CBOR bytes
+            name=data.get('device_name', 'Unnamed Device'),
             sign_count=auth_data.counter,  # fido2 1.1.3
             transports=response.get("transports", []),
             prf_enabled=prf_enabled,
@@ -119,7 +120,8 @@ class FinishRegistration(View):
         user.save()
         login(request, user)
 
-        request.session.flush()
+        del request.session["reg_state"]
+        del request.session["reg_user_id"]
 
         return JsonResponse({"status": "OK", "prf_enabled": prf_enabled})
 
@@ -130,7 +132,7 @@ class StartAuthentication(View):
         # Discoverable credentials only (no email needed)
         options, state = server.authenticate_begin(
             credentials=[],  # discoverable/resident keys
-            user_verification="preferred",
+            user_verification="required",
             # 2 salts required by APPLE
             extensions={"prf": {"eval": {"first": PRF_SALT_FIRST, "second": PRF_SALT_SECOND}}},
         )
@@ -169,11 +171,14 @@ class FinishAuthentication(View):
             signature,
             )
 
+        if not authenticator_data_obj.is_user_verified:
+                    raise ValueError("User verification required")
 
         # ----- Sign count check – protect against cloned authenticators -----
         # Most of password managers let count to 0 https://github.com/bitwarden/clients/pull/8024#top
         # Hardware key like yubikey use the counter
         # auth_date does not countains a counter attribut but the authenticator_data_obj does
+        # # TODO: add logging for anomalies
         if authenticator_data_obj.counter != 0 and authenticator_data_obj.counter <= credential.sign_count:
             raise ValueError("Possible cloned authenticator detected (sign count did not increase)")
         credential.sign_count = authenticator_data_obj.counter
@@ -198,7 +203,7 @@ class FinishAuthentication(View):
         prf_hex = prf_bytes.hex() if prf_bytes else None
 
         login(request, credential.user)
-        request.session.flush()
+        del request.session["auth_state"]
 
         return JsonResponse({
             "status": "OK",

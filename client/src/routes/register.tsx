@@ -49,6 +49,7 @@ function RegisterPage() {
         userType === "doctor"
           ? (formData.get("medicalOrganization") as string)
           : "",
+      device_name: (formData.get("deviceName") as string) || "",
     };
 
     try {
@@ -238,6 +239,15 @@ function RegisterPage() {
                 </div>
               </div>
             )}
+
+            <div className="space-y-2">
+              <Label htmlFor="deviceName">Device Name (optional)</Label>
+              <Input
+                id="deviceName"
+                name="deviceName"
+                placeholder="e.g., My iPhone"
+              />
+            </div>
 
             {/* WebAuthn Status */}
             {webauthnStarted && (

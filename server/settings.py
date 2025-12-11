@@ -20,8 +20,7 @@ INSTALLED_APPS = [
     "django.contrib.sessions",
     "django.contrib.messages",
     "django.contrib.staticfiles",
-    
-    # Third party
+    # 3rd party
     "rest_framework",
     "corsheaders",
     "accounts",
@@ -41,7 +40,6 @@ MIDDLEWARE = [
 
 ROOT_URLCONF = "urls"
 
-# Database
 DATABASES = {
     'default': dj_database_url.config(
         default=f"sqlite:///{BASE_DIR / 'db.sqlite3'}"
@@ -74,6 +72,25 @@ TEMPLATES = [
 # CORS (dev only)
 CORS_ALLOW_ALL_ORIGINS = True
 
-# Static files
+CSRF_COOKIE_SECURE = True
+
+CSRF_COOKIE_HTTPONLY = True
+
 STATIC_URL = "static/"
 
+LOGGING = {
+    'version': 1,
+    'loggers': {
+        'metadata': {
+            'handlers': ['file'],
+            'level': 'INFO',
+        },
+    },
+    'handlers': {
+        'file': {
+            'level': 'INFO',
+            'class': 'logging.FileHandler',
+            'filename': 'metadata.log',
+        },
+    },
+}

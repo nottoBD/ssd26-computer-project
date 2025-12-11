@@ -41,6 +41,12 @@ class User(AbstractBaseUser, PermissionsMixin):
     is_staff = models.BooleanField(default=False)  # for admin access
     date_joined = models.DateTimeField(default=timezone.now)
 
+# Encryption keys for E2EE (X25519)
+#   # 32 bytes X25519 public key
+    encryption_public_key = models.BinaryField(null=True, blank=True)
+  # AES-KEK encrypted 32 bytes X25519 private key
+    encrypted_encryption_private = models.BinaryField(null=True, blank=True)
+
     objects = UserManager()
 
     USERNAME_FIELD = "email"
@@ -54,8 +60,12 @@ class PatientRecord(models.Model):
     patient = models.OneToOneField(
         User, on_delete=models.CASCADE, related_name="medical_record"
     )
-    # Temporary clear-text JSON field 
-    data = models.JSONField(default=dict, blank=True)
+    # AES-GCM encrypted record (JSON serialized)
+    encrypted_data = models.BinaryField(null=True, blank=True)
+  # {user_id: hex(ECDH encrypted DEK)}
+    encrypted_deks = models.JSONField(default=dict)
+  # Ed25519 signature of encrypted_data
+    record_signature = models.BinaryField(null=True, blank=True)
 
     def __str__(self):
         return f"Record of {self.patient.email}"

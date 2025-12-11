@@ -385,6 +385,7 @@ version = "0.1.0"
 source = { virtual = "." }
 dependencies = [
     { name = "cbor2" },
+    { name = "cryptography" },
     { name = "dj-database-url" },
     { name = "django" },
     { name = "django-cors-headers" },
@@ -404,6 +405,7 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "cbor2", specifier = ">=5.7.1" },
+    { name = "cryptography", specifier = ">=44.0.3" },
     { name = "dj-database-url", specifier = ">=3.0.1" },
     { name = "django", specifier = ">=6.0" },
     { name = "django-cors-headers", specifier = ">=4.9.0" },
