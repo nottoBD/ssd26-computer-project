@@ -82,6 +82,7 @@ class StartRegistration(View):
 
         request.session["reg_state"] = state
         request.session["reg_user_id"] = str(user.id)
+        request.session["reg_device_name"] = data.get("device_name", "")
 
         return JsonResponse(to_serializable(pk_options))
 
@@ -110,7 +111,7 @@ class FinishRegistration(View):
             user=user,
             credential_id=auth_data.credential_data.credential_id,
             public_key=cbor2.dumps(auth_data.credential_data.public_key),  # COSE key dict to CBOR bytes
-            name=data.get('device_name', 'Unnamed Device'),
+            name=request.session.get('reg_device_name', 'Unnamed Device'),
             sign_count=auth_data.counter,  # fido2 1.1.3
             transports=response.get("transports", []),
             prf_enabled=prf_enabled,
@@ -122,6 +123,7 @@ class FinishRegistration(View):
 
         del request.session["reg_state"]
         del request.session["reg_user_id"]
+        del request.session["reg_device_name"]
 
         return JsonResponse({"status": "OK", "prf_enabled": prf_enabled})
 

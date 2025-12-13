@@ -23,12 +23,6 @@ export default defineConfig({
   resolve: {
     alias: {
       "@": path.resolve(__dirname, "./src"),
-      "@noble/curves/ed25519": "@noble/curves/ed25519.js",
-      "@noble/curves/x25519": "@noble/curves/x25519.js",
     },
-  },
-
-  optimizeDeps: {
-    include: ["@noble/hashes/sha256"],
   },
 });

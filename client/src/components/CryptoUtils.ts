@@ -1,9 +1,8 @@
-import { ed25519 } from "@noble/curves";
-import { x25519 } from "@noble/curves";
+import { ed25519, x25519 } from "@noble/curves/ed25519.js";
 import { GCM } from "@stablelib/gcm";
 import { randomBytes } from "@stablelib/random";
-import { hkdf } from "@stablelib/hkdf";
-import * as hashes from "@noble/hashes";
+import { HKDF } from "@stablelib/hkdf";
+import { sha256 } from "@noble/hashes/sha256";
 
 export async function deriveKEK(prfBytes: Uint8Array): Promise<Uint8Array> {
   // return type raw for GCM
