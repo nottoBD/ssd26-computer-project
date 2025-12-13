@@ -12,7 +12,7 @@ import {
   CardTitle,
 } from "@/components/ui/card";
 import { Alert, AlertDescription } from "@/components/ui/alert";
-import { Shield, Fingerprint, Loader2 } from "lucide-react";
+import { Shield, Fingerprint, Loader2, AlertTriangle } from "lucide-react";
 import { startAuthentication } from "@simplewebauthn/browser";
 import {
   deriveKEK,
@@ -68,9 +68,12 @@ function LoginPage() {
 
       if (!finishResp.ok)
         throw new Error(result.error || "Authentication failed");
+      
+      //INFO: Update local last login time for anomaly detection in settings
+      localStorage.setItem('last_login_time', new Date().toISOString());
 
-      // PRF SUCCESS KEK AVAILABLE IN MEMORY
-      if (result.prf_available && result.prf_hex) {
+      // // PRF SUCCESS KEK AVAILABLE IN MEMORY
+      if (result.prf_hex) {
         const prfBytes = Uint8Array.from(
           result.prf_hex.match(/.{1,2}/g)!.map((byte) => parseInt(byte, 16)),
         );
@@ -123,14 +126,17 @@ function LoginPage() {
 
         console.log("✅ PRF KEK derived and ready for encryption");
       }
-
+      
       navigate({ to: "/" });
     } catch (err: any) {
       console.error(err);
-      setError(
-        err.message ||
-          "Authentication failed — try another device or register first",
-      );
+      let errorMsg = err.message || "Authentication failed - try another device or register first";
+      
+      //INFO: Handling for clone/anomaly errors
+      if (errorMsg.includes("cloned authenticator")) {
+        errorMsg = "Possible cloned device detected! Check your activity in settings and contact support if suspicious.";
+      }
+      setError(errorMsg);
       setStage("prompt");
     } finally {
       setLoading(false);
@@ -155,6 +161,7 @@ function LoginPage() {
         <CardContent className="space-y-6">
           {error && (
             <Alert variant="destructive">
+              <AlertTriangle className="h-4 w-4" /> {/* Primary/Secondary Alerts */}
               <AlertDescription>{error}</AlertDescription>
             </Alert>
           )}

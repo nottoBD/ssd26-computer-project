@@ -18,6 +18,11 @@ class WebAuthnCredential(models.Model):
     prf_enabled = models.BooleanField(default=False)
     created_at = models.DateTimeField(auto_now_add=True)
 
+    # Handling primary/secondary, CDA approval, anomaly log detection (bc no sign_count)
+    aaguid = models.BinaryField(null=True, blank=True)
+    is_primary = models.BooleanField(default=False)
+    supports_sign_count = models.BooleanField(default=False) # Detects if sign counter increments
+
     class Meta:
             verbose_name = "WebAuthn Credential"
             verbose_name_plural = "WebAuthn Credentials"

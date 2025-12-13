@@ -1,9 +1,64 @@
-import { createRootRoute, Link, Outlet } from '@tanstack/react-router'
+import { createRootRoute, Link, Outlet, useNavigate } from '@tanstack/react-router'
 import { Button } from '@/components/ui/button'
-import { Shield, User, Stethoscope } from 'lucide-react'
+import { Shield, User, Stethoscope, Settings, LogOut as LogOutIcon } from 'lucide-react'
+import { useState, useEffect } from 'react'
 
 export const Route = createRootRoute({
-  component: () => (
+component: () => {
+    const navigate = useNavigate()
+    const [isAuthenticated, setIsAuthenticated] = useState(false)
+    const [loading, setLoading] = useState(true)
+
+    useEffect(() => {
+      checkAuth()
+    }, [])
+
+    const getCsrfToken = () => {
+      const match = document.cookie.match(new RegExp('(^| )csrftoken=([^;]+)'))
+      return match ? match[2] : ''
+    }
+
+    const checkAuth = async () => {
+      try {
+        const response = await fetch('/api/auth/status/', {
+          method: 'GET',
+          credentials: 'include',
+        })
+        if (!response.ok) {
+          setIsAuthenticated(false)
+          return
+        }
+        const data = await response.json()
+        setIsAuthenticated(data.authenticated)
+      } catch (error) {
+        setIsAuthenticated(false)
+      } finally {
+        setLoading(false)
+      }
+    }
+
+    const handleLogout = async () => {
+      try {
+        const csrfToken = getCsrfToken()
+        await fetch('/api/logout/', {
+          method: 'POST',
+          credentials: 'include',
+          headers: {
+            'X-CSRFToken': csrfToken,
+          },
+        })
+        setIsAuthenticated(false)
+        navigate({ to: '/' })
+      } catch (error) {
+        console.error('Logout failed', error)
+      }
+    }
+
+    if (loading) {
+      return <div>Loading...</div>
+    }
+
+    return (
     <div className="min-h-screen bg-gradient-to-b from-gray-50 to-white">
       <nav className="border-b bg-white/80 backdrop-blur-sm shadow-sm">
         <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 h-16 flex items-center justify-between">
@@ -91,5 +146,6 @@ export const Route = createRootRoute({
         </div>
       </footer>
     </div>
-  ),
+  );
+},
 })

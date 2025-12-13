@@ -15,7 +15,7 @@ import {
   CardTitle,
 } from "@/components/ui/card";
 import { Alert, AlertDescription } from "@/components/ui/alert";
-import { Loader2, Shield, User, Stethoscope, Fingerprint } from "lucide-react";
+import { Loader2, Shield, User, Stethoscope, Fingerprint, Upload } from "lucide-react";
 import { startRegistration } from "@simplewebauthn/browser";
 
 export const Route = createFileRoute("/register")({
@@ -28,6 +28,7 @@ function RegisterPage() {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [webauthnStarted, setWebauthnStarted] = useState(false);
+  const [certFile, setCertFile] = useState<File | null>(null);
 
   const handleSubmit = async (e: React.FormEvent<HTMLFormElement>) => {
     e.preventDefault();

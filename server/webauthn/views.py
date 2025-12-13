@@ -7,6 +7,7 @@ from django.views import View
 from django.views.decorators.csrf import csrf_exempt
 from django.utils.decorators import method_decorator
 from django.contrib.auth import login
+from django.contrib.auth.decorators import login_required
 
 from fido2.webauthn import PublicKeyCredentialRpEntity, AttestedCredentialData, CollectedClientData, AttestationObject, AuthenticatorData
 from fido2.server import Fido2Server
@@ -16,6 +17,9 @@ import cbor2
 from hashlib import sha256
 from accounts.models import User, PatientRecord
 from .models import WebAuthnCredential
+import logging
+
+logger = logging.getLogger(__name__)
 
 # Using sha256 of a unique string → always the same salts → same PRF output on every device for the same credential
  # This guarantees stable KEK across sessions and synced devices (Apple/Google/1Password/Bitwarden all sync the PRF secret)
@@ -115,7 +119,13 @@ class FinishRegistration(View):
             sign_count=auth_data.counter,  # fido2 1.1.3
             transports=response.get("transports", []),
             prf_enabled=prf_enabled,
+            aaguid=auth_data.credential_data.aaguid,  # for authenticator type insights
         )
+
+        # Mark as primary if first credential
+        if not user.webauthn_credentials.exclude(pk=credential.pk).exists():
+            credential.is_primary = True
+            credential.save()
 
         user.is_active = True
         user.save()
@@ -176,14 +186,19 @@ class FinishAuthentication(View):
         if not authenticator_data_obj.is_user_verified:
                     raise ValueError("User verification required")
 
-        # ----- Sign count check – protect against cloned authenticators -----
-        # Most of password managers let count to 0 https://github.com/bitwarden/clients/pull/8024#top
-        # Hardware key like yubikey use the counter
-        # auth_date does not countains a counter attribut but the authenticator_data_obj does
-        # # TODO: add logging for anomalies
-        if authenticator_data_obj.counter != 0 and authenticator_data_obj.counter <= credential.sign_count:
-            raise ValueError("Possible cloned authenticator detected (sign count did not increase)")
-        credential.sign_count = authenticator_data_obj.counter
+        # ----- Improved sign count check for clone detection -----
+        current_counter = authenticator_data_obj.counter
+        if credential.supports_sign_count and current_counter <= credential.sign_count:
+            logger.warning(f"Possible clone detected for credential {credential.id} (counter {current_counter} <= {credential.sign_count}) from IP {request.META.get('REMOTE_ADDR')}")
+            raise ValueError("Possible cloned authenticator detected")
+        # Detect if supports incrementing (set flag if it ever increases)
+        if current_counter > credential.sign_count:
+            if not credential.supports_sign_count:
+                credential.supports_sign_count = True
+        # Log for anomaly detection (expand with metadata like time/size for master note)
+        elif current_counter == 0 and credential.sign_count == 0:
+            logger.info(f"Software authenticator (no counter) used for user {credential.user.id} from IP {request.META.get('REMOTE_ADDR')}")
+        credential.sign_count = current_counter
         credential.save()
 
         # ----- PRF extension results (multi-device ready KEK) -----
@@ -201,7 +216,6 @@ class FinishAuthentication(View):
         else:
             prf_bytes = None  # fallback to no KEK on very old authenticators
 
-
         prf_hex = prf_bytes.hex() if prf_bytes else None
 
         login(request, credential.user)
@@ -211,3 +225,127 @@ class FinishAuthentication(View):
             "status": "OK",
             "prf_hex": prf_hex, # used to derive/store encrypted X25519 key
         })
+
+
+    #Approval to add secondary credential (auth with primary only)
+@method_decorator(csrf_exempt, name="dispatch")
+class StartAddCredentialApproval(View):
+    def post(self, request):
+        if not request.user.is_authenticated:
+            return JsonResponse({"error": "Authentication required"}, status=401)
+        primary_cred = WebAuthnCredential.objects.filter(user=request.user, is_primary=True).first()
+        if not primary_cred:
+            return JsonResponse({"error": "No primary credential found"}, status=400)
+        options, state = server.authenticate_begin(
+            credentials=[primary_cred.get_credential_data()],
+            user_verification="required",
+            extensions={"prf": {"eval": {"first": PRF_SALT_FIRST, "second": PRF_SALT_SECOND}}},
+        )
+        pk_options = dict(options.public_key)
+        pk_options['allowCredentials'] = [{
+            "type": "public-key",
+            "id": websafe_encode(primary_cred.credential_id),
+            "transports": primary_cred.transports,
+        }]
+        request.session["add_cred_approval_state"] = state
+        return JsonResponse(to_serializable(pk_options))
+
+@method_decorator(csrf_exempt, name="dispatch")
+class FinishAddCredentialApproval(View):
+    def post(self, request):
+        state = request.session.get("add_cred_approval_state")
+        if not state:
+            return JsonResponse({"error": "No approval in progress"}, status=400)
+        response = json.loads(request.body)
+        credential_id = websafe_decode(response["rawId"])
+        primary_cred = WebAuthnCredential.objects.filter(user=request.user, is_primary=True).first()
+        if credential_id != primary_cred.credential_id:
+            return JsonResponse({"error": "Not primary credential"}, status=403)
+        credential = primary_cred
+        client_data_json = websafe_decode(response["response"]["clientDataJSON"])
+        authenticator_data = websafe_decode(response["response"]["authenticatorData"])
+        signature = websafe_decode(response["response"]["signature"])
+        client_data = CollectedClientData(client_data_json)
+        authenticator_data_obj = AuthenticatorData(authenticator_data)
+        server.authenticate_complete(
+            state,
+            [credential.get_credential_data()],
+            credential_id,
+            client_data,
+            authenticator_data_obj,
+            signature,
+        )
+        if not authenticator_data_obj.is_user_verified:
+            raise ValueError("User verification required")
+        # Sign count check (same as auth)
+        current_counter = authenticator_data_obj.counter
+        if credential.supports_sign_count and current_counter <= credential.sign_count:
+            logger.warning(f"Possible clone during approval for user {request.user.id}")
+            raise ValueError("Possible cloned authenticator detected")
+        if current_counter > credential.sign_count:
+            if not credential.supports_sign_count:
+                credential.supports_sign_count = True
+        credential.sign_count = current_counter
+        credential.save()
+        # Approval granted
+        request.session["add_cred_approved"] = True
+        del request.session["add_cred_approval_state"]
+        return JsonResponse({"status": "OK"})
+
+# Add secondary credential (after approval)
+@method_decorator(csrf_exempt, name="dispatch")
+class StartAddCredential(View):
+    def post(self, request):
+        if not request.user.is_authenticated:
+            return JsonResponse({"error": "Authentication required"}, status=401)
+        if not request.session.get("add_cred_approved"):
+            return JsonResponse({"error": "Approval required first"}, status=403)
+        data = json.loads(request.body)
+        options, state = server.register_begin(
+            user={
+                "id": str(request.user.id).encode(),
+                "name": request.user.email,
+                "displayName": f"{request.user.first_name} {request.user.last_name}",
+            },
+            credentials=[c.get_credential_data() for c in request.user.webauthn_credentials.all()],
+            user_verification="required",
+        )
+        pk_options = dict(options.public_key)
+        pk_options["authenticatorSelection"] = {
+            "requireResidentKey": True,
+            "residentKey": "required",
+            "userVerification": "required",
+        }
+        pk_options["extensions"] = {"prf": {}}
+        request.session["add_cred_state"] = state
+        request.session["add_cred_device_name"] = data.get("device_name", "")
+        del request.session["add_cred_approved"]  # One-time use
+        return JsonResponse(to_serializable(pk_options))
+
+@method_decorator(csrf_exempt, name="dispatch")
+class FinishAddCredential(View):
+    def post(self, request):
+        state = request.session.get("add_cred_state")
+        if not state:
+            return JsonResponse({"error": "No add in progress"}, status=400)
+        response = json.loads(request.body)
+        client_data_json = websafe_decode(response["response"]["clientDataJSON"])
+        attestation_object = websafe_decode(response["response"]["attestationObject"])
+        client_data = CollectedClientData(client_data_json)
+        att_obj = AttestationObject(attestation_object)
+        auth_data = server.register_complete(state, client_data, att_obj)
+        prf_enabled = response.get("clientExtensionResults", {}).get("prf", {}).get("enabled", False)
+        credential = WebAuthnCredential.objects.create(
+            user=request.user,
+            credential_id=auth_data.credential_data.credential_id,
+            public_key=cbor2.dumps(auth_data.credential_data.public_key),
+            name=request.session.get('add_cred_device_name', 'Unnamed Device'),
+            sign_count=auth_data.counter,
+            transports=response.get("transports", []),
+            prf_enabled=prf_enabled,
+            aaguid=auth_data.credential_data.aaguid,
+            is_primary=False,  # Explicitly secondary
+        )
+        del request.session["add_cred_state"]
+        del request.session["add_cred_device_name"]
+        return JsonResponse({"status": "OK", "prf_enabled": prf_enabled})
