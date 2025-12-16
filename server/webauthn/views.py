@@ -219,7 +219,7 @@ class FinishAuthentication(View):
         prf_hex = prf_bytes.hex() if prf_bytes else None
 
         login(request, credential.user)
-        del request.session["auth_state"]
+        request.session.pop("auth_state", None)
 
         return JsonResponse({
             "status": "OK",
