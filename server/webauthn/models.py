@@ -42,3 +42,12 @@ class WebAuthnCredential(models.Model):
             self.credential_id,
             cbor2.loads(self.public_key),
         )
+
+class AuthenticationLog(models.Model):
+    user = models.ForeignKey('accounts.User', on_delete=models.CASCADE, null=True, blank=True)
+    timestamp = models.DateTimeField(auto_now_add=True)
+    ip_address = models.GenericIPAddressField(null=True, blank=True)
+    device_name = models.CharField(max_length=100, blank=True)
+    success = models.BooleanField(default=False)
+    metadata = models.JSONField(default=dict, blank=True)
+

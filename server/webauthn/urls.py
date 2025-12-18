@@ -6,11 +6,13 @@ from .views import (
     FinishAuthentication,
     AuthStatus,
     LogoutView,
-
+    UserCredentials,
+    UserActivity,
+    DeleteCredential,
     StartAddCredentialApproval,
     FinishAddCredentialApproval,
-    StartAddCredential,
     FinishAddCredential,
+    StartAddWithCode,
 )
 
 urlpatterns = [
@@ -23,7 +25,11 @@ urlpatterns = [
 
     path("credential/add/approve/start/", StartAddCredentialApproval.as_view(), name="webauthn_add_approve_start"),
     path("credential/add/approve/finish/", FinishAddCredentialApproval.as_view(), name="webauthn_add_approve_finish"),
-    path("credential/add/start/", StartAddCredential.as_view(), name="webauthn_add_start"),
     path("credential/add/finish/", FinishAddCredential.as_view(), name="webauthn_add_finish"),
+    path("add/start/", StartAddWithCode.as_view(), name="webauthn_add_with_code_start"),
+    # credential/add/finish/ remains the same
+    path("user/credentials/", UserCredentials.as_view(), name="user_credentials"),
+    path("user/activity/", UserActivity.as_view(), name="user_activity"),
+    path("credential/<str:cred_id>/delete/", DeleteCredential.as_view(), name="delete_credential"),
 ]
 

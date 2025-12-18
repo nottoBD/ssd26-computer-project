@@ -188,8 +188,10 @@ export const Route = createRootRoute({
               </div>
             </div>
             <div className="mt-8 pt-8 border-t text-center text-sm text-muted-foreground">
-              <p>ULB Computer Project - Secure Software Design - Group SSD26</p>
+
               <p className="mt-1">Server authentication required • No trusted third parties</p>
+              <p>Master of Cybersecurity • Secure Software Design</p>
+              <p>2026</p>
             </div>
           </div>
         </footer>

@@ -6,7 +6,7 @@ import { Button } from "@/components/ui/button";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
 import { Alert, AlertDescription } from "@/components/ui/alert";
 import { Loader2, Shield, Trash, AlertTriangle } from "lucide-react";
-import { startAuthentication, startRegistration } from "@simplewebauthn/browser";
+import { startAuthentication, startRegistration, base64URLStringToBuffer } from "@simplewebauthn/browser";
 
 export const Route = createFileRoute("/settings")({
   component: SettingsPage,
@@ -18,7 +18,8 @@ function SettingsPage() {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [anomalyWarning, setAnomalyWarning] = useState<string | null>(null);
-
+  const [addCode, setAddCode] = useState<string | null>(null);
+  
   useEffect(() => {
     fetchData();
   }, []);
@@ -28,13 +29,13 @@ function SettingsPage() {
     setError(null);
     try {
       // Fetch credentials
-      const credsResp = await fetch("/api/user/credentials/");
+      const credsResp = await fetch("/api/webauthn/user/credentials/");
       if (!credsResp.ok) throw new Error("Failed to fetch credentials");
       const creds = await credsResp.json();
       setCredentials(creds);
 
       // Fetch activity logs
-      const activityResp = await fetch("/api/user/activity/");
+      const activityResp = await fetch("/api/webauthn/user/activity/");
       if (!activityResp.ok) throw new Error("Failed to fetch activity");
       const logs = await activityResp.json();
       setActivity(logs);
@@ -54,6 +55,57 @@ function SettingsPage() {
     }
   };
 
+
+  const handleGenerateAddCode = async () => {
+    if (!confirm("To generate the add code, you will be prompted to confirm with your primary passkey. This is a security measure and not a new registration. Continue?")) return;
+    setError(null);
+    setAddCode(null);
+    try {
+      // Approve with primary to generate code
+      const approveStart = await fetch("/api/webauthn/credential/add/approve/start/", { method: "POST" });
+      if (!approveStart.ok) throw new Error("Approval start failed");
+      const approveOptions = await approveStart.json();
+
+      // Convert PRF salts from base64url strings to ArrayBuffer
+      const prfEval = approveOptions.extensions?.prf?.eval;
+      if (prfEval) {
+        prfEval.first = base64URLStringToBuffer(prfEval.first);
+        if (prfEval.second) {
+          prfEval.second = base64URLStringToBuffer(prfEval.second);
+        }
+      }
+
+      const approveCred = await startAuthentication(approveOptions);
+      const approveFinish = await fetch("/api/webauthn/credential/add/approve/finish/", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(approveCred),
+      });
+      if (!approveFinish.ok) throw new Error("Approval failed - possible clone detected?");
+      const result = await approveFinish.json();
+      setAddCode(result.add_code);
+    } catch (err: any) {
+      let errorMsg = err.message || "Failed to generate add code";
+      if (errorMsg.includes("clone")) {
+        errorMsg = "Possible cloned device during approval! Check activity logs.";
+      }
+      setError(errorMsg);
+    }
+  };
+
+  const handleRemove = async (credId: string) => {
+    if (confirm("Remove this device?")) {
+      try {
+        const resp = await fetch(`/api/webauthn/credential/${credId}/delete/`, { method: "DELETE" });
+        if (!resp.ok) throw new Error("Remove failed");
+        fetchData();
+      } catch (err) {
+        setError((err as Error).message);
+      }
+    }
+  };
+
+
   const handleAddSecondary = async (deviceName: string = "New Device") => {
     setError(null);
     try {
@@ -61,6 +113,16 @@ function SettingsPage() {
       const approveStart = await fetch("/api/webauthn/credential/add/approve/start/", { method: "POST" });
       if (!approveStart.ok) throw new Error("Approval start failed");
       const approveOptions = await approveStart.json();
+
+      // Convert PRF salts from base64url strings to ArrayBuffer
+      const prfEval = approveOptions.extensions?.prf?.eval;
+      if (prfEval) {
+        prfEval.first = base64URLStringToBuffer(prfEval.first);
+        if (prfEval.second) {
+          prfEval.second = base64URLStringToBuffer(prfEval.second);
+        }
+      }
+
       const approveCred = await startAuthentication(approveOptions);
       const approveFinish = await fetch("/api/webauthn/credential/add/approve/finish/", {
         method: "POST",
@@ -96,17 +158,7 @@ function SettingsPage() {
     }
   };
 
-  const handleRemove = async (credId: string) => {
-    if (confirm("Remove this device?")) {
-      try {
-        const resp = await fetch(`/api/credential/${credId}/delete/`, { method: "DELETE" });
-        if (!resp.ok) throw new Error("Remove failed");
-        fetchData();
-      } catch (err) {
-        setError((err as Error).message);
-      }
-    }
-  };
+
 
   if (loading) return <Loader2 className="animate-spin" />;
 
@@ -144,8 +196,9 @@ function SettingsPage() {
             ))}
           </TableBody>
         </Table>
-        <Button onClick={() => handleAddSecondary()} className="mt-4"><Shield className="mr-2 h-4 w-4" /> Add Secondary Device</Button>
-      </section>
+        <Button onClick={handleGenerateAddCode} className="mt-4"><Shield className="mr-2 h-4 w-4" /> Generate Add Code for Secondary Device</Button>
+        {addCode && <Alert className="mt-4"><AlertDescription>Add Code: {addCode} (expires in 10 minutes). Enter on the new device.</AlertDescription></Alert>}
+          </section>
 
       <section>
         <h2 className="text-xl mb-2">Recent Activity</h2>
@@ -173,3 +226,4 @@ function SettingsPage() {
     </div>
   );
 }
+

@@ -1,41 +1,48 @@
-# WebAuthn Login & Register System
+# Explanation of Multi-Device Auth System Changes
 
-[See basic commands in skeleton-index README](https://github.com/nottoBD/ssd26-computer-project/blob/skeleton-index/README.md)
+[See basic login-register without Multi-Device Management on branch login-register](https://github.com/nottoBD/ssd26-computer-project/blob/webauthn/login-register/README.md)
 
-## Prerequisites
+## Overview
+Below is a structured summary of what was incomplete in the previous branch (before setting up a device management) and how to migrate.
 
-**Important**: Password managers (like Bitwarden) refuse to create passkeys for `localhost` due to security reasons. You must configure a local domain for testing.
+## What Was Incomplete/Risky in login-register
+- **No Primary Approval for Adds**: Direct registration allowed unauthorized additions (risks: forgery #9, broken auth #14).
+- **No Primary-Only Restrictions**: Any device could manage settings/revoke (risks: access control #13, non-repudiation #5).
+- **Missing Server Logging/Anomaly Detection**: Client-side only; no metadata logging (risks: monitoring #10, Master note).
+- **API Gaps**: 404s on credentials/activity endpoints.
+- **Login Usability for New Devices**: Couldn't add from new device without login.
+- **Other**: Weak clone checks in approval, potential remanence #8.
 
-### Step 1: Configure Local Domain
-Add this entry to your `/etc/hosts` file:
+## Vision for New System
+- **Primary Device Hierarchy**: First device is primary; approves/revokes all changes. Only primary accesses settings.
+- **One-Time Code Approval**: Primary generates short-lived code (<10min); new device uses email+code to add as secondary.
+- **Per-Device Credentials**: Unique WebAuthn creds per device (PRF keeps shared KEK for E2EE).
+- **Logging/Monitoring**: Server logs auth with metadata for anomalies.
+- **Best Practices**: FIDO2-compliant, OWASP-aligned, minimal server trust.
 
-```bash
-# Static table lookup for hostnames
-# See hosts(5) for details
-127.0.0.1        healthsecure.local
-::1              localhost
-```
+## Specific Changes
+### Backend Models
+- Added `AuthenticationLog`: Logs time/IP/device/success/metadata (#10, Master note).
+- Added `User.pending_add_code/expiry`: For secure approvals.
 
-## Access Registration
+### Backend Views/URLs
+- Updated `FinishAuthentication`: Logs attempts, stores credential ID for primary checks, enhanced clone detection.
+- Added `is_primary_device`: Restricts sensitive actions.
+- Changed Approval/Add: Primary auth generates code; new device uses `/add/start/` with code.
+- New Views: `/user/credentials/`, `/user/activity/`, `/credential/<id>/delete/` (primary-only).
+- URLs: Added paths for above (fixes 404s).
 
-Navigate to: https://healthsecure.local/register
+### Frontend
+- Settings: Generate code via primary auth; display for new device. Remove uses new endpoint.
+- Login: Add mode for email/code/device_name to join as secondary.
 
-**Note**: While `https://localhost` remains accessible, passkey registration and login will not function through this address.
-
-## Current Status
-
-### ✅ Login & Registration
-- Fully functional with passkeys when using `healthsecure.local`
-- Bitwarden example: https://pasteboard.co/ggYuNqiRSJFM.png
-- Any additional device can login with a password manager
-- No password
-- No account recovery
-- No multidevice with primary/secondary system (yet!)
-
-### Current Issues
-- Must fix dependency problems client's CryptoUtils.ts and vite.config.ts...
-
-## Future Integration
-- Full PKI implementation will follow after resolving login & multi-device access
-- This will eliminate the need for `/etc/hosts` modification
+## How to Migrate/Integrate Safely
+1. **Apply Models**: Run migrations for new fields/logs.
+2. **Update Views/URLs**: Add/replace as provided; existing register/login unchanged.
+3. **Update Frontend**: Modify settings/login.tsx; test new URLs (e.g., /api/webauthn/...).
+4. **Test Flow**:
+   - Register primary.
+   - Settings (primary): Generate code.
+   - New device login: Add mode, enter email/code.
+   - Verify: Secondaries can't manage settings.
 
