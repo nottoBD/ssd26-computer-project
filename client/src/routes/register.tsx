@@ -17,6 +17,7 @@ import {
 import { Alert, AlertDescription } from "@/components/ui/alert";
 import { Loader2, Shield, User, Stethoscope, Fingerprint, Upload } from "lucide-react";
 import { startRegistration } from "@simplewebauthn/browser";
+import { useAuth } from './__root'
 
 export const Route = createFileRoute("/register")({
   component: RegisterPage,
@@ -24,6 +25,7 @@ export const Route = createFileRoute("/register")({
 
 function RegisterPage() {
   const navigate = useNavigate();
+  const { refreshAuth } = useAuth();
   const [userType, setUserType] = useState<"patient" | "doctor">("patient");
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -48,11 +50,22 @@ function RegisterPage() {
         userType === "patient" ? (formData.get("dateOfBirth") as string) : null,
       medical_organization:
         userType === "doctor"
-          ? (formData.get("medicalOrganization") as string)
-          : "",
+          ? (formData.get("medicalOrganization") as string) : "",
+      
       device_name: (formData.get("deviceName") as string) || "",
     };
-
+    
+    // Check already authenticated
+    const authCheck = await fetch("/api/webauthn/auth/status/", { credentials: 'include' });
+    
+    if (authCheck.ok) {
+        const { authenticated } = await authCheck.json();
+        if (authenticated) {
+            setError("Already logged in - logout first to register new account");
+            setLoading(false);
+            return;
+        }
+    } 
     try {
       // 1. Start registration on server
       const startResp = await fetch("/api/webauthn/register/start/", {
@@ -88,6 +101,7 @@ function RegisterPage() {
 
       // Success!
       alert("🎉 Successfully registered and logged in with passkey!");
+      await refreshAuth();
       navigate({ to: "/" });
     } catch (err) {
       console.error(err);

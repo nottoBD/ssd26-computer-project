@@ -4,6 +4,8 @@ from .views import (
     FinishRegistration,
     StartAuthentication,
     FinishAuthentication,
+    AuthStatus,
+    LogoutView,
 
     StartAddCredentialApproval,
     FinishAddCredentialApproval,
@@ -16,6 +18,8 @@ urlpatterns = [
     path("register/finish/", FinishRegistration.as_view(), name="webauthn_register_finish"),
     path("login/start/", StartAuthentication.as_view(), name="webauthn_login_start"),
     path("login/finish/", FinishAuthentication.as_view(), name="webauthn_login_finish"),
+    path("auth/status/", AuthStatus.as_view(), name="auth_status"),
+    path("logout/", LogoutView.as_view(), name="logout"),
 
     path("credential/add/approve/start/", StartAddCredentialApproval.as_view(), name="webauthn_add_approve_start"),
     path("credential/add/approve/finish/", FinishAddCredentialApproval.as_view(), name="webauthn_add_approve_finish"),

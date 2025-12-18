@@ -6,7 +6,7 @@ from django.http import JsonResponse
 from django.views import View
 from django.views.decorators.csrf import csrf_exempt
 from django.utils.decorators import method_decorator
-from django.contrib.auth import login
+from django.contrib.auth import login, logout
 from django.contrib.auth.decorators import login_required
 
 from fido2.webauthn import PublicKeyCredentialRpEntity, AttestedCredentialData, CollectedClientData, AttestationObject, AuthenticatorData
@@ -111,7 +111,7 @@ class FinishRegistration(View):
         auth_data = server.register_complete(state, client_data, att_obj)  # returns AuthenticatorData in fido2==1.1.3
         prf_enabled = response.get("clientExtensionResults", {}).get("prf", {}).get("enabled", False)
 
-        WebAuthnCredential.objects.create(
+        credential = WebAuthnCredential.objects.create(
             user=user,
             credential_id=auth_data.credential_data.credential_id,
             public_key=cbor2.dumps(auth_data.credential_data.public_key),  # COSE key dict to CBOR bytes
@@ -298,6 +298,13 @@ class StartAddCredential(View):
     def post(self, request):
         if not request.user.is_authenticated:
             return JsonResponse({"error": "Authentication required"}, status=401)
+
+        # Ensure user has no credentials deleted via /settings or similar
+        if WebAuthnCredential.objects.filter(user=request.user).exists() and not request.session.get("add_cred_approved"):
+            # Extra check: /settings might have been attempted, but prevent add if no primary
+            if not WebAuthnCredential.objects.filter(user=request.user, is_primary=True).exists():
+                return JsonResponse({"error": "No primary credential - contact support"}, status=403)
+
         if not request.session.get("add_cred_approved"):
             return JsonResponse({"error": "Approval required first"}, status=403)
         data = json.loads(request.body)
@@ -349,3 +356,24 @@ class FinishAddCredential(View):
         del request.session["add_cred_state"]
         del request.session["add_cred_device_name"]
         return JsonResponse({"status": "OK", "prf_enabled": prf_enabled})
+
+@method_decorator(csrf_exempt, name="dispatch")
+class AuthStatus(View):
+    def get(self, request):
+        return JsonResponse({
+            'authenticated': request.user.is_authenticated
+        })
+
+@method_decorator(csrf_exempt, name="dispatch")
+class LogoutView(View):
+    def post(self, request):
+        if request.user.is_authenticated:
+            logout(request)
+            # Flush session
+            request.session.flush()
+            response = JsonResponse({"status": "OK"})
+            # Expire cookies client-side, but server already invalidated
+            response.delete_cookie('sessionid')
+            response.delete_cookie('csrftoken')
+            return response
+        return JsonResponse({"error": "Not authenticated"}, status=401)

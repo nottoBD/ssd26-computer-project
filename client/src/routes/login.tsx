@@ -21,6 +21,7 @@ import {
   decryptAES,
   deriveEd25519FromX25519,
 } from "../components/CryptoUtils";
+import { useAuth } from './__root'
 
 export const Route = createFileRoute("/login")({
   component: LoginPage,
@@ -28,6 +29,7 @@ export const Route = createFileRoute("/login")({
 
 function LoginPage() {
   const navigate = useNavigate();
+  const { refreshAuth } = useAuth();
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [stage, setStage] = useState<"prompt" | "authenticating">("prompt");
@@ -126,7 +128,8 @@ function LoginPage() {
 
         console.log("✅ PRF KEK derived and ready for encryption");
       }
-      
+
+      await refreshAuth();
       navigate({ to: "/" });
     } catch (err: any) {
       console.error(err);
