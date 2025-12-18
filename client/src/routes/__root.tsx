@@ -112,7 +112,16 @@ export const Route = createRootRoute({
                   <span>Doctor Portal</span>
                 </div>
               </div>
-              
+
+              {/* Settings Gear Icon only when authenticated */}
+              {isAuthenticated && (
+                <Button asChild variant="ghost" className="text-gray-600 hover:text-gray-700 hover:bg-gray-50">
+                  <Link to="/settings">
+                    <SettingsIcon className="w-4 h-4" />
+                  </Link>
+                </Button>
+              )}
+
               {/* Dynamic Auth Button */}
               <Button
                 variant="ghost"
@@ -127,15 +136,6 @@ export const Route = createRootRoute({
                   "Login with WebAuthn"
                 )}
               </Button>
-
-              {/* Settings Gear Icon - Only show when authenticated */}
-              {isAuthenticated && (
-                <Button asChild variant="ghost" className="text-gray-600 hover:text-gray-700 hover:bg-gray-50">
-                  <Link to="/settings">
-                    <SettingsIcon className="w-4 h-4" />
-                  </Link>
-                </Button>
-              )}
 
               <Button asChild className="bg-gradient-to-r from-blue-600 to-indigo-600 hover:from-blue-700 hover:to-indigo-700">
                 <Link to="/register">Secure Registration</Link>
@@ -188,7 +188,7 @@ export const Route = createRootRoute({
               </div>
             </div>
             <div className="mt-8 pt-8 border-t text-center text-sm text-muted-foreground">
-              <p>Computer Project - Secure Software Development - Group SSD26</p>
+              <p>ULB Computer Project - Secure Software Design - Group SSD26</p>
               <p className="mt-1">Server authentication required • No trusted third parties</p>
             </div>
           </div>
