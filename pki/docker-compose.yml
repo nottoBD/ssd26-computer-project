@@ -1,0 +1,3 @@
+# PKI is now integrated into the root docker-compose.yml for HealthSecure.
+# Use the project root compose file to run the full stack.
+services: {}

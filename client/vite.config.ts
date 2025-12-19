@@ -9,10 +9,17 @@ export default defineConfig({
   server: {
     host: true,
     port: 5173,
-    https: {
-      key: fs.readFileSync("./localhost-key.pem"),
-      cert: fs.readFileSync("./localhost.pem"),
-    },
+    https: (() => {
+      const keyPath = process.env.TLS_KEY_PATH ?? "./localhost-key.pem";
+      const certPath = process.env.TLS_CERT_PATH ?? "./localhost.pem";
+      if (fs.existsSync(keyPath) && fs.existsSync(certPath)) {
+        return {
+          key: fs.readFileSync(keyPath),
+          cert: fs.readFileSync(certPath),
+        };
+      }
+      return undefined;
+    })(),
     proxy: {
       "/api": {
         target: "http://server:8000",

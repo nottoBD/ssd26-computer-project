@@ -9,7 +9,7 @@ SECRET_KEY = os.getenv("SECRET_KEY", "django-insecure-change-me")
 
 DEBUG = os.getenv("DEBUG", "1") == "1"
 
-ALLOWED_HOSTS = os.getenv("ALLOWED_HOSTS", "localhost,127.0.0.1").split(",")
+ALLOWED_HOSTS = os.getenv("ALLOWED_HOSTS", "localhost,127.0.0.1,healthsecure.local").split(",")
 
 AUTH_USER_MODEL = "accounts.User"
 
@@ -75,6 +75,14 @@ CORS_ALLOW_ALL_ORIGINS = True
 CSRF_COOKIE_SECURE = True
 
 CSRF_COOKIE_HTTPONLY = True
+
+CSRF_TRUSTED_ORIGINS = os.getenv(
+    "CSRF_TRUSTED_ORIGINS",
+    "https://localhost:3443,https://healthsecure.local:3443",
+).split(",")
+
+SECURE_PROXY_SSL_HEADER = ("HTTP_X_FORWARDED_PROTO", "https")
+USE_X_FORWARDED_HOST = True
 
 STATIC_URL = "static/"
 
