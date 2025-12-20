@@ -46,3 +46,20 @@ Below is a structured summary of what was incomplete in the previous branch (bef
    - New device login: Add mode, enter email/code.
    - Verify: Secondaries can't manage settings.
 
+
+
+## Fix Primary/Secondary
+
+Client/login.txt && Client/settings.tsx: 
+- Add credentials: "include" in api call (not all, if other error occurs add to other endpoint)
+
+Server/settings.py : 
+- Add CSRF_COOKIE_SECURE = True,CSRF_COOKIE_HTTPONLY = True,CSRF_TRUSTED_ORIGINS = 
+
+Server/webauthn/view.py
+- FinishRegistration -> only one primary, add primary if no other device exist and add in session used_credential_id and device_role
+- FinishAddCredential -> force secondary device is_primary=False and device_role='secondary'
+- StartAddCredentialApproval -> refuse if not primary
+- FinishAddCredentialApproval -> fix problem with primary_id bytes or memoryview -> primary_id = primary_id.tobytes()
+- StartAddWithCode -> add security by cancel if no primary exist
+- is_primary_device() -> better, check is_authenticated and lookup DB

@@ -33,7 +33,6 @@ logger = logging.getLogger(__name__)
 PRF_SALT_FIRST = sha256(b"HealthSecure Project - PRF salt v1 - first").digest()
 PRF_SALT_SECOND = sha256(b"HealthSecure Project - PRF salt v1 - second").digest()
 
-rp = PublicKeyCredentialRpEntity(id="healthsecure.local", name="HealthSecure Project")
 server = get_server()
 
 def to_serializable(obj):
@@ -87,7 +86,7 @@ class StartRegistration(View):
 
         pk_options["authenticatorSelection"] = {
             "requireResidentKey": True,
-            "residentKey": "required",
+            "residentKey": "preferred",
             "userVerification": "preferred",
         }
         pk_options["extensions"] = {"prf": {}}
@@ -131,13 +130,18 @@ class FinishRegistration(View):
         )
 
         # Mark as primary if first credential
-        if not user.webauthn_credentials.exclude(pk=credential.pk).exists():
+        if not WebAuthnCredential.objects.filter(user=user, is_primary=True).exists():
             credential.is_primary = True
             credential.save()
+
 
         user.is_active = True
         user.save()
         login(request, user)
+        # Mark which credential was used for this session
+        request.session['used_credential_id'] = websafe_encode(credential.credential_id)
+        request.session['device_role'] = 'primary' if credential.is_primary else 'secondary'
+
 
         del request.session["reg_state"]
         del request.session["reg_user_id"]
@@ -239,6 +243,7 @@ class FinishAuthentication(View):
 
             login(request, credential.user)
             request.session['used_credential_id'] = websafe_encode(credential.credential_id)
+            request.session['device_role'] = 'primary' if credential.is_primary else 'secondary'
             request.session.pop("auth_state", None)
 
             # Log success
@@ -278,6 +283,9 @@ class StartAddCredentialApproval(View):
     def post(self, request):
         if not request.user.is_authenticated:
             return JsonResponse({"error": "Authentication required"}, status=401)
+        if not is_primary_device(request):
+            return JsonResponse({"error": "Primary device required"}, status=403)
+
         primary_cred = WebAuthnCredential.objects.filter(user=request.user, is_primary=True).first()
         if not primary_cred:
             return JsonResponse({"error": "No primary credential found"}, status=400)
@@ -303,9 +311,18 @@ class FinishAddCredentialApproval(View):
             return JsonResponse({"error": "No approval in progress"}, status=400)
         response = json.loads(request.body)
         credential_id = websafe_decode(response["rawId"])
+
         primary_cred = WebAuthnCredential.objects.filter(user=request.user, is_primary=True).first()
-        if credential_id != primary_cred.credential_id:
+        if not primary_cred:
+            return JsonResponse({"error": "No primary credential found"}, status=400)
+
+        primary_id = primary_cred.credential_id
+        if isinstance(primary_id, memoryview):
+            primary_id = primary_id.tobytes()
+
+        if credential_id != primary_id:
             return JsonResponse({"error": "Not primary credential"}, status=403)
+
         credential = primary_cred
         client_data_json = websafe_decode(response["response"]["clientDataJSON"])
         authenticator_data = websafe_decode(response["response"]["authenticatorData"])
@@ -342,6 +359,7 @@ class FinishAddCredentialApproval(View):
         return JsonResponse({"status": "OK", "add_code": code})
 
 
+@method_decorator(csrf_exempt, name='dispatch')
 class FinishAddCredential(View):
     def post(self, request):
         state = request.session.get("add_cred_state")
@@ -378,6 +396,7 @@ class FinishAddCredential(View):
         # Auto-login on new device
         login(request, user)
         request.session['used_credential_id'] = websafe_encode(credential.credential_id)
+        request.session['device_role'] = 'secondary'
 
         # Log
         AuthenticationLog.objects.create(
@@ -403,6 +422,9 @@ class StartAddWithCode(View):
 
         try:
             user = User.objects.get(email=email)
+            if not WebAuthnCredential.objects.filter(user=user, is_primary=True).exists():
+                return JsonResponse({"error": "Primary device required"}, status=403)
+            
             if user.pending_add_code != code or user.pending_add_expiry < timezone.now():
                 raise ValueError("Invalid or expired code")
 
@@ -505,15 +527,21 @@ class LogoutView(View):
         return JsonResponse({"error": "Not authenticated"}, status=401)
 
 def is_primary_device(request):
+    if not request.user.is_authenticated:
+        return False
+
     cid = request.session.get('used_credential_id')
-    if cid:
-        try:
-            cred = WebAuthnCredential.objects.get(
-                credential_id=websafe_decode(cid),
-                user=request.user
-            )
-            return cred.is_primary
-        except WebAuthnCredential.DoesNotExist:
-            pass
-    return False
+    if not cid:
+        return False
+
+    try:
+        WebAuthnCredential.objects.get(
+            credential_id=websafe_decode(cid),
+            user=request.user,
+            is_primary=True,
+        )
+        return True
+    except WebAuthnCredential.DoesNotExist:
+        return False
+
 

@@ -171,6 +171,7 @@ function LoginPage() {
       const addCred = await startRegistration(addOptions);
       const addFinish = await fetch("/api/webauthn/credential/add/finish/", {
         method: "POST",
+        credentials: "include",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(addCred),
       });

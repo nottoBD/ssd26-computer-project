@@ -1,25 +1,36 @@
 "use client";
 
 import { useState, useEffect } from "react";
-import { createFileRoute, useNavigate } from "@tanstack/react-router";
+import { createFileRoute } from "@tanstack/react-router";
 import { Button } from "@/components/ui/button";
-import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
+import {
+  Table,
+  TableBody,
+  TableCell,
+  TableHead,
+  TableHeader,
+  TableRow,
+} from "@/components/ui/table";
 import { Alert, AlertDescription } from "@/components/ui/alert";
 import { Loader2, Shield, Trash, AlertTriangle } from "lucide-react";
-import { startAuthentication, startRegistration, base64URLStringToBuffer } from "@simplewebauthn/browser";
+import {
+  startAuthentication,
+  startRegistration,
+  base64URLStringToBuffer,
+} from "@simplewebauthn/browser";
 
 export const Route = createFileRoute("/settings")({
   component: SettingsPage,
 });
 
 function SettingsPage() {
-  const [credentials, setCredentials] = useState<any[]>([]); // {id, name, created_at, prf_enabled, is_primary, supports_sign_count}
-  const [activity, setActivity] = useState<any[]>([]); // {time, ip, device_name, success}
+  const [credentials, setCredentials] = useState<any[]>([]);
+  const [activity, setActivity] = useState<any[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [anomalyWarning, setAnomalyWarning] = useState<string | null>(null);
   const [addCode, setAddCode] = useState<string | null>(null);
-  
+
   useEffect(() => {
     fetchData();
   }, []);
@@ -27,25 +38,48 @@ function SettingsPage() {
   const fetchData = async () => {
     setLoading(true);
     setError(null);
+
     try {
-      // Fetch credentials
-      const credsResp = await fetch("/api/webauthn/user/credentials/");
-      if (!credsResp.ok) throw new Error("Failed to fetch credentials");
+      // Fetch credentials (PRIMARY ONLY)
+      const credsResp = await fetch("/api/webauthn/user/credentials/", {
+        credentials: "include",
+      });
+      if (!credsResp.ok) {
+        if (credsResp.status === 403)
+          throw new Error("Access denied (primary device required).");
+        if (credsResp.status === 401)
+          throw new Error("Not authenticated. Please login again.");
+        throw new Error("Failed to fetch credentials");
+      }
       const creds = await credsResp.json();
       setCredentials(creds);
 
-      // Fetch activity logs
-      const activityResp = await fetch("/api/webauthn/user/activity/");
-      if (!activityResp.ok) throw new Error("Failed to fetch activity");
+      // Fetch activity logs (PRIMARY ONLY)
+      const activityResp = await fetch("/api/webauthn/user/activity/", {
+        credentials: "include",
+      });
+      if (!activityResp.ok) {
+        if (activityResp.status === 403)
+          throw new Error("Access denied (primary device required).");
+        if (activityResp.status === 401)
+          throw new Error("Not authenticated. Please login again.");
+        throw new Error("Failed to fetch activity");
+      }
       const logs = await activityResp.json();
       setActivity(logs);
 
-      // Client-side anomaly check (logins after local last without this session)
-      const localLast = localStorage.getItem('last_login_time');
+      // Client-side anomaly check (optional)
+      const localLast = localStorage.getItem("last_login_time");
       if (localLast) {
-        const recentUnexplained = logs.filter((log: any) => new Date(log.time) > new Date(localLast) && !log.success); // Example: failed attempts after last
+        const recentUnexplained = logs.filter(
+          (log: any) => new Date(log.time) > new Date(localLast) && !log.success
+        );
         if (recentUnexplained.length > 0) {
-          setAnomalyWarning("Unusual activity detected! Review logs below and revoke suspicious devices.");
+          setAnomalyWarning(
+            "Unusual activity detected! Review logs below and revoke suspicious devices."
+          );
+        } else {
+          setAnomalyWarning(null);
         }
       }
     } catch (err) {
@@ -55,15 +89,32 @@ function SettingsPage() {
     }
   };
 
-
   const handleGenerateAddCode = async () => {
-    if (!confirm("To generate the add code, you will be prompted to confirm with your primary passkey. This is a security measure and not a new registration. Continue?")) return;
+    if (
+      !confirm(
+        "To generate the add code, you will be prompted to confirm with your primary passkey. Continue?"
+      )
+    )
+      return;
+
     setError(null);
     setAddCode(null);
+
     try {
-      // Approve with primary to generate code
-      const approveStart = await fetch("/api/webauthn/credential/add/approve/start/", { method: "POST" });
-      if (!approveStart.ok) throw new Error("Approval start failed");
+      // 1) Start approval (PRIMARY ONLY)
+      const approveStart = await fetch(
+        "/api/webauthn/credential/add/approve/start/",
+        { method: "POST", credentials: "include" }
+      );
+
+      if (!approveStart.ok) {
+        if (approveStart.status === 403)
+          throw new Error("Primary device required (403).");
+        if (approveStart.status === 401)
+          throw new Error("Not authenticated (401).");
+        throw new Error("Approval start failed");
+      }
+
       const approveOptions = await approveStart.json();
 
       // Convert PRF salts from base64url strings to ArrayBuffer
@@ -75,13 +126,26 @@ function SettingsPage() {
         }
       }
 
+      // 2) WebAuthn prompt (get assertion from PRIMARY)
       const approveCred = await startAuthentication(approveOptions);
-      const approveFinish = await fetch("/api/webauthn/credential/add/approve/finish/", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(approveCred),
-      });
-      if (!approveFinish.ok) throw new Error("Approval failed - possible clone detected?");
+
+      // 3) Finish approval -> get add_code
+      const approveFinish = await fetch(
+        "/api/webauthn/credential/add/approve/finish/",
+        {
+          method: "POST",
+          credentials: "include",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(approveCred),
+        }
+      );
+
+      if (!approveFinish.ok) {
+        if (approveFinish.status === 403)
+          throw new Error("Primary device required (403).");
+        throw new Error("Approval failed - possible clone detected?");
+      }
+
       const result = await approveFinish.json();
       setAddCode(result.add_code);
     } catch (err: any) {
@@ -94,27 +158,48 @@ function SettingsPage() {
   };
 
   const handleRemove = async (credId: string) => {
-    if (confirm("Remove this device?")) {
-      try {
-        const resp = await fetch(`/api/webauthn/credential/${credId}/delete/`, { method: "DELETE" });
-        if (!resp.ok) throw new Error("Remove failed");
-        fetchData();
-      } catch (err) {
-        setError((err as Error).message);
+    if (!confirm("Remove this device?")) return;
+
+    try {
+      const resp = await fetch(`/api/webauthn/credential/${credId}/delete/`, {
+        method: "DELETE",
+        credentials: "include",
+      });
+
+      if (!resp.ok) {
+        if (resp.status === 403)
+          throw new Error("Primary device required (403).");
+        throw new Error("Remove failed");
       }
+
+      fetchData();
+    } catch (err) {
+      setError((err as Error).message);
     }
   };
 
-
+  // Optional test flow: approve + add in one UI (if your backend supports /add/start + /add/finish)
   const handleAddSecondary = async (deviceName: string = "New Device") => {
     setError(null);
+
     try {
       // Step 1: Approve with primary
-      const approveStart = await fetch("/api/webauthn/credential/add/approve/start/", { method: "POST" });
-      if (!approveStart.ok) throw new Error("Approval start failed");
+      const approveStart = await fetch(
+        "/api/webauthn/credential/add/approve/start/",
+        { method: "POST", credentials: "include" }
+      );
+
+      if (!approveStart.ok) {
+        if (approveStart.status === 403)
+          throw new Error("Primary device required (403).");
+        if (approveStart.status === 401)
+          throw new Error("Not authenticated (401).");
+        throw new Error("Approval start failed");
+      }
+
       const approveOptions = await approveStart.json();
 
-      // Convert PRF salts from base64url strings to ArrayBuffer
+      // Convert PRF salts
       const prfEval = approveOptions.extensions?.prf?.eval;
       if (prfEval) {
         prfEval.first = base64URLStringToBuffer(prfEval.first);
@@ -124,31 +209,51 @@ function SettingsPage() {
       }
 
       const approveCred = await startAuthentication(approveOptions);
-      const approveFinish = await fetch("/api/webauthn/credential/add/approve/finish/", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(approveCred),
-      });
-      if (!approveFinish.ok) throw new Error("Approval failed - possible clone detected?");
 
-      // Step 2: Register secondary
+      const approveFinish = await fetch(
+        "/api/webauthn/credential/add/approve/finish/",
+        {
+          method: "POST",
+          credentials: "include",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(approveCred),
+        }
+      );
+
+      if (!approveFinish.ok) {
+        if (approveFinish.status === 403)
+          throw new Error("Primary device required (403).");
+        throw new Error("Approval failed - possible clone detected?");
+      }
+
+      // Step 2: Start secondary registration (depends on your backend)
       const addStart = await fetch("/api/webauthn/credential/add/start/", {
         method: "POST",
+        credentials: "include",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ device_name: deviceName }),
       });
-      if (!addStart.ok) throw new Error("Add start failed");
+
+      if (!addStart.ok) {
+        if (addStart.status === 403)
+          throw new Error("Primary device required (403).");
+        throw new Error("Add start failed");
+      }
+
       const addOptions = await addStart.json();
       const addCred = await startRegistration(addOptions);
+
       const addFinish = await fetch("/api/webauthn/credential/add/finish/", {
         method: "POST",
+        credentials: "include",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(addCred),
       });
+
       if (!addFinish.ok) throw new Error("Add failed");
 
       alert("Secondary device added successfully!");
-      fetchData(); // Refresh list
+      fetchData();
     } catch (err: any) {
       let errorMsg = err.message || "Add failed";
       if (errorMsg.includes("clone")) {
@@ -158,18 +263,34 @@ function SettingsPage() {
     }
   };
 
-
-
-  if (loading) return <Loader2 className="animate-spin" />;
+  if (loading)
+    return (
+      <div className="p-8 flex items-center gap-2 text-muted-foreground">
+        <Loader2 className="h-5 w-5 animate-spin" />
+        Loading…
+      </div>
+    );
 
   return (
     <div className="p-4">
       <h1 className="text-2xl font-bold mb-4">Settings</h1>
-      {error && <Alert variant="destructive"><AlertDescription>{error}</AlertDescription></Alert>}
-      {anomalyWarning && <Alert variant="destructive"><AlertTriangle className="h-4 w-4" /><AlertDescription>{anomalyWarning}</AlertDescription></Alert>}
+
+      {error && (
+        <Alert variant="destructive" className="mb-4">
+          <AlertDescription>{error}</AlertDescription>
+        </Alert>
+      )}
+
+      {anomalyWarning && (
+        <Alert variant="destructive" className="mb-4">
+          <AlertTriangle className="h-4 w-4" />
+          <AlertDescription>{anomalyWarning}</AlertDescription>
+        </Alert>
+      )}
 
       <section className="mb-8">
         <h2 className="text-xl mb-2">Devices</h2>
+
         <Table>
           <TableHeader>
             <TableRow>
@@ -181,27 +302,56 @@ function SettingsPage() {
               <TableHead>Actions</TableHead>
             </TableRow>
           </TableHeader>
+
           <TableBody>
-            {credentials.map(cred => (
+            {credentials.map((cred) => (
               <TableRow key={cred.id}>
                 <TableCell>{cred.name}</TableCell>
                 <TableCell>{new Date(cred.created_at).toLocaleString()}</TableCell>
                 <TableCell>{cred.prf_enabled ? "Yes" : "No"}</TableCell>
                 <TableCell>{cred.is_primary ? "Yes" : "No"}</TableCell>
-                <TableCell>{cred.supports_sign_count ? "Yes" : "No (Software Passkey)"}</TableCell>
                 <TableCell>
-                  {!cred.is_primary && <Button variant="destructive" size="sm" onClick={() => handleRemove(cred.id)}><Trash className="h-4 w-4" /></Button>}
+                  {cred.supports_sign_count ? "Yes" : "No (Software Passkey)"}
+                </TableCell>
+                <TableCell>
+                  {!cred.is_primary && (
+                    <Button
+                      variant="destructive"
+                      size="sm"
+                      onClick={() => handleRemove(cred.id)}
+                    >
+                      <Trash className="h-4 w-4" />
+                    </Button>
+                  )}
                 </TableCell>
               </TableRow>
             ))}
           </TableBody>
         </Table>
-        <Button onClick={handleGenerateAddCode} className="mt-4"><Shield className="mr-2 h-4 w-4" /> Generate Add Code for Secondary Device</Button>
-        {addCode && <Alert className="mt-4"><AlertDescription>Add Code: {addCode} (expires in 10 minutes). Enter on the new device.</AlertDescription></Alert>}
-          </section>
+
+        <Button onClick={handleGenerateAddCode} className="mt-4">
+          <Shield className="mr-2 h-4 w-4" />
+          Generate Add Code for Secondary Device
+        </Button>
+
+        {addCode && (
+          <Alert className="mt-4">
+            <AlertDescription>
+              Add Code: {addCode} (expires in 10 minutes). Enter on the new
+              device.
+            </AlertDescription>
+          </Alert>
+        )}
+
+        {/* Si tu veux tester l’ajout complet depuis le même appareil (pas réaliste mais utile en dev) */}
+        {/* <Button onClick={() => handleAddSecondary("My Secondary Device")} className="mt-4 ml-2">
+          Add Secondary (test)
+        </Button> */}
+      </section>
 
       <section>
         <h2 className="text-xl mb-2">Recent Activity</h2>
+
         <Table>
           <TableHeader>
             <TableRow>
@@ -211,6 +361,7 @@ function SettingsPage() {
               <TableHead>Success</TableHead>
             </TableRow>
           </TableHeader>
+
           <TableBody>
             {activity.map((log, i) => (
               <TableRow key={i}>
@@ -226,4 +377,3 @@ function SettingsPage() {
     </div>
   );
 }
-
