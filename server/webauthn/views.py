@@ -23,6 +23,7 @@ import logging
 import secrets
 from datetime import timedelta
 from django.utils import timezone
+from .utils import get_server
 
 logger = logging.getLogger(__name__)
 
@@ -33,7 +34,7 @@ PRF_SALT_FIRST = sha256(b"HealthSecure Project - PRF salt v1 - first").digest()
 PRF_SALT_SECOND = sha256(b"HealthSecure Project - PRF salt v1 - second").digest()
 
 rp = PublicKeyCredentialRpEntity(id="healthsecure.local", name="HealthSecure Project")
-server = Fido2Server(rp, attestation="none")
+server = get_server()
 
 def to_serializable(obj):
     if isinstance(obj, bytes):
@@ -87,7 +88,7 @@ class StartRegistration(View):
         pk_options["authenticatorSelection"] = {
             "requireResidentKey": True,
             "residentKey": "required",
-            "userVerification": "required",
+            "userVerification": "preferred",
         }
         pk_options["extensions"] = {"prf": {}}
 
