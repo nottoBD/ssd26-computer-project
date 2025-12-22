@@ -12,8 +12,6 @@ SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd -- "${SCRIPT_DIR}/.." && pwd)"
 ENV_FILE="${ROOT}/.env"
 ROOTS_DIR="$ROOT/pki/roots"
-P12_PASS=""
-P12_BUNDLE="$ROOT/pki/leafs/browser/${USER_ID}.p12"
 
 if docker compose version &>/dev/null; then
     COMPOSE_CMD=("docker" "compose")
@@ -31,7 +29,6 @@ cd "$ROOT" || say_red "Project root not found."
 if [[ -f "$ENV_FILE" ]]; then
     say "Using env-file: $ENV_FILE"
     ENV_OPTS=(--env-file "$ENV_FILE")
-    P12_PASS=$(grep -E '^BROWSER_P12_PASSWORD=' "$ENV_FILE" | cut -d= -f2 || true)
 else
     say "No .env file found: relying on docker-compose.yml env-var"
     ENV_OPTS=()
@@ -82,14 +79,8 @@ say "Inspecting self-signed root cert:"
 openssl x509 -in "$ROOT/step-root.pem" -noout -text | grep -E 'Issuer:|Subject:|Self-signed'
 
 say "Inspecting TLS handshake:"
-if [[ -f "$P12_BUNDLE" && -n "${P12_PASS:-}" ]]; then
-  curl -v --capath "$ROOTS_DIR" \
-             --cert-type P12 --cert "${P12_BUNDLE}:${P12_PASS}" \
+curl -v --capath "$ROOTS_DIR" \
              https://localhost:3443/api/health/ -o /dev/null
-else
-  curl -v --capath "$ROOTS_DIR" \
-             https://localhost:3443/api/health/ -o /dev/null
-fi
 
 printf "\n"
 

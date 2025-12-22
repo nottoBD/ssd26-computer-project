@@ -21,7 +21,7 @@ PKI_DIR="$PROJECT_ROOT/pki"
 LEAFS_DIR="$PKI_DIR/leafs"
 ROOTS_DIR="$PKI_DIR/roots"
 
-mkdir -p "$LEAFS_DIR/nginx" "$LEAFS_DIR/client" "$LEAFS_DIR/browser" "$ROOTS_DIR"
+mkdir -p "$LEAFS_DIR/nginx" "$LEAFS_DIR/client" "$LEAFS_DIR/logger" "$ROOTS_DIR"
 
 # 1) Fresh password
 ################################################################################
@@ -64,6 +64,9 @@ done
 # sync password file, then persist it to .env and shred the temp file
 sleep 2
 docker exec step-ca sh -c "echo -n $CA_PASSWORD > /home/step/secrets/password"
+
+docker exec step-ca chown step:step /home/step/secrets/password
+docker exec step-ca chmod 600 /home/step/secrets/password
 
 ENV_FILE="$PROJECT_ROOT/.env"; touch "$ENV_FILE"
 if grep -q '^STEP_CA_PASSWORD=' "$ENV_FILE"; then
@@ -114,6 +117,25 @@ docker exec step-ca bash -c "
     --san localhost --san 127.0.0.1 --san ::1 \
     --not-after 8760h \
     --kty RSA --size 2048
+
+  step ca certificate server.healthsecure.local \
+  /home/step/leaf/server.crt \
+  /home/step/leaf/server.key \
+  --provisioner healthsecure-provisioner --password-file \$STEP_PASSWORD_FILE \
+  --san server --san server.healthsecure.local \
+  --san localhost --san 127.0.0.1 --san ::1 \
+  --not-after 8760h \
+  --kty RSA --size 2048
+
+  step ca certificate server.healthsecure.local \
+  /home/step/leaf/logger.crt \
+  /home/step/leaf/logger.key \
+  --provisioner healthsecure-provisioner --password-file \$STEP_PASSWORD_FILE \
+  --san server --san logger.healthsecure.local \
+  --san localhost --san 127.0.0.1 --san ::1 \
+  --not-after 8760h \
+  --kty RSA --size 2048
+
 "
 
 # 5) Build full chains
@@ -130,53 +152,6 @@ docker cp step-ca:/home/step/certs/intermediate_ca.crt "$ROOTS_DIR/intermediate_
 ln -sf intermediate_ca.crt "$ROOTS_DIR/$(openssl x509 -noout -hash -in "$ROOTS_DIR/intermediate_ca.crt").0"
 command -v c_rehash >/dev/null 2>&1 && c_rehash "$ROOTS_DIR" || openssl rehash "$ROOTS_DIR"
 
-# 6)  Browser client certificate for optional mTLS
-################################################################################
-USER_ID=$(id -un)
-BROWSER_DIR="$LEAFS_DIR/browser"
-mkdir -p "$BROWSER_DIR"
-
-# pw PKCS#12 bundle = healthsecure
-source "$PROJECT_ROOT/.env" 2>/dev/null || true
-P12_PASSWORD="${BROWSER_P12_PASSWORD:-healthsecure}"
-if grep -q '^BROWSER_P12_PASSWORD=' "$ENV_FILE"; then
-  sed -i.bak "s|^BROWSER_P12_PASSWORD=.*|BROWSER_P12_PASSWORD=$P12_PASSWORD|" "$ENV_FILE"
-else
-  echo "BROWSER_P12_PASSWORD=$P12_PASSWORD" >> "$ENV_FILE"
-fi
-
-REMOTE_DIR="/home/step/leaf/browser"
-docker exec step-ca mkdir -p "$REMOTE_DIR"
-
-docker exec step-ca bash -c "
-  set -e
-  step ca certificate \
-    ${USER_ID}.browser.healthsecure.local \
-    ${REMOTE_DIR}/${USER_ID}.crt \
-    ${REMOTE_DIR}/${USER_ID}.key \
-    --provisioner healthsecure-provisioner \
-    --password-file /home/step/secrets/password \
-    --san ${USER_ID} --san ${USER_ID}.browser \
-    --not-after 8760h --kty RSA --size 2048
-
-  cat  ${REMOTE_DIR}/${USER_ID}.crt  /home/step/certs/intermediate_ca.crt \
-       > ${REMOTE_DIR}/${USER_ID}.fullchain.crt
-"
-
-for ext in key fullchain.crt; do
-  docker cp "step-ca:${REMOTE_DIR}/${USER_ID}.${ext}" \
-            "$BROWSER_DIR/${USER_ID}.${ext}"
-done
-
-openssl pkcs12 -export \
-  -inkey   "$BROWSER_DIR/${USER_ID}.key" \
-  -in      "$BROWSER_DIR/${USER_ID}.fullchain.crt" \
-  -certfile "$ROOTS_DIR/step-root.pem" \
-  -name    "HealthSecure ${USER_ID}" \
-  -password pass:"$P12_PASSWORD" \
-  -out     "$BROWSER_DIR/${USER_ID}.p12"
-
-cp "$BROWSER_DIR/${USER_ID}.p12" "$PROJECT_ROOT/${USER_ID}.p12"
 
 # 7) Copy leaf certs to host
 ################################################################################
@@ -207,10 +182,8 @@ say "\nNginx cert SHA-256 fingerprint:"; printf "%s $CERT_FINGERPRINT"
 
 printf "\n"
 
-say "Browser certificate created:"
-say "    - Files in $BROWSER_DIR"
-say "    - Import bundle at $PROJECT_ROOT/${USER_ID}.p12  (password: $P12_PASSWORD)"
 
-DOCKER_SCRIPT="$PROJECT_ROOT/pki/3-run.sh"
+DOCKER_SCRIPT="$PROJECT_ROOT/bash/3-run.sh"
 say "PKI ready, next step:"
 say "         (here) file://$DOCKER_SCRIPT"
+

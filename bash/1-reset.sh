@@ -22,7 +22,7 @@ cd "$PROJECT_ROOT" || err "Cannot cd into project root ($PROJECT_ROOT)"
 trap 'cd "$PROJECT_ROOT"' EXIT
 
 PKI_DIR="$PROJECT_ROOT/pki"
-NGINX_DIR="$PROJECT_ROOT/nginx"
+NGINX_DIR="$PROJECT_ROOT/nginx/pins"
 
 # 1) Stop stack
 ############################################################################
@@ -72,6 +72,6 @@ docker buildx create --name healthsecure-builder --driver docker-container --use
 docker buildx inspect --bootstrap
 docker ps --filter name=buildx_
 
-DOC="$PROJECT_ROOT/pki/2-pki_setup.sh"
+DOC="$PROJECT_ROOT/bash/2-pki_setup.sh"
 printf "\nReset complete. You should now configure PKI with script:\n"
 say "         (here) file://$DOC"
