@@ -18,6 +18,11 @@ class WebAuthnCredential(models.Model):
     prf_enabled = models.BooleanField(default=False)
     created_at = models.DateTimeField(auto_now_add=True)
 
+    # Handling primary/secondary, CDA approval, anomaly log detection (bc no sign_count)
+    aaguid = models.BinaryField(null=True, blank=True)
+    is_primary = models.BooleanField(default=False)
+    supports_sign_count = models.BooleanField(default=False) # Detects if sign counter increments
+
     class Meta:
             verbose_name = "WebAuthn Credential"
             verbose_name_plural = "WebAuthn Credentials"
@@ -37,3 +42,12 @@ class WebAuthnCredential(models.Model):
             self.credential_id,
             cbor2.loads(self.public_key),
         )
+
+class AuthenticationLog(models.Model):
+    user = models.ForeignKey('accounts.User', on_delete=models.CASCADE, null=True, blank=True)
+    timestamp = models.DateTimeField(auto_now_add=True)
+    ip_address = models.GenericIPAddressField(null=True, blank=True)
+    device_name = models.CharField(max_length=100, blank=True)
+    success = models.BooleanField(default=False)
+    metadata = models.JSONField(default=dict, blank=True)
+

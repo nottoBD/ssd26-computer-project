@@ -12,8 +12,9 @@ import {
   CardTitle,
 } from "@/components/ui/card";
 import { Alert, AlertDescription } from "@/components/ui/alert";
-import { Shield, Fingerprint, Loader2 } from "lucide-react";
-import { startAuthentication } from "@simplewebauthn/browser";
+import { Input } from "@/components/ui/input";
+import { Shield, Fingerprint, Loader2, AlertTriangle } from "lucide-react";
+import { startAuthentication, startRegistration, base64URLStringToBuffer } from "@simplewebauthn/browser";
 import {
   deriveKEK,
   generateX25519Keypair,
@@ -21,6 +22,7 @@ import {
   decryptAES,
   deriveEd25519FromX25519,
 } from "../components/CryptoUtils";
+import { useAuth } from './__root'
 
 export const Route = createFileRoute("/login")({
   component: LoginPage,
@@ -28,19 +30,17 @@ export const Route = createFileRoute("/login")({
 
 function LoginPage() {
   const navigate = useNavigate();
+  const { refreshAuth } = useAuth();
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [stage, setStage] = useState<"prompt" | "authenticating">("prompt");
-
-  const startWebAuthnLogin = async () => {
-    setLoading(true);
-    setError(null);
-    setStage("authenticating");
-  };
+  const [stage, setStage] = useState<"regular" | "authenticating" | "add" | "adding">("regular");
+  const [email, setEmail] = useState('');
+  const [code, setCode] = useState('');
+  const [deviceName, setDeviceName] = useState('New Device');
 
   const handleWebAuthnLogin = async () => {
-    startWebAuthnLogin();
-
+    setLoading(true);
+    setError(null);
     try {
       // Step 1: Ask server for authentication options (discoverable credentials = no email needed)
       const resp = await fetch("/api/webauthn/login/start/", {
@@ -53,6 +53,15 @@ function LoginPage() {
         throw new Error("No registered device found for this browser");
 
       const options = await resp.json();
+
+      // PRF salts from base64url to ArrayBuffer (necessary for Android Bitwaden)
+      const prfEval = options.extensions?.prf?.eval;
+      if (prfEval) {
+        prfEval.first = base64URLStringToBuffer(prfEval.first);
+        if (prfEval.second) {
+          prfEval.second = base64URLStringToBuffer(prfEval.second);
+        }
+      }
 
       // Step 2: Trigger browser native prompt
       const credential = await startAuthentication(options);
@@ -68,9 +77,12 @@ function LoginPage() {
 
       if (!finishResp.ok)
         throw new Error(result.error || "Authentication failed");
+      
+      //INFO: Update local last login time for anomaly detection in settings
+      localStorage.setItem('last_login_time', new Date().toISOString());
 
-      // PRF SUCCESS KEK AVAILABLE IN MEMORY
-      if (result.prf_available && result.prf_hex) {
+      // // PRF SUCCESS KEK AVAILABLE IN MEMORY
+      if (result.prf_hex) {
         const prfBytes = Uint8Array.from(
           result.prf_hex.match(/.{1,2}/g)!.map((byte) => parseInt(byte, 16)),
         );
@@ -124,14 +136,52 @@ function LoginPage() {
         console.log("✅ PRF KEK derived and ready for encryption");
       }
 
+      await refreshAuth();
       navigate({ to: "/" });
     } catch (err: any) {
       console.error(err);
-      setError(
-        err.message ||
-          "Authentication failed — try another device or register first",
-      );
-      setStage("prompt");
+      let errorMsg = err.message || "Authentication failed - try another device or register first";
+      
+      //INFO: Handling for clone/anomaly errors
+      if (errorMsg.includes("cloned authenticator")) {
+        errorMsg = "Possible cloned device detected! Check your activity in settings and contact support if suspicious.";
+      }
+      setError(errorMsg);
+      setStage("regular");
+    } finally {
+      setLoading(false);
+    }
+  };
+
+
+  const handleAddDevice = async () => {
+    setLoading(true);
+    setError(null);
+    try {
+      const addStart = await fetch("/api/webauthn/add/start/", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ email, code, device_name: deviceName }),
+      });
+      if (!addStart.ok) {
+        const err = await addStart.json();
+        throw new Error(err.error || "Add start failed");
+      }
+      const addOptions = await addStart.json();
+      const addCred = await startRegistration(addOptions);
+      const addFinish = await fetch("/api/webauthn/credential/add/finish/", {
+        method: "POST",
+        credentials: "include",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(addCred),
+      });
+      if (!addFinish.ok) throw new Error("Add failed");
+
+      await refreshAuth();
+      navigate({ to: "/" });
+    } catch (err: any) {
+      setError(err.message || "Device add failed - check code and try again");
+      setStage("add");
     } finally {
       setLoading(false);
     }
@@ -155,12 +205,13 @@ function LoginPage() {
         <CardContent className="space-y-6">
           {error && (
             <Alert variant="destructive">
+              <AlertTriangle className="h-4 w-4" /> {/* Primary/Secondary Alerts */}
               <AlertDescription>{error}</AlertDescription>
             </Alert>
           )}
 
           <div className="space-y-4">
-            {stage === "prompt" ? (
+            {stage === "regular" ? (
               <>
                 <div className="text-center">
                   <div className="inline-flex items-center justify-center w-16 h-16 rounded-full bg-blue-100 mb-4">
@@ -176,14 +227,20 @@ function LoginPage() {
                 </div>
 
                 <Button
-                  onClick={handleWebAuthnLogin}
+                  onClick={() => {
+                    setStage("authenticating");
+                    handleWebAuthnLogin();
+                  }}
                   className="w-full h-12 text-base bg-gradient-to-r from-blue-600 to-indigo-600 hover:from-blue-700 hover:to-indigo-700"
                 >
                   <Fingerprint className="mr-2 h-5 w-5" />
                   Login with WebAuthn
                 </Button>
+                <Button variant="link" onClick={() => setStage("add")}>
+                  Add this device to an existing account
+                </Button>
               </>
-            ) : (
+            ) : stage === "authenticating" ? (
               <div className="py-12 text-center space-y-6">
                 <div className="mx-auto w-20 h-20 rounded-full bg-gradient-to-r from-blue-600 to-indigo-600 flex items-center justify-center animate-pulse">
                   <Fingerprint className="h-10 w-10 text-white" />
@@ -194,6 +251,51 @@ function LoginPage() {
                   </h3>
                   <p className="text-muted-foreground mt-2">
                     Use Face ID, Touch ID, Windows Hello, or security key
+                  </p>
+                </div>
+              </div>
+            ) : stage === "add" ? (
+              <div className="space-y-4">
+                <Input
+                  placeholder="Email"
+                  value={email}
+                  onChange={(e) => setEmail(e.target.value)}
+                />
+                <Input
+                  placeholder="Add Code from primary device"
+                  value={code}
+                  onChange={(e) => setCode(e.target.value)}
+                />
+                <Input
+                  placeholder="Device Name"
+                  value={deviceName}
+                  onChange={(e) => setDeviceName(e.target.value)}
+                />
+                <Button 
+                  onClick={() => {
+                    setStage("adding");
+                    handleAddDevice();
+                  }} 
+                  disabled={loading} 
+                  className="w-full"
+                >
+                  {loading ? <Loader2 className="animate-spin" /> : 'Add Device'}
+                </Button>
+                <Button variant="link" onClick={() => setStage("regular")}>
+                  Back to regular login
+                </Button>
+              </div>
+            ) : (
+              <div className="py-12 text-center space-y-6">
+                <div className="mx-auto w-20 h-20 rounded-full bg-gradient-to-r from-blue-600 to-indigo-600 flex items-center justify-center animate-pulse">
+                  <Fingerprint className="h-10 w-10 text-white" />
+                </div>
+                <div>
+                  <h3 className="text-xl font-semibold">
+                    Add this device
+                  </h3>
+                  <p className="text-muted-foreground mt-2">
+                    Use Face ID, Touch ID, Windows Hello, or security key to create a new passkey
                   </p>
                 </div>
               </div>

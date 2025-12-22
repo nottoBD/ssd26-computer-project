@@ -73,8 +73,12 @@ TEMPLATES = [
 CORS_ALLOW_ALL_ORIGINS = True
 
 CSRF_COOKIE_SECURE = True
-
 CSRF_COOKIE_HTTPONLY = True
+CSRF_TRUSTED_ORIGINS = [
+    "http://localhost:5173",
+    "https://localhost:5173",
+]
+
 
 CSRF_TRUSTED_ORIGINS = os.getenv(
     "CSRF_TRUSTED_ORIGINS",

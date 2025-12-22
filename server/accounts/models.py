@@ -47,6 +47,10 @@ class User(AbstractBaseUser, PermissionsMixin):
   # AES-KEK encrypted 32 bytes X25519 private key
     encrypted_encryption_private = models.BinaryField(null=True, blank=True)
 
+    # Multi device
+    pending_add_code = models.CharField(max_length=128, blank=True, null=True)
+    pending_add_expiry = models.DateTimeField(blank=True, null=True)
+    
     objects = UserManager()
 
     USERNAME_FIELD = "email"
