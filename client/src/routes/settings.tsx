@@ -158,25 +158,59 @@ function SettingsPage() {
   };
 
   const handleRemove = async (credId: string) => {
-    if (!confirm("Remove this device?")) return;
+  if (!confirm("Remove this device? You will be prompted to confirm with your primary passkey.")) return;
 
-    try {
-      const resp = await fetch(`/api/webauthn/credential/${credId}/delete/`, {
-        method: "DELETE",
-        credentials: "include",
-      });
+  setError(null);
 
-      if (!resp.ok) {
-        if (resp.status === 403)
-          throw new Error("Primary device required (403).");
-        throw new Error("Remove failed");
-      }
+  try {
+    // 1) Start delete approval (PRIMARY ONLY)
+    const approveStart = await fetch("/api/webauthn/credential/delete/approve/start/", {
+      method: "POST",
+      credentials: "include",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ target_cred_id: credId }),
+    });
 
-      fetchData();
-    } catch (err) {
-      setError((err as Error).message);
+    if (!approveStart.ok) {
+      if (approveStart.status === 403) throw new Error("Primary device required (403).");
+      if (approveStart.status === 401) throw new Error("Not authenticated (401).");
+      throw new Error("Delete approval start failed");
     }
-  };
+
+    const approveOptions = await approveStart.json();
+
+    // Convert PRF salts to ArrayBuffer (same logic as generate add code)
+    const prfEval = approveOptions.extensions?.prf?.eval;
+    if (prfEval) {
+      prfEval.first = base64URLStringToBuffer(prfEval.first);
+      if (prfEval.second) prfEval.second = base64URLStringToBuffer(prfEval.second);
+    }
+
+    // 2) WebAuthn prompt (assertion from PRIMARY)
+    const assertion = await startAuthentication(approveOptions);
+
+    // 3) Finish approval -> actual deletion happens server-side
+    const approveFinish = await fetch("/api/webauthn/credential/delete/approve/finish/", {
+      method: "POST",
+      credentials: "include",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(assertion),
+    });
+
+    if (!approveFinish.ok) {
+      const txt = await approveFinish.text().catch(() => "");
+      if (approveFinish.status === 403) throw new Error("Primary device required (403).");
+      throw new Error(`Delete approval failed: ${txt || approveFinish.statusText}`);
+    }
+
+    // instant UI update + refetch
+    setCredentials((curr) => curr.filter((c) => c.id !== credId));
+    fetchData();
+  } catch (err) {
+    setError((err as Error).message);
+  }
+};
+
 
   // Optional test flow: approve + add in one UI (if your backend supports /add/start + /add/finish)
   const handleAddSecondary = async (deviceName: string = "New Device") => {
@@ -314,13 +348,15 @@ function SettingsPage() {
                   {cred.supports_sign_count ? "Yes" : "No (Software Passkey)"}
                 </TableCell>
                 <TableCell>
-                  {!cred.is_primary && (
+                  {cred.is_primary ? (
+                  <span className="text-muted-foreground">-</span>
+                  ) : (
                     <Button
-                      variant="destructive"
-                      size="sm"
+                      type="button"
+                      className="text-red-600 hover:text-red-700 hover:bg-red-50 rounded px-2 py-1"
                       onClick={() => handleRemove(cred.id)}
                     >
-                      <Trash className="h-4 w-4" />
+                      delete
                     </Button>
                   )}
                 </TableCell>

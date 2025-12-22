@@ -358,6 +358,148 @@ class FinishAddCredentialApproval(View):
         del request.session["add_cred_approval_state"]
         return JsonResponse({"status": "OK", "add_code": code})
 
+@method_decorator(csrf_exempt, name="dispatch")
+class StartDeleteCredentialApproval(View):
+    def post(self, request):
+        if not request.user.is_authenticated:
+            return JsonResponse({"error": "Authentication required"}, status=401)
+
+        if not is_primary_device(request):
+            return JsonResponse({"error": "Primary device required"}, status=403)
+
+        data = json.loads(request.body or "{}")
+        target_cred_id = data.get("target_cred_id")
+        if not target_cred_id:
+            return JsonResponse({"error": "target_cred_id required"}, status=400)
+
+        # Target must exist + belong to user + must be secondary
+        try:
+            target_bin = websafe_decode(target_cred_id)
+            target = WebAuthnCredential.objects.get(user=request.user, credential_id=target_bin)
+        except WebAuthnCredential.DoesNotExist:
+            return JsonResponse({"error": "Credential not found"}, status=404)
+
+        if target.is_primary:
+            return JsonResponse({"error": "Cannot delete primary device"}, status=403)
+
+        # Authenticate using PRIMARY credential only
+        primary_cred = WebAuthnCredential.objects.filter(user=request.user, is_primary=True).first()
+        if not primary_cred:
+            return JsonResponse({"error": "No primary credential found"}, status=400)
+
+        options, state = server.authenticate_begin(
+            credentials=[primary_cred.get_credential_data()],
+            user_verification="required",
+            extensions={"prf": {"eval": {"first": PRF_SALT_FIRST, "second": PRF_SALT_SECOND}}},
+        )
+
+        pk_options = dict(options.public_key)
+        pk_options["allowCredentials"] = [{
+            "type": "public-key",
+            "id": websafe_encode(primary_cred.credential_id),
+            "transports": primary_cred.transports,
+        }]
+
+        request.session["del_cred_approval_state"] = state
+        request.session["del_target_cred_id"] = target_cred_id
+
+        return JsonResponse(to_serializable(pk_options))
+
+
+@method_decorator(csrf_exempt, name="dispatch")
+class FinishDeleteCredentialApproval(View):
+    def post(self, request):
+        if not request.user.is_authenticated:
+            return JsonResponse({"error": "Authentication required"}, status=401)
+
+        if not is_primary_device(request):
+            return JsonResponse({"error": "Primary device required"}, status=403)
+
+        state = request.session.get("del_cred_approval_state")
+        target_cred_id = request.session.get("del_target_cred_id")
+
+        if not state or not target_cred_id:
+            return JsonResponse({"error": "No delete approval in progress"}, status=400)
+
+        response = json.loads(request.body)
+        credential_id = websafe_decode(response["rawId"])
+
+        primary_cred = WebAuthnCredential.objects.filter(user=request.user, is_primary=True).first()
+        if not primary_cred:
+            return JsonResponse({"error": "No primary credential found"}, status=400)
+
+        primary_id = primary_cred.credential_id
+        if isinstance(primary_id, memoryview):
+            primary_id = primary_id.tobytes()
+
+        # The assertion MUST be from primary credential
+        if credential_id != primary_id:
+            return JsonResponse({"error": "Not primary credential"}, status=403)
+
+        client_data_json = websafe_decode(response["response"]["clientDataJSON"])
+        authenticator_data = websafe_decode(response["response"]["authenticatorData"])
+        signature = websafe_decode(response["response"]["signature"])
+
+        client_data = CollectedClientData(client_data_json)
+        authenticator_data_obj = AuthenticatorData(authenticator_data)
+
+        server.authenticate_complete(
+            state,
+            [primary_cred.get_credential_data()],
+            credential_id,
+            client_data,
+            authenticator_data_obj,
+            signature,
+        )
+
+        if not authenticator_data_obj.is_user_verified:
+            return JsonResponse({"error": "User verification required"}, status=400)
+
+        # signCount anti-clone (même logique que add approval)
+        current_counter = authenticator_data_obj.counter
+        if primary_cred.supports_sign_count and current_counter <= primary_cred.sign_count:
+            logger.warning(f"Possible clone during delete approval for user {request.user.id}")
+            return JsonResponse({"error": "Possible cloned authenticator detected"}, status=400)
+
+        if current_counter > primary_cred.sign_count and not primary_cred.supports_sign_count:
+            primary_cred.supports_sign_count = True
+
+        primary_cred.sign_count = current_counter
+        primary_cred.save()
+
+        # Delete target credential
+        try:
+            target_bin = websafe_decode(target_cred_id)
+            target = WebAuthnCredential.objects.get(user=request.user, credential_id=target_bin)
+        except WebAuthnCredential.DoesNotExist:
+            # Already deleted -> ok
+            target = None
+
+        if target and target.is_primary:
+            return JsonResponse({"error": "Cannot delete primary device"}, status=403)
+
+        if target:
+            deleted_name = target.name
+            target.delete()
+        else:
+            deleted_name = "Unknown"
+
+        # Log (optionnel mais utile)
+        AuthenticationLog.objects.create(
+            user=request.user,
+            ip_address=request.META.get("REMOTE_ADDR"),
+            device_name=deleted_name,
+            success=True,
+            metadata={"privileges": "delete_device"},
+        )
+
+        # cleanup session
+        request.session.pop("del_cred_approval_state", None)
+        request.session.pop("del_target_cred_id", None)
+
+        return JsonResponse({"status": "OK"})
+
+
 
 @method_decorator(csrf_exempt, name='dispatch')
 class FinishAddCredential(View):
@@ -487,17 +629,20 @@ class UserActivity(View):
             'success': log.success
         } for log in logs], safe=False)
 
+@method_decorator(csrf_exempt, name="dispatch")
 class DeleteCredential(View):
-    @method_decorator(csrf_exempt)
     @method_decorator(login_required)
     def delete(self, request, cred_id):
         if not is_primary_device(request):
             return JsonResponse({'error': 'Access restricted to primary device'}, status=403)
+
         try:
             cred_id_bin = websafe_decode(cred_id)
             cred = WebAuthnCredential.objects.get(user=request.user, credential_id=cred_id_bin)
+
             if cred.is_primary:
                 return JsonResponse({'error': 'Cannot delete primary device'}, status=403)
+
             cred.delete()
             return JsonResponse({'status': 'OK'})
         except WebAuthnCredential.DoesNotExist:
