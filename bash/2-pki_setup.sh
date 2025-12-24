@@ -8,11 +8,7 @@ say() { echo -e "\033[32m$*\033[0m"; }
 err() { echo -e "\033[31m$*\033[0m"; exit 1; }
 
 script_dir=$(realpath "$(dirname "$0")")
-if [[ -d "$script_dir/../pki" ]]; then
-    PROJECT_ROOT=$(realpath "$script_dir/..")
-else
-    PROJECT_ROOT=$script_dir
-fi
+PROJECT_ROOT=$(realpath "$script_dir/..")
 cd "$PROJECT_ROOT" || err "Failed to enter $PROJECT_ROOT"
 
 # layout variables
@@ -21,7 +17,7 @@ PKI_DIR="$PROJECT_ROOT/pki"
 LEAFS_DIR="$PKI_DIR/leafs"
 ROOTS_DIR="$PKI_DIR/roots"
 
-mkdir -p "$LEAFS_DIR/nginx" "$LEAFS_DIR/client" "$LEAFS_DIR/logger" "$ROOTS_DIR"
+mkdir -p "$LEAFS_DIR/nginx" "$LEAFS_DIR/client" "$LEAFS_DIR/server" "$LEAFS_DIR/logger" "$ROOTS_DIR"
 
 # 1) Fresh password
 ################################################################################
@@ -32,8 +28,6 @@ else
     echo -n "$CA_PASSWORD" > .step-ca-password
     chmod 600 .step-ca-password
 fi
-
-docker buildx use healthsecure-builder 2>/dev/null || true
 
 # 2) Launch new CA
 ################################################################################
@@ -119,22 +113,22 @@ docker exec step-ca bash -c "
     --kty RSA --size 2048
 
   step ca certificate server.healthsecure.local \
-  /home/step/leaf/server.crt \
-  /home/step/leaf/server.key \
-  --provisioner healthsecure-provisioner --password-file \$STEP_PASSWORD_FILE \
-  --san server --san server.healthsecure.local \
-  --san localhost --san 127.0.0.1 --san ::1 \
-  --not-after 8760h \
-  --kty RSA --size 2048
+    /home/step/leaf/server.crt \
+    /home/step/leaf/server.key \
+    --provisioner healthsecure-provisioner --password-file \$STEP_PASSWORD_FILE \
+    --san server --san server.healthsecure.local \
+    --san localhost --san 127.0.0.1 --san ::1 \
+    --not-after 8760h \
+    --kty RSA --size 2048
 
-  step ca certificate server.healthsecure.local \
-  /home/step/leaf/logger.crt \
-  /home/step/leaf/logger.key \
-  --provisioner healthsecure-provisioner --password-file \$STEP_PASSWORD_FILE \
-  --san server --san logger.healthsecure.local \
-  --san localhost --san 127.0.0.1 --san ::1 \
-  --not-after 8760h \
-  --kty RSA --size 2048
+  step ca certificate logger.healthsecure.local \
+    /home/step/leaf/logger.crt \
+    /home/step/leaf/logger.key \
+    --provisioner healthsecure-provisioner --password-file \$STEP_PASSWORD_FILE \
+    --san logger --san logger.healthsecure.local \
+    --san localhost --san 127.0.0.1 --san ::1 \
+    --not-after 8760h \
+    --kty RSA --size 2048
 
 "
 
@@ -143,7 +137,7 @@ docker exec step-ca bash -c "
 docker exec step-ca bash -c "
   set -e
   INT=/home/step/certs/intermediate_ca.crt
-  for name in nginx client; do
+  for name in nginx client server logger; do
     cat /home/step/leaf/\${name}.crt \"\$INT\" > /home/step/leaf/\${name}.fullchain.crt
   done"
 
@@ -152,14 +146,13 @@ docker cp step-ca:/home/step/certs/intermediate_ca.crt "$ROOTS_DIR/intermediate_
 ln -sf intermediate_ca.crt "$ROOTS_DIR/$(openssl x509 -noout -hash -in "$ROOTS_DIR/intermediate_ca.crt").0"
 command -v c_rehash >/dev/null 2>&1 && c_rehash "$ROOTS_DIR" || openssl rehash "$ROOTS_DIR"
 
-
-# 7) Copy leaf certs to host
+# 6) Copy leaf certs to host
 ################################################################################
-for name in nginx client; do
+for name in nginx client server logger; do
   remote_base="/home/step/leaf/${name}"
   local_dir="$LEAFS_DIR/${name}"
   docker cp step-ca:${remote_base}.fullchain.crt "$local_dir/fullchain.crt"
-  docker cp step-ca:${remote_base}.key             "$local_dir/${name}.key"
+  docker cp step-ca:${remote_base}.key           "$local_dir/${name}.key"
 done
 
 CHAIN="$ROOTS_DIR/clients_ca_chain.pem"
@@ -172,18 +165,30 @@ docker rm -f step-ca step-ca-bootstrap 2>/dev/null || true
 export SSL_CERT_FILE="$ROOTS_DIR/step-root.pem" # CAfile(anchor)
 export SSL_CERT_DIR="$ROOTS_DIR" # CApath(c_rehash)
 
-# fingerprint from fullchain (leaf first cert)
-NGINX_CERT_PATH="$LEAFS_DIR/nginx/fullchain.crt"
-CERT_FINGERPRINT=$(openssl x509 -in "$NGINX_CERT_PATH" -pubkey -noout | openssl pkey -pubin -outform DER | openssl dgst -sha256 -binary | openssl base64 -A)
+# fingerprints
 CA_ROOT_FINGERPRINT=$(openssl x509 -in "$ROOTS_DIR/step-root.pem" -outform der | openssl dgst -sha256 | sed 's/^.* //' | tr 'A-F' 'a-f')
 
-say "CA root SHA-256 fingerprint:"; printf "%s $CA_ROOT_FINGERPRINT"
-say "\nNginx cert SHA-256 fingerprint:"; printf "%s $CERT_FINGERPRINT"
+SERVER_CERT_PATH="$LEAFS_DIR/server/fullchain.crt"
+SERVER_CERT_FINGERPRINT=$(openssl x509 -in "$SERVER_CERT_PATH" -pubkey -noout | openssl pkey -pubin -outform DER | openssl dgst -sha256 -binary | openssl base64 -A)
+
+say "CA root SHA-256 fingerprint:"; printf " %s\n" "$CA_ROOT_FINGERPRINT"
+say "Server cert SHA-256 fingerprint:"; printf " %s\n" "$SERVER_CERT_FINGERPRINT"
+
+# Set in .env
+if grep -q '^PUBLIC_CA_ROOT_FINGERPRINT=' "$ENV_FILE"; then
+  sed -i.bak "s|^PUBLIC_CA_ROOT_FINGERPRINT=.*|PUBLIC_CA_ROOT_FINGERPRINT=$CA_ROOT_FINGERPRINT|" "$ENV_FILE"
+else
+  echo "PUBLIC_CA_ROOT_FINGERPRINT=$CA_ROOT_FINGERPRINT" >> "$ENV_FILE"
+fi
+
+if grep -q '^PUBLIC_BACKEND_CERT_FINGERPRINT=' "$ENV_FILE"; then
+  sed -i.bak "s|^PUBLIC_BACKEND_CERT_FINGERPRINT=.*|PUBLIC_BACKEND_CERT_FINGERPRINT=$SERVER_CERT_FINGERPRINT|" "$ENV_FILE"
+else
+  echo "PUBLIC_BACKEND_CERT_FINGERPRINT=$SERVER_CERT_FINGERPRINT" >> "$ENV_FILE"
+fi
 
 printf "\n"
-
 
 DOCKER_SCRIPT="$PROJECT_ROOT/bash/3-run.sh"
 say "PKI ready, next step:"
 say "         (here) file://$DOCKER_SCRIPT"
-

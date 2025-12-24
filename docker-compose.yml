@@ -8,6 +8,8 @@ services:
       STEPDEBUG: "0"
     volumes:
       - stepca-data:/home/step
+    ports: 
+      - "9000-9001:9000-9001"
     healthcheck:
       test: ["CMD-SHELL", "step ca health --ca-url https://step-ca:9000 --root /home/step/certs/root_ca.crt 2>/dev/null | grep -q '^ok' || exit 1"]
       interval: 20s
@@ -87,7 +89,18 @@ services:
       - client
       - server
 
+  # logger:
+  #   build: ./logger
+  #   volumes:
+  #     - ./pki/leafs/logger/fullchain.crt:/tls/logger.crt:ro
+  #     - ./pki/leafs/logger/logger.key:/tls/logger.key:ro
+  #   depends_on:
+  #     - step-ca
+  #   expose:
+  #     - "some_port"
+
 volumes:
   postgres_data:
   stepca-data:
     external: true
+
