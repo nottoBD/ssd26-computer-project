@@ -3,10 +3,10 @@ import react from "@vitejs/plugin-react-swc";
 import tailwindcss from "@tailwindcss/vite";
 import path from "path";
 import fs from "fs";
-import { tanstackRouter } from '@tanstack/router-plugin/vite'
+import { tanstackRouter } from "@tanstack/router-plugin/vite";
 
 export default defineConfig({
-    plugins: [
+  plugins: [
     tanstackRouter({
       routesDirectory: "./src/routes",
       generatedRouteTree: "./src/routeTree.gen.ts",
@@ -20,9 +20,10 @@ export default defineConfig({
   server: {
     host: true,
     port: 5173,
+    strictPort: true,
     https: (() => {
-      const keyPath = process.env.TLS_KEY_PATH ?? "./localhost-key.pem";
-      const certPath = process.env.TLS_CERT_PATH ?? "./localhost.pem";
+      const keyPath = process.env.TLS_KEY_PATH;
+      const certPath = process.env.TLS_CERT_PATH;
       if (fs.existsSync(keyPath) && fs.existsSync(certPath)) {
         return {
           key: fs.readFileSync(keyPath),
@@ -33,9 +34,16 @@ export default defineConfig({
     })(),
     proxy: {
       "/api": {
-        target: "http://server:8000",
+        target: "https://server:8000",
         changeOrigin: true,
+        secure: false, // Disable internal cert verification for dev (self-signed chain)
       },
+    },
+    hmr: {
+      protocol: "wss",
+      host: "healthsecure.local",
+      port: 3443,
+      clientPort: 3443,
     },
   },
   resolve: {
@@ -44,3 +52,4 @@ export default defineConfig({
     },
   },
 });
+

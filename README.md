@@ -41,7 +41,7 @@ done
 ## Simulate TLS Handshake
 ### OpenSSL Client
 ```bash
-echo | openssl s_client -connect localhost:3443 -CAfile pki/roots/step-root.pem -showcerts -quiet
+echo | openssl s_client -connect localhost:3443 -CAfile pki/roots/step-root.pem -showcerts
 ```
 
 ### Curl Verbose

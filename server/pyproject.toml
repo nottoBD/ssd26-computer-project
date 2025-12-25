@@ -10,15 +10,19 @@ dependencies = [
     "dj-database-url>=3.0.1",
     "django>=6.0",
     "django-cors-headers>=4.9.0",
+    "django-recaptcha>=4.1.0",
     "djangorestframework>=3.16.1",
     "fido2==1.1.3",
+    "gunicorn>=23.0.0",
     "psycopg2-binary>=2.9.11",
     "python-dotenv>=1.2.1",
+    "requests>=2.32.5",
     "whitenoise>=6.11.0",
 ]
 
 [dependency-groups]
 dev = [
     "black>=25.11.0",
+    "pytest-django>=4.11.1",
     "ruff>=0.14.8",
 ]

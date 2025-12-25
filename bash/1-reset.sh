@@ -22,7 +22,6 @@ cd "$PROJECT_ROOT" || err "Cannot cd into project root ($PROJECT_ROOT)"
 trap 'cd "$PROJECT_ROOT"' EXIT
 
 PKI_DIR="$PROJECT_ROOT/pki"
-NGINX_DIR="$PROJECT_ROOT/nginx/pins"
 
 # 1) Stop stack
 ############################################################################
@@ -59,7 +58,6 @@ say "Cleaning-up certs"
 USER_ID=$(id -un)
 
 clean_tree "$PKI_DIR"
-clean_tree "$NGINX_DIR"
 
 rm -f "$PROJECT_ROOT/step-root.pem" "$PROJECT_ROOT/.step-ca-password" "$PROJECT_ROOT/${USER_ID}.p12"
 

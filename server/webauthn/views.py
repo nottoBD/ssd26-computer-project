@@ -1,7 +1,9 @@
+# Modified server/webauthn/views.py
 import json
 import uuid
 import types
 import enum
+import requests
 from base64 import urlsafe_b64decode, urlsafe_b64encode
 
 from django.http import JsonResponse
@@ -24,6 +26,8 @@ import secrets
 from datetime import timedelta
 from django.utils import timezone
 from .utils import get_server
+from django.conf import settings
+
 
 logger = logging.getLogger(__name__)
 
@@ -46,11 +50,90 @@ def to_serializable(obj):
         return obj.value
     return obj
 
+def verify_certificate(certificate):
+    import tempfile
+    import os
+    import subprocess
+
+    cert = certificate.split("-----END CERTIFICATE-----")[0] + "-----END CERTIFICATE-----\n"
+
+    cert_file = tempfile.NamedTemporaryFile(delete=False, suffix=".pem")
+    try:
+        cert_file.write(cert.encode("utf-8"))
+        cert_file.flush()
+        cert_file.close()
+
+        verify = subprocess.run(
+            [
+                "openssl",
+                "verify",
+                "-CAfile",
+                STEP_ROOT,
+                "-untrusted",
+                STEP_INTERMEDIATE,
+                cert_file.name,
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        if "OK" not in verify.stdout:
+            return {"valid": False, "detail": verify.stderr}
+
+        inspect = subprocess.run(
+            [
+                "openssl",
+                "x509",
+                "-in",
+                cert_file.name,
+                "-noout",
+                "-subject",
+                "-nameopt",
+                "RFC2253",
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        cn = None
+        subject = inspect.stdout.strip()
+        if "CN=" in subject:
+            cn = subject.split("CN=")[-1].split(",")[0].strip()
+
+        return {"valid": True, "cn": cn}
+    except subprocess.CalledProcessError as exc:
+        return {"valid": False, "detail": exc.stderr}
+    finally:
+        try:
+            os.unlink(cert_file.name)
+        except OSError:
+            pass
+
 
 @method_decorator(csrf_exempt, name="dispatch")
 class StartRegistration(View):
     def post(self, request):
         data = json.loads(request.body)
+
+        # -- ReCAPTCHA
+        recaptcha_token = data.get("recaptcha_token")
+        if not recaptcha_token:
+            return JsonResponse({"error": "reCAPTCHA token required"}, status=400)
+
+
+        verify_url = "https://www.google.com/recaptcha/api/siteverify"
+        verify_data = {
+            "secret": settings.RECAPTCHA_SECRET_KEY,
+            "response": recaptcha_token,
+            "remoteip": request.META.get("REMOTE_ADDR"),  # better scoring
+        }
+        verify_resp = requests.post(verify_url, data=verify_data)
+        verify_json = verify_resp.json()
+
+        if not verify_json.get("success") or verify_json.get("score", 0) < settings.RECAPTCHA_SCORE_THRESHOLD:
+            return JsonResponse({"error": "reCAPTCHA verification failed - are you for real?"}, status=400)
+        # --- --- ---
+
 
         email = data["email"].strip().lower()
         if User.objects.filter(email=email).exists():
@@ -66,6 +149,19 @@ class StartRegistration(View):
         )
         user.is_active = False
         user.save()
+
+        if user.type == User.Type.DOCTOR:
+            certificate = data.get("certificate")
+            if not certificate:
+                return JsonResponse({"error": "Certificate required for doctor registration"}, status=400)
+            verify_result = verify_certificate(certificate)
+            if not verify_result.get("valid"):
+                return JsonResponse({"error": "Invalid certificate", "detail": verify_result.get("detail")}, status=400)
+            expected_cn = f"{data['first_name']} {data['last_name']}"
+            if verify_result["cn"] != expected_cn:
+                return JsonResponse({"error": "Certificate name mismatch"}, status=400)
+            user.certificate = certificate
+            user.save()
 
         if user.type == User.Type.PATIENT:
             PatientRecord.objects.create(patient=user)
@@ -566,7 +662,7 @@ class StartAddWithCode(View):
             user = User.objects.get(email=email)
             if not WebAuthnCredential.objects.filter(user=user, is_primary=True).exists():
                 return JsonResponse({"error": "Primary device required"}, status=403)
-            
+
             if user.pending_add_code != code or user.pending_add_expiry < timezone.now():
                 raise ValueError("Invalid or expired code")
 
@@ -688,5 +784,3 @@ def is_primary_device(request):
         return True
     except WebAuthnCredential.DoesNotExist:
         return False
-
-

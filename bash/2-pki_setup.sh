@@ -151,8 +151,9 @@ command -v c_rehash >/dev/null 2>&1 && c_rehash "$ROOTS_DIR" || openssl rehash "
 for name in nginx client server logger; do
   remote_base="/home/step/leaf/${name}"
   local_dir="$LEAFS_DIR/${name}"
-  docker cp step-ca:${remote_base}.fullchain.crt "$local_dir/fullchain.crt"
-  docker cp step-ca:${remote_base}.key           "$local_dir/${name}.key"
+  docker cp step-ca:${remote_base}.crt                  "$local_dir/${name}.crt"
+  docker cp step-ca:${remote_base}.fullchain.crt        "$local_dir/fullchain.crt"
+  docker cp step-ca:${remote_base}.key                  "$local_dir/${name}.key"
 done
 
 CHAIN="$ROOTS_DIR/clients_ca_chain.pem"

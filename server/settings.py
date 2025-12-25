@@ -13,6 +13,8 @@ ALLOWED_HOSTS = os.getenv("ALLOWED_HOSTS", "localhost,127.0.0.1,healthsecure.loc
 
 AUTH_USER_MODEL = "accounts.User"
 
+# webauthn = our own custom implementation (PRF support, sign-count, anomaly detection, multi-device mngmt)
+
 INSTALLED_APPS = [
     "django.contrib.admin",
     "django.contrib.auth",
@@ -20,6 +22,7 @@ INSTALLED_APPS = [
     "django.contrib.sessions",
     "django.contrib.messages",
     "django.contrib.staticfiles",
+    "django.contrib.humanize",
     # 3rd party
     "rest_framework",
     "corsheaders",
@@ -42,18 +45,18 @@ ROOT_URLCONF = "urls"
 
 DATABASES = {
     'default': dj_database_url.config(
-        default=f"sqlite:///{BASE_DIR / 'db.sqlite3'}"
+        default=f"sqlite:///{BASE_DIR / 'db.sqlite3'}",
+        conn_max_age=600,
+        conn_health_checks=True,
     )
 }
 
-# DRF
 REST_FRAMEWORK = {
     "DEFAULT_PERMISSION_CLASSES": [
         "rest_framework.permissions.AllowAny",
     ],
 }
 
-# For django.contrib.admin
 TEMPLATES = [
     {
         "BACKEND": "django.template.backends.django.DjangoTemplates",
@@ -69,16 +72,19 @@ TEMPLATES = [
         },
     },
 ]
-# CORS (dev only)
-CORS_ALLOW_ALL_ORIGINS = True
+
+CORS_ALLOW_ALL_ORIGINS = False
 
 CSRF_COOKIE_SECURE = True
-CSRF_COOKIE_HTTPONLY = True
-CSRF_TRUSTED_ORIGINS = [
-    "http://localhost:5173",
-    "https://localhost:5173",
-]
 
+CSRF_COOKIE_HTTPONLY = True
+
+SESSION_COOKIE_AGE = 10
+
+CSRF_ALLOWED_ORIGINS = [
+    "https://healthsecure.local:3443",
+    "https://localhost:3443",
+]
 
 CSRF_TRUSTED_ORIGINS = os.getenv(
     "CSRF_TRUSTED_ORIGINS",
@@ -86,6 +92,7 @@ CSRF_TRUSTED_ORIGINS = os.getenv(
 ).split(",")
 
 SECURE_PROXY_SSL_HEADER = ("HTTP_X_FORWARDED_PROTO", "https")
+
 USE_X_FORWARDED_HOST = True
 
 STATIC_URL = "static/"
@@ -106,3 +113,36 @@ LOGGING = {
         },
     },
 }
+
+SESSION_COOKIE_SECURE = True
+
+AUTHENTICATION_BACKENDS = [
+    "django.contrib.auth.backends.ModelBackend",
+]
+
+ACCOUNT_USER_MODEL_USERNAME_FIELD = None
+
+ACCOUNT_LOGIN_FIELDS = ["email"]
+
+ACCOUNT_ADAPTER = "accounts.adapters.CustomAccountAdapter"
+
+ACCOUNT_FORMS = {"signup": "accounts.forms.CustomSignupForm"}
+
+ACCOUNT_LOGIN_METHODS = {"email"}
+
+ACCOUNT_SIGNUP_FIELDS = ['email*']
+
+ACCOUNT_DEFAULT_HTTP_PROTOCOL = "https"
+
+WEBAUTHN_RP_ID = "healthsecure.local"
+
+WEBAUTHN_RP_NAME = "HealthSecure"
+
+WEBAUTHN_ORIGIN = "https://healthsecure.local:3443"
+
+RECAPTCHA_SITE_KEY = os.getenv("RECAPTCHA_SITE_KEY", "6LcvdjYsAAAAAI4qUf4My6wWKkf8cIJW2vEG7h01")  # frontend PubKey, dev only
+
+RECAPTCHA_SECRET_KEY = os.getenv("RECAPTCHA_SECRET_KEY", "6LcvdjYsAAAAALRD-sSqyR7I9B3dRFGsn8LqP2r8") #INFO: dev only
+
+RECAPTCHA_SCORE_THRESHOLD = 0.5  # 0<=val<=1
+

@@ -4,8 +4,8 @@ from django.conf import settings
 import os
 from base64 import urlsafe_b64decode
 
-rp_id = os.getenv("RP_ID", "localhost")
-rp_name = "HealthSecure Project"
+rp_id = os.getenv("RP_ID", "healthsecure.local")
+rp_name = "HealthSecure"
 
 rp = PublicKeyCredentialRpEntity(id=rp_id, name=rp_name)
 server = Fido2Server(rp, attestation="none")  # "none" = maximum compatibility & privacy
