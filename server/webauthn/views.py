@@ -4,6 +4,7 @@ import uuid
 import types
 import enum
 import requests
+import os
 from base64 import urlsafe_b64decode, urlsafe_b64encode
 
 from django.http import JsonResponse
@@ -28,7 +29,8 @@ from django.utils import timezone
 from .utils import get_server
 from django.conf import settings
 
-
+STEP_ROOT = os.getenv("STEP_ROOT", "/ca/certs/root_ca.crt")
+STEP_INTERMEDIATE = os.getenv("STEP_INTERMEDIATE", "/ca/certs/intermediate_ca.crt")
 logger = logging.getLogger(__name__)
 
 # Using sha256 of a unique string → always the same salts → same PRF output on every device for the same credential
@@ -149,7 +151,7 @@ class StartRegistration(View):
         )
         user.is_active = False
         user.save()
-
+        # in verify_result["cn"] expected_cn is now email
         if user.type == User.Type.DOCTOR:
             certificate = data.get("certificate")
             if not certificate:
@@ -157,7 +159,7 @@ class StartRegistration(View):
             verify_result = verify_certificate(certificate)
             if not verify_result.get("valid"):
                 return JsonResponse({"error": "Invalid certificate", "detail": verify_result.get("detail")}, status=400)
-            expected_cn = f"{data['first_name']} {data['last_name']}"
+            expected_cn = email
             if verify_result["cn"] != expected_cn:
                 return JsonResponse({"error": "Certificate name mismatch"}, status=400)
             user.certificate = certificate
@@ -784,3 +786,4 @@ def is_primary_device(request):
         return True
     except WebAuthnCredential.DoesNotExist:
         return False
+

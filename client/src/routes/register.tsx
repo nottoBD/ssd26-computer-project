@@ -50,11 +50,11 @@ function RegisterPage() {
         const formData = new FormData(formRef.current);
         const firstName = formData.get("firstName") as string;
         const lastName = formData.get("lastName") as string;
-        const email = formData.get("email") as string;
+        const email = (formData.get("email") as string).trim().toLowerCase();
         const medicalOrganization = formData.get("medicalOrganization") as string;
 
-        if (!firstName.trim() || !lastName.trim() || !email.trim() || !medicalOrganization.trim()) {
-          throw new Error("Please fill in first name, last name, email, and medical organization before generating certificate");
+        if (!firstName.trim() || !lastName.trim() || !email.trim()) {
+          throw new Error("Please fill in first name, last name, and email before generating certificate");
         }
 
         setLoading(true);
@@ -73,20 +73,17 @@ function RegisterPage() {
 
         const csr = new pkijs.CertificationRequest();
 
+        // Problem patch : 
+        // Order of DN in CSR
+        // CN is now email and not surname name
+        
         const cnAttr = new pkijs.AttributeTypeAndValue({
-          type: "2.5.4.3", // CN
-          value: new asn1js.Utf8String({ value: `${firstName} ${lastName}` })
+          type: "2.5.4.3", // CN = email address
+          value: new asn1js.Utf8String({ value: email })
         });
 
-
-        if (medicalOrganization.trim()) {
-          const oAttr = new pkijs.AttributeTypeAndValue({
-            type: "2.5.4.10", // O
-            value: new asn1js.Utf8String({ value: medicalOrganization })
-          });
-          csr.subject.typesAndValues.push(oAttr);
-        }
         csr.subject.typesAndValues.push(cnAttr);
+
         await csr.subjectPublicKeyInfo.importKey(keyPair.publicKey);
 
         // Add Subject Alternative Name extension for email
@@ -121,6 +118,8 @@ function RegisterPage() {
         const csrDer = csr.toSchema().toBER(false);
         const csrPem = `-----BEGIN CERTIFICATE REQUEST-----\n${btoa(String.fromCharCode(...new Uint8Array(csrDer))).match(/.{1,64}/g)?.join("\n")}\n-----END CERTIFICATE REQUEST-----`;
 
+        console.log("Generated CSR:", csrPem);
+
         const signResp = await fetch("/api/ca/sign/", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
@@ -151,9 +150,10 @@ function RegisterPage() {
         const certBlob = new Blob([certificate], { type: "text/plain" });
         setCertFile(new File([certBlob], "doctor_cert.pem"));
 
-        alert("Certificate generated! Private key downloaded - store it securely.");
+        alert("Certificate generated! Private key downloaded - store it securely.\nNote: Organization info included in CN field.");
 
       } catch (err) {
+        console.error("Certificate generation error:", err);
         setError((err as Error).message);
       } finally {
         setLoading(false);
@@ -483,3 +483,4 @@ function RegisterPage() {
     </div>
   );
 }
+

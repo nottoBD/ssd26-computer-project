@@ -105,6 +105,8 @@ def ca_root(_request):
     return HttpResponse(root_pem, content_type="text/plain")
 
 
+
+
 @api_view(["POST"])
 @permission_classes([AllowAny])
 def ca_sign(request):
@@ -131,7 +133,10 @@ def ca_sign(request):
 
         if not email_sans:
             raise ValueError("No email SAN in CSR")
-        subject = email_sans[0].value
+        
+        # no need .value here
+        subject = email_sans[0]  
+        
     except Exception as exc:
         return Response({"message": "Failed to parse CSR", "detail": str(exc)}, status=400)
 
@@ -160,6 +165,7 @@ def ca_sign(request):
             STEP_PROVISIONER,
             "--output-file",
             token_file.name,
+            "--force",  # add --force to avoid problem
         ]
         if not_after:
             token_args.extend(["--not-after", str(not_after)])
