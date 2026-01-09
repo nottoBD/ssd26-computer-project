@@ -1,96 +1,29 @@
-# PKI Integration Verification README
+## User Management
 
-This README lists commands to verify the PKI setup after running `bash/2-pki_setup.sh` and `bash/3-run.sh`. Run these from the project root to ensure the certificate chain is effective and gap-free.
+- **Credential/Info Changes (Master Note)**: Implement PUT `/api/users/credentials` for updating WebAuthn credentials or certs. Client generates new keypair, signs update request; server revokes old cert via CRL update in PKI (using oscrypto or similar for CRL management). Support multi-device: broadcast changes to approved devices via WebSocket (ws module), require secondary approval if primary initiates.
 
-## Inspect Individual Certificates
+- **Revocation**: Add DELETE `/api/users/revoke` endpoint. Client signs revocation; server marks user inactive, adds cert to CRL, cascades to remove from appointed lists (atomic transaction with mongoose-transactions). Prevent access to records post-revocation by checking CRL on every request.
 
-### Root CA
+## Doctor Appointment Management
 
-```bash
-openssl x509 -in pki/roots/step-root.pem -noout -text -fingerprint -sha256
-```
+- **Add/Remove Doctors**: For patient-initiated: POST/DELETE `/api/appointments/doctor/:doctorId` from client, signed by patient cert. Server verifies sig, updates patient's encrypted appointedDoctors array (decrypt not needed; use blinded index for doctor ID search). Sanitize :doctorId with express-validator to prevent Mongo injection.
 
+- **Doctor-Initiated Appointments**: POST `/api/appointments/request/:patientId` from doctor client, signed. Server stores pending request in temp collection, notifies patient via email (nodemailer) or push (if implemented). Patient approves via PUT `/api/appointments/approve/:requestId`, signing approval; server then updates lists. Use uuid for requestId to avoid guessable IDs.
 
-### Intermediate CA
-```bash
-openssl x509 -in pki/roots/intermediate_ca.crt -noout -text -fingerprint -sha256
-```
+- **Integrity/Non-Repudiation**: Chain appointment history with hashes (previousHash field in schema), verify on read to detect tampering. Use helmet middleware for CSP/XSS protection on related endpoints.
 
-### Leaf Certificates 
-```bash
-for leaf in nginx server logger client; do
-  echo "Inspecting $leaf:"
-  openssl x509 -in pki/leafs/$leaf/fullchain.crt -noout -text -fingerprint -sha256 | head -n 30
-  echo ""
-done
-```
+## Medical Record Management
 
-## Verify Chain of Trust
+- **Record Structure**: Model in `server/models/record.js` as tree: Patient has root Record doc with files array (each: encryptedContent as Binary, encryptedName as string, date as Date, signatures array). Support directory depth up to 5 (config const); store treeDepth in metadata. No subdirs enforced, but allow nested via parentId refs.
 
-### With Intermediates as Untrusted
+- **Viewing Records**: GET `/api/records/:patientId` (for self or appointed doctor). Server checks caller cert against appointed list (blinded query), sends encrypted files. Client decrypts/verifies sigs. For doctors, require re-auth if session >1h (using express-session with secure cookies).
 
-```bash
-for leaf in nginx server logger client; do
-  echo "Verifying $leaf:"
-  openssl verify -verbose -CAfile pki/roots/step-root.pem -untrusted pki/roots/intermediate_ca.crt pki/leafs/$leaf/fullchain.crt
-  echo ""
-done
-```
+- **Uploading Files**: POST `/api/records/upload` using multer (diskStorage with uuid filenames, limits: {fileSize: 10*1024*1024}, fileFilter: validate MIME with file-type module to allow pdf/docx/jpg/png only, reject others to prevent shell injections). Client encrypts file/content/date/name, signs; server stores, adds to tree. Sandbox uploads: process in /tmp dir, use fs.promises.unlink post-upload. For doctor-initiated: require patient approval via signed token (JWT with jose module, short expiry).
 
+- **Editing Files**: PUT `/api/records/:fileId` similar to upload, but append version (use mongoose-version plugin for auto-versioning). Client re-encrypts new content, signs; server replaces, preserves old version hash for audit.
 
-## Simulate TLS Handshake
-### OpenSSL Client
-```bash
-echo | openssl s_client -connect localhost:3443 -CAfile pki/roots/step-root.pem -showcerts
-```
+- **Deleting Files**: DELETE `/api/records/:fileId`, signed by patient/approved doctor. Server marks as deleted (soft delete with isDeleted flag), overwrites content with zeros (via node:crypto randomBytes) to mitigate remanence. Ensure non-repudiation by logging signed delete request immutably.
 
-### Curl Verbose
-```bash
-curl -v --cacert pki/roots/step-root.pem https://localhost:3443/api/health/
-```
+- **Doctor Actions Approval**: For upload/edit/delete by doctor, create pendingAction doc, patient approves via multi-device flow (poll endpoint or WebSocket). Use rate-limit on approvals to prevent spam.
 
-## Check Certificate Validity Dates
-### Root CA
-```bash
-openssl x509 -in pki/roots/step-root.pem -noout -dates
-```
-
-### Intermediate CA
-```bash
-openssl x509 -in pki/roots/intermediate_ca.crt -noout -dates
-```
-
-### Leaf Certificates
-```bash
-for leaf in nginx server logger client; do
-  echo "Validity dates for $leaf:"
-  openssl x509 -in pki/leafs/$leaf/fullchain.crt -noout -dates | head -n 2
-  echo ""
-done
-```
-
-
-## Check Revocation (OCSP/CRL)
-This project uses the free community edition of Smallstep's step-ca, which does not support OCSP responders. For CRL, while passive revocation is available (e.g., via step ca revoke), we have opted not to enable active CRL distribution points or endpoints in certificates to keep the setup minimal and aligned with core project requirements.
-### Check Certificate Extensions
-```bash
-openssl x509 -in pki/leafs/nginx/fullchain.crt -noout -ext crlDistributionPoints,ocsp
-```
-
-
-## Additional Integrity Checks
-### No PrivKey in Chain
-```bash
-grep -q "PRIVATE KEY" pki/leafs/nginx/fullchain.crt && echo "Error: Private key in chain!" || echo "OK: No private keys in chain"
-```
-
-### Root PubKey Fingerprint
-```bash
-openssl x509 -in pki/roots/step-root.pem -pubkey -noout | openssl pkey -pubin -outform der | openssl dgst -sha256 | awk '{print $2}'
-```
-
-## Docker Mount Inspection
-```bash
-docker inspect nginx | jq '.[0].Mounts[] | select(.Destination | contains("/etc/ssl"))'
-```
-
+- **Key Rotation**: Implement PUT `/api/records/rotate-key` for per-patient symmetric key rotation to limit breach impact. Each patient's records use a unique symmetric key, derived via PBKDF2 from their WebAuthn credential (or cert passphrase) + salt. Store encrypted key metadata (e.g., version, creation date) on server as blinded index. Client generates new AES-GCM 256-bit key (crypto.subtle.generateKey), optionally re-encrypts existing files in batches (download, decrypt with old, encrypt with new, re-upload). Share new key with appointed doctors via ECDH (from X.509 certs) for secure wrap (crypto.subtle.wrapKey). Trigger manually or auto (every 90 days, timestamp check on login). Require multi-device approval. Retain old keys client-side in IndexedDB for historical decryption; purge after full re-encryption.
