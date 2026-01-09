@@ -18,12 +18,14 @@ import {
   startRegistration,
   base64URLStringToBuffer,
 } from "@simplewebauthn/browser";
+import { useAuth } from "./__root";
 
 export const Route = createFileRoute("/settings")({
   component: SettingsPage,
 });
 
 function SettingsPage() {
+  const { refreshAuth } = useAuth();
   const [credentials, setCredentials] = useState<any[]>([]);
   const [activity, setActivity] = useState<any[]>([]);
   const [loading, setLoading] = useState(true);
@@ -84,6 +86,7 @@ function SettingsPage() {
       }
     } catch (err) {
       setError((err as Error).message);
+      await refreshAuth();
     } finally {
       setLoading(false);
     }
@@ -379,10 +382,6 @@ function SettingsPage() {
           </Alert>
         )}
 
-        {/* Si tu veux tester l’ajout complet depuis le même appareil (pas réaliste mais utile en dev) */}
-        {/* <Button onClick={() => handleAddSecondary("My Secondary Device")} className="mt-4 ml-2">
-          Add Secondary (test)
-        </Button> */}
       </section>
 
       <section>

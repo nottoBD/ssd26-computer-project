@@ -58,20 +58,18 @@ export const Route = createRootRoute({
         const response = await fetch('/api/webauthn/logout/', {
           method: 'POST',
           credentials: 'include',
-          headers: {
-            'X-CSRFToken': csrfToken,
-          },
+          headers: { 'X-CSRFToken': csrfToken},
         })
-        if (!response.ok) {
-            throw new Error('Logout failed')
-        }
-        setIsAuthenticated(false)
-        navigate({ to: '/' })
       } catch (error) {
-        console.error('Logout failed', error)
+        console.error('Logout request failed', error)
+      } finally {
+        document.cookie = 'sessionid=; expires=Thu, 01 Jan 1970 00:00:00 UTC; path=/; secure; samesite=lax';
+        document.cookie = 'csrftoken=; expires=Thu, 01 Jan 1970 00:00:00 UTC; path=/; secure; samesite=lax';
+        setIsAuthenticated(false);
+        navigate({ to: '/' });
       }
     }
-
+        
     const handleAuthAction = () => {
       if (isAuthenticated) {
         handleLogout()

@@ -758,16 +758,16 @@ class AuthStatus(View):
 @method_decorator(csrf_exempt, name="dispatch")
 class LogoutView(View):
     def post(self, request):
+        response = JsonResponse({"status": "OK"})
         if request.user.is_authenticated:
             logout(request)
-            # Flush session
             request.session.flush()
-            response = JsonResponse({"status": "OK"})
-            # Expire cookies client-side, but server already invalidated
-            response.delete_cookie('sessionid')
-            response.delete_cookie('csrftoken')
-            return response
-        return JsonResponse({"error": "Not authenticated"}, status=401)
+        else:
+            request.session.flush()
+        response.delete_cookie('sessionid')
+        response.delete_cookie('csrftoken')
+        return response
+
 
 def is_primary_device(request):
     if not request.user.is_authenticated:

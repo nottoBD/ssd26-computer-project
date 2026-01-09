@@ -64,7 +64,7 @@ function LoginPage() {
       }
 
       // Step 2: Trigger browser native prompt
-      const credential = await startAuthentication(options);
+      const credential = await startAuthentication({ optionsJSON: options })
 
       // Step 3: Send back to server
       const finishResp = await fetch("/api/webauthn/login/finish/", {

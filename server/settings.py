@@ -79,7 +79,7 @@ CSRF_COOKIE_SECURE = True
 
 CSRF_COOKIE_HTTPONLY = True
 
-SESSION_COOKIE_AGE = 10
+SESSION_COOKIE_AGE = 1200  # 20 minutes
 
 CSRF_ALLOWED_ORIGINS = [
     "https://healthsecure.local:3443",
