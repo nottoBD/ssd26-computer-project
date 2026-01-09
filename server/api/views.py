@@ -1,11 +1,13 @@
 from rest_framework.decorators import api_view, permission_classes
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
+from rest_framework import status
 from django.utils import timezone
 from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PublicKey
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+from accounts.models import User, PatientRecord, DoctorPatientLink
 import json
 import logging
 
@@ -120,6 +122,60 @@ def get_user_public_key(request, user_id):
     except User.DoesNotExist:
         return Response({'error': 'User not found'}, status=404)
 
+@api_view(['DELETE'])
+@permission_classes([IsAuthenticated])
+def remove_doctor(request, doctor_id):
+    if request.user.type != User.Type.PATIENT:
+        return Response({'error': 'Only patients can remove doctors'}, status=403)
+
+    try:
+        doctor = User.objects.get(id=doctor_id, type=User.Type.DOCTOR)
+        link = DoctorPatientLink.objects.get(doctor=doctor, patient=request.user)
+        link.delete()  # Atomic removal
+
+        # Revoke DEK access: remove from patient's record
+        record = request.user.medical_record
+        if str(doctor_id) in record.encrypted_deks:
+            del record.encrypted_deks[str(doctor_id)]
+            record.save()
+
+        metadata = {
+            'time': timezone.now().isoformat(),
+            'size': 0,  # No data size for removal
+            'privileges': 'remove_doctor',
+            'tree_depth': 2,  # Consistent with appointment
+        }
+        logger.info(json.dumps(metadata))
+
+        return Response({'status': 'OK'})
+
+    except (User.DoesNotExist, DoctorPatientLink.DoesNotExist):
+        return Response({'error': 'Invalid doctor or not appointed'}, status=404)
+
+@api_view(['GET'])
+@permission_classes([IsAuthenticated])
+def get_my_doctors(request):
+    if request.user.type != User.Type.PATIENT:
+        return Response({'error': 'Only patients can view appointed doctors'}, status=403)
+
+    links = DoctorPatientLink.objects.filter(patient=request.user)
+    doctors = [
+        {
+            'id': str(link.doctor.id),  # UUID as string
+            'name': f"{link.doctor.first_name} {link.doctor.last_name}"
+        }
+        for link in links
+    ]
+
+    metadata = {
+        'time': timezone.now().isoformat(),
+        'size': len(doctors),  # Number of doctors
+        'privileges': 'read_appointed_doctors',
+        'tree_depth': 1,  # Flat list
+    }
+    logger.info(json.dumps(metadata))
+
+    return Response({'doctors': doctors})
 
 @api_view(['GET'])
 def health(request):

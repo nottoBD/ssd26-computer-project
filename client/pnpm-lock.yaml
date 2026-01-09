@@ -41,6 +41,9 @@ importers:
       '@simplewebauthn/browser':
         specifier: ^13.2.2
         version: 13.2.2
+      '@stablelib/aes':
+        specifier: ^2.0.1
+        version: 2.0.1
       '@stablelib/gcm':
         specifier: ^2.0.1
         version: 2.0.1
@@ -86,6 +89,12 @@ importers:
       react-hook-form:
         specifier: ^7.68.0
         version: 7.68.0(react@19.2.1)
+      sha2:
+        specifier: link:@noble/hashes/sha2
+        version: link:@noble/hashes/sha2
+      sha256:
+        specifier: link:@noble/hashes/sha256
+        version: link:@noble/hashes/sha256
       tailwind-merge:
         specifier: ^3.4.0
         version: 3.4.0
@@ -1191,6 +1200,9 @@ packages:
 
   '@stablelib/aead@2.0.0':
     resolution: {integrity: sha512-U/RMANRxbT/ahIpYsPSiFwDFNjADHdnCFfmo09MO1ai2XmerPAOPtMl0qmX7XVvygnACC6ijKDyHBoT2rGyElg==}
+
+  '@stablelib/aes@2.0.1':
+    resolution: {integrity: sha512-LpDuPe9Cr/IXXJaCHDCAITtVa7uLV6P+Cs3V8lZw87sElX7eOLk1OHTSzzvWagTJf++O+o3EISawHh1uzyi4qw==}
 
   '@stablelib/binary@2.0.1':
     resolution: {integrity: sha512-U9iAO8lXgEDONsA0zPPSgcf3HUBNAqHiJmSHgZz62OvC3Hi2Bhc5kTnQ3S1/L+sthDTHtCMhcEiklmIly6uQ3w==}
@@ -3344,6 +3356,12 @@ snapshots:
   '@simplewebauthn/browser@13.2.2': {}
 
   '@stablelib/aead@2.0.0': {}
+
+  '@stablelib/aes@2.0.1':
+    dependencies:
+      '@stablelib/binary': 2.0.1
+      '@stablelib/blockcipher': 2.0.0
+      '@stablelib/wipe': 2.0.1
 
   '@stablelib/binary@2.0.1':
     dependencies:
