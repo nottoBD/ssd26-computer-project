@@ -1,6 +1,10 @@
 #!/usr/bin/env bash
 
 set -euo pipefail
+cleanup() {
+  docker rm -f step-ca step-ca-bootstrap 2>/dev/null || true
+}
+trap cleanup EXIT
 
 # helpers
 ################################################################################
@@ -69,7 +73,9 @@ else
   echo "STEP_CA_PASSWORD=$CA_PASSWORD" >> "$ENV_FILE"
 fi
 say "STEP_CA_PASSWORD stored in $(basename "$ENV_FILE")"
-shred -u .step-ca-password
+# shred -u .step-ca-password #shred doesnt work on MacOS
+rm -f .step-ca-password
+
 
 # 3) Provisioner
 ################################################################################
