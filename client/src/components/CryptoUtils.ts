@@ -101,7 +101,9 @@ export function bytesToHex(bytes: Uint8Array): string {
 }
 
 export function hexToBytes(hex: string): Uint8Array {
-  return new Uint8Array(
-    hex.match(/.{1,2}/g)!.map((byte) => parseInt(byte, 16)),
-  );
+  if (!hex) {
+    return new Uint8Array();
+  }
+  const bytes = hex.match(/.{1,2}/g)?.map((byte) => parseInt(byte, 16)) ?? [];
+  return new Uint8Array(bytes);
 }

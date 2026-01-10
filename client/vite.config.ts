@@ -20,6 +20,9 @@ export default defineConfig({
   server: {
     host: true,
     port: 5173,
+    watch: {
+      ignored: ["**/.pnpm-store/**"], // Stops Vite watcher from entering symlink loops
+    },
     strictPort: true,
     https: (() => {
       const keyPath = process.env.TLS_KEY_PATH;
@@ -52,4 +55,3 @@ export default defineConfig({
     },
   },
 });
-

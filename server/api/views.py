@@ -15,6 +15,29 @@ logger = logging.getLogger('metadata')
 
 @api_view(['GET'])
 @permission_classes([IsAuthenticated])
+def get_current_user(request):
+    user = request.user
+    data = {
+        'id': str(user.id),
+        'type': user.type,
+        'first_name': user.first_name,
+        'last_name': user.last_name,
+    }
+    if user.type == User.Type.PATIENT:
+        data['date_of_birth'] = user.date_of_birth.isoformat() if user.date_of_birth else None
+    elif user.type == User.Type.DOCTOR:
+        data['medical_organization'] = user.medical_organization
+    metadata = {
+        'time': timezone.now().isoformat(),
+        'size': 0,
+        'privileges': 'read_own_profile',
+        'tree_depth': 1,
+    }
+    logger.info(json.dumps(metadata))
+    return Response(data)
+
+@api_view(['GET'])
+@permission_classes([IsAuthenticated])
 def get_my_record(request):
     if request.user.type != User.Type.PATIENT:
         return Response({'error': 'Only patients have records'}, status=403)
@@ -65,6 +88,9 @@ def appoint_doctor(request):
 
     doctor_id = request.data['doctor_id']
     encrypted_dek = request.data['encrypted_dek']  # ECDH encrypted for doctor
+    if encrypted_dek:
+        record.encrypted_deks[str(doctor_id)] = encrypted_dek
+        record.save()
 
     try:
         doctor = User.objects.get(id=doctor_id, type=User.Type.DOCTOR)
@@ -87,31 +113,37 @@ def appoint_doctor(request):
 
     return Response({'status': 'OK'})
 
+
 @api_view(['GET'])
 @permission_classes([IsAuthenticated])
 def get_patient_record(request, patient_id):
-    if request.user.type != User.Type.DOCTOR:
-        return Response({'error': 'Only doctors access'}, status=403)
+  if request.user.type != User.Type.DOCTOR:
+    return Response({'error': 'Only doctors access'}, status=403)
 
-    try:
-        link = DoctorPatientLink.objects.get(doctor=request.user, patient_id=patient_id)
-    except DoctorPatientLink.DoesNotExist:
-        return Response({'error': 'Not appointed'}, status=403)
+  try:
+    link = DoctorPatientLink.objects.get(doctor=request.user, patient_id=patient_id)
+  except DoctorPatientLink.DoesNotExist:
+    return Response({'error': 'Not appointed'}, status=403)
 
-    record = PatientRecord.objects.get(patient_id=patient_id)
-    metadata = {
-        'time': timezone.now().isoformat(),
-        'size': len(record.encrypted_data),
-        'privileges': 'read_patient_record',
-        'tree_depth': 2,
+  record = PatientRecord.objects.get(patient_id=patient_id)
+  encrypted_dek = record.encrypted_deks.get(str(request.user.id))
+  metadata = {
+    'time': timezone.now().isoformat(),
+    'size': len(record.encrypted_data) if record.encrypted_data else 0,
+    'privileges': 'read_patient_record',
+    'tree_depth': 2,
+  }
+  logger.info(json.dumps(metadata))
+
+  return Response({
+    'encrypted_data': record.encrypted_data.hex() if record.encrypted_data else None,
+    'encrypted_dek': encrypted_dek if encrypted_dek else None,
+    'signature': record.record_signature.hex() if record.record_signature else None,
+    'patient': {
+      'name': f"{record.patient.first_name} {record.patient.last_name}",
+      'dob': record.patient.date_of_birth.isoformat() if record.patient.date_of_birth else None
     }
-    logger.info(json.dumps(metadata))
-
-    return Response({
-        'encrypted_data': record.encrypted_data.hex(),
-        'encrypted_dek': record.encrypted_deks.get(str(request.user.id)),
-        'signature': record.record_signature.hex(),
-    })
+  })
 
 @api_view(['GET'])
 @permission_classes([IsAuthenticated])
@@ -178,6 +210,60 @@ def get_my_doctors(request):
     return Response({'doctors': doctors})
 
 @api_view(['GET'])
+@permission_classes([IsAuthenticated])
+def get_my_patients(request):
+    if request.user.type != User.Type.DOCTOR:
+        return Response({'error': 'Only doctors can view appointed patients'}, status=403)
+
+    links = DoctorPatientLink.objects.filter(doctor=request.user)
+    patients = [
+        {
+            'id': str(link.patient.id),
+            'name': f"{link.patient.first_name} {link.patient.last_name}",
+            'dob': link.patient.date_of_birth.isoformat() if link.patient.date_of_birth else None,
+            'appointedDate': link.appointed_at.isoformat(),
+        }
+        for link in links
+    ]
+
+    metadata = {
+        'time': timezone.now().isoformat(),
+        'size': len(patients),
+        'privileges': 'read_appointed_patients',
+        'tree_depth': 1,
+    }
+    logger.info(json.dumps(metadata))
+
+    return Response({'patients': patients})
+
+@api_view(['GET'])
+@permission_classes([IsAuthenticated])
+def search_doctors(request):
+    if request.user.type != User.Type.PATIENT:
+        return Response({'error': 'Only patients can search doctors'}, status=403)
+
+    q = request.GET.get('q', '')
+    doctors = User.objects.filter(type=User.Type.DOCTOR).filter(
+        Q(first_name__icontains=q) | Q(last_name__icontains=q) | Q(medical_organization__icontains=q)
+    )
+    data = [
+        {
+            'id': str(d.id),
+            'name': f"{d.first_name} {d.last_name}",
+            'org': d.medical_organization
+        } for d in doctors
+    ]
+
+    metadata = {
+        'time': timezone.now().isoformat(),
+        'size': len(data),
+        'privileges': 'search_doctors',
+        'tree_depth': 1,
+    }
+    logger.info(json.dumps(metadata))
+
+    return Response({'doctors': data})
+
+@api_view(['GET'])
 def health(request):
     return Response({"status": "ok", "message": "Backend is running!"})
-
