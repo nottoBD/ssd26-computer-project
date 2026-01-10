@@ -9,9 +9,9 @@
 
 \usepackage[bookmarks=true,bookmarksnumbered]{hyperref}
 \hypersetup{
-	pdftitle={SSD - BOTTON Lab2},
-	pdfauthor={BOTTON David },
-	pdfkeywords={SSD, BO},
+	pdftitle={SSD26 - Medical Records},
+	pdfauthor={BOTTON David, PEETROONS Simon, GERDAY Léandre, VARGA Ferenc, ANDRIANIRINA Mino},
+	pdfkeywords={he2b, ulb, master of cybersecurity, medical records, E2EE, secure software design},
 	bookmarksnumbered,
     breaklinks=true,
     colorlinks=true,
@@ -70,12 +70,11 @@ headheight=16mm,
 \fancyhead{}
 \fancyfoot{}
 \fancyhead[C]{\sffamily%
-{\bfseries\fontsize{15.5pt}{1em}\selectfont\uppercase{Free University of Brussels}}\\
+{\bfseries\fontsize{15.5pt}{1em}\selectfont\uppercase{Haute École Bruxelles-Brabant}}\\
 \fontsize{11.3pt}{1.2em}\selectfont\uppercase{Faculty of Sciences}\\
 \uppercase{Master of Cybersecurity \\ 2025-2026}}\\
 \fancyfoot[C]{\sffamily\fontsize{9pt}{1em}\selectfont%
-ULB CP260, 50 F.D. Roosevelt Avenue, 1050 Brussels, Belgium\\
-Tel: +32 (0)2 650 31 46\\
+Rue Royale 67, 1000 Bruxelles, Belgium\\
     }
 }
 
@@ -125,27 +124,27 @@ Tel: +32 (0)2 650 31 46\\
 
 \null\vfill
 
-{\scshape\large Secure Software Design \& Web Security\par}
+{\scshape\large Secure Software Development \& Web Security\par}
 {\scshape\large Computer Project\par}
 
 \vskip 3\baselineskip
 
-{\LARGE\bfseries E2EE Health\par}
+{\LARGE\bfseries Medical Records System\par}
 
 \vskip 3\baselineskip
 
-Candidates:\\[1.5ex]
+Candidates\\[1.5ex]
 {\large\bfseries\begin{tabular}{@{}r@{\hspace{1.5em}}l@{}}
-    615056 & BOTTON David \\
-    XXXX & GERDAY Léandre \\
-    XXXX & VARGA Ferenc \\
-
-\\
+    Peetroons Simon & (519237) \\
+    Andrianirina Mino & (604350) \\ 
+    Botton David & (615056) \\
+    Gerday Léandre & (616822) \\
+    Varga Ferenc & (617441) \\
 \end{tabular}}
+\vskip 3\baselineskip
 
-
-Advisor:\\[1ex]
-{\large\bfseries Pr. R. Absil\par}
+Advisor\\[1ex]
+{\large\bfseries Professor Absil\par}
 
 \end{center}
 
@@ -167,47 +166,151 @@ Advisor:\\[1ex]
 \clearpage
 \pagenumbering{arabic}
 \pagestyle{fancy}
-\fancyhead[L]{\sffamily\small SSD -- Computer Project}
-\fancyhead[R]{\sffamily\small Group X}
+\fancyhead[L]{\sffamily\small Secure System Design }
+\fancyhead[R]{\sffamily\small 2026 Computer Project}
 \fancyfoot[C]{\thepage}
 \newpage
 
-\section{Secret String in \textit{secret-str}} \label{sec:q1}
+% Per Mélot Section 1 (Introduction): Start with a concise overview of the problem, your approach, and the report's structure. Avoid verbosity; focus on putting your work in value (mettre en valeur). Question: Does this section precisely state objectives without unnecessary background? Is it self-contained yet brief?
 
-I extract human readable text from the binary using a simple \hyperref[lst:A1_strings_command]{command} and discover the secret string. 
+\section{Introduction}
+The goal of this project is to implement a secure client/server system handling medical records, with an untrusted server and emphasis on security.
 
-\section{Stack Smashing Protection in a Code Snippet} \label{sec:q2}
+We designed our system as a Dockerized application using Django for the backend, React for the frontend, Nginx as a reverse proxy, and Step-CA for PKI management. Authentication relies on WebAuthn with PRF extensions for key derivation, supporting multi-device access via a primary-secondary hierarchy. All sensitive data, including medical records, is encrypted client-side using AES-GCM, with keys managed via ECDH for sharing between patients and appointed doctors. The server stores only ciphertexts and metadata, ensuring no access to plaintext even if compromised.
 
-The code provided implements a stack canary mechanism using the guard and secret variables 
-to detect buffer overflows by verifying the integrity of guard. This mechanism can be bypassed in two 
-ways: 
+This approach prioritizes efficiency and security: WebAuthn over passwords to resist phishing, client-side E2EE to maintain confidentiality, and a local PKI chain (Root CA $\to$ Intermediate $\to$ Leaf certs) for TLS.
 
-1. \texttt{Information Leak}: 
+The report is structured as follows: Section 2 describes the system architecture; Section 3 details features and security measures; Section 4 lists all process flows; Section 5 evaluates threats; and Section 6 concludes. An appendix addresses the security checklist.
 
-2. \texttt{Brute Forcing}: 
+% Per Mélot Section 4.2 (Content): Ensure content is rigorous, scientific, and justified. Use tables/figures for clarity (e.g., architecture diagram). Question: Are claims backed by evidence/references? Did you avoid speculation?
 
+\section{System Characteristics and Architecture}
+The architecture is client/server, with clients driven by users (patients or doctors) and an untrusted server.
 
-\appendix
-\addtocontents{toc}{\protect\vspace{10pt}\noindent\hrulefill\par\vspace{10pt}}
-
-\clearpage
-\section{A1 Additional Material} \label{annex:q1}
-\begin{lstlisting}[caption={Command solving Q1}, label={lst:A1_strings_command}]
-strings secret-str | grep -i secret
-\end{lstlisting}
-
-% \begin{figure}[H]
-% % \centering
-% %     \includegraphics[width=1\linewidth]{figures/A1_strings_output.png}
-% %     \caption{Secret String Q1}
-% %     \label{fig:A1_secret_string}
-% % \end{figure}
-
-% \hyperref[sec:q1]{Back to X}
-% \clearpage
+We containerized the system using Docker Compose, including services for the frontend (React with Tanstack, PNPM, Tailwind, Vite), backend (Django with custom WebAuthn), Nginx reverse proxy, and Step-CA for PKI. This ensures reproducibility and isolation, with Nginx handling TLS termination for client-server communication.
 
 
+
+\subsection{The Server}
+The server is not trusted. In particular, we do not know its set of public keys. Consequently, we provide a mechanism to "securely" transfer it and check its ownership via a local PKI chain: Root CA signs Intermediate CA, which issues leaf certificates for services (e.g., server.healthsecure.local). Fingerprints are computed and verified client-side.
+
+No sensitive data is stored in plaintext; all medical records are ciphertexts. Metadata (e.g., request time, size, privileges, tree depth) is sent separately for anomaly detection, without depending on content.
+
+
+\subsection{Users and Medical Records}
+Users are patients or doctors. Doctors are trusted, with x509 certificates signed by the PKI for integrity and non-repudiation of attributes (e.g., organization).
+
+Patients have first/last name, DOB, medical record (encrypted directory of dated files), and appointed doctors.
+
+Doctors have first/last name and medical organization.
+
+Medical records are client-encrypted directories; content/names/dates are sensitive and never exposed server-side.
+
+% Per Mélot Section 4.1 (Structure): Use logical subsections per feature; ensure flow guides reader. Question: Is the structure balanced and hierarchical? Does each section build on the previous?
+
+\section{Features and Security Implementation}
+In each protocol, data exchange and storage are secured with emphasis on confidentiality, integrity, and additional measures like anti-injection.
+
+We implemented more than basic protections, reCAPTCHA, and logging with separation of duties, favoring efficiency (e.g., WebAuthn over MFA for simplicity and security).
+
+\subsection{User Registration, Authentication, and Revocation}
+Registration generates WebAuthn credentials client-side, with PRF extension for KEK derivation. Doctors include x509 certs signed by PKI for attribute verification.
+
+Authentication uses WebAuthn assertions, validating sign counts to detect clones. Sessions are short-lived (20 min) and encrypted.
+
+Multi-device: Primary device (first registered) approves secondaries via one-time codes (<10 min expiry). Only primary can change credentials or revoke devices.
+
+Revocation flushes sessions and deletes credentials, logged with metadata.
+
+
+\emph{Avoided:} Traditional passwords (vulnerable to phishing/dictionary attacks). \emph{Preferred:} WebAuthn for hardware-bound, phishing-resistant auth.
+
+Addresses Q2 (hardened auth: zero-knowledge WebAuthn), Q5 (non-repudiation: signatures), Q14 (auth not broken: per OWASP).
+
+\subsection{Adding/Deleting a Doctor}
+
+Patients add doctors via ECDH-shared secrets for DEK sharing; requires patient approval if doctor-initiated.
+Deletion revokes access by removing shared keys.
+Integrity ensured via Ed25519 signatures over lists.
+\emph{Avoided:} Server-mediated sharing (compromises confidentiality). \emph{Preferred:} Client-side ECDH for E2EE sharing.
+Addresses Q4 (sequence integrity: signatures), Q9 (request forgery: CSRF tokens).
+
+\subsection{Viewing a Medical Record}
+Patients/doctors decrypt records client-side using KEK/DEK. Server provides ciphertexts only to authorized users (via session checks).
+
+No one else accesses; RBAC enforced backend.
+
+Addresses Q1 (confidentiality: E2EE), Q3 (integrity: Ed25519 signatures).
+
+\subsection{Uploading, Editing, and Deleting Files}
+Files encrypted client-side with random DEK, signed with Ed25519. DEK encrypted with KEK (patient) and ECDH (doctors).
+
+Doctor actions require patient approval.
+
+Deletion overwrites with random data to mitigate remanence.
+
+Addresses Q8 (remanence: overwrite), Q7 (injections: Django validators).
+
+\subsection{Monitoring and Additional Security}
+Logs record activity
+
+% Per Mélot Section 4.2: Evaluate your work critically. Question: Did you assess limitations and efficiencies? Is this section concise yet comprehensive?
+
+\section{Process Flows}
+
+\subsection{Register}
+\subsection{Login}
+
+\subsection{etc..}
+
+
+
+\section{Threat Modeling and Evaluation}
+We performed threat modeling using STRIDE to identify risks and mitigations.
+
+- \textbf{Spoofing}: Mitigated by WebAuthn; PKI prevents fake servers.
+- \textbf{Tampering}: Ed25519 signatures on records/lists.
+- \textbf{Repudiation}: Logs with non-repudiable signatures.
+- \textbf{Information Disclosure}: E2EE; no plaintext on server.
+- \textbf{Denial of Service}: reCAPTCHA, rate limiting.
+- \textbf{Elevation of Privilege}: Primary-only management; RBAC.
+
+Limitations: Incomplete logging separation; no ML anomaly detection due to data constraints. Efficient choices: WebAuthn reduces overhead vs. MFA; client-side crypto offloads server.
 
 \printbibliography
+
+% Per Mélot Annexes: Use for supplementary material. Question: Is this non-essential? Does it support main content without overwhelming?
+
+\appendix
+\section{Security Checklist Responses}
+% \begin{table}[H]
+% \centering
+% \begin{tabular}{ll}
+% \toprule
+% Question & Response \\
+% \midrule
+% 1. Do I properly ensure confidentiality? & Yes, via client-side E2EE with AES-GCM; no plaintext transmitted/stored. Admin has no key access. \\
+% 2. Did I harden my authentication scheme? & Yes, WebAuthn with PRF and zero-knowledge proofs; no Captcha/MFA needed due to built-in resistance. \\
+% 3. Do I properly ensure integrity of stored data? & Yes, Ed25519 signatures on ciphertexts. \\
+% 4. Do I properly ensure the integrity of sequences of items? & Yes, hash chains/signatures on doctor lists/records; tampering detected via verification. \\
+% 5. Do I properly ensure non-repudiation? & Yes, Ed25519 signatures and PKI certs for actions/attributes. \\
+% 6. Do my security features rely on secrecy, beyond cryptographic keys and access codes? & No, all rely on standards; no obscurity. \\
+% 7. Am I vulnerable to injection? & No, Django sanitizes URL/SQL/JS inputs. \\
+% 8. Am I vulnerable to data remanence attacks? & No, deletions overwrite with random data. \\
+% 9. Am I vulnerable to fraudulent request forgery? & No, CSRF tokens. \\
+% 10. Am I monitoring enough user activity...? & Yes, AuthenticationLog with sanitization; anomaly detection via metadata; no whistleblower yet. \\
+% 11. Am I using components with known vulnerabilities? & No, deps updated via PNPM. \\
+% 12. Is my system updated? & Yes, Docker images pinned to latest secure versions. \\
+% 13. Is my access control broken (cf. OWASP 10)? & No, RBAC with primary hierarchy. \\
+% 14. Is my authentication broken (cf. OWASP 10)? & No, WebAuthn aligns with OWASP. \\
+% 15. Are my general security features misconfigured (cf. OWASP 10)? & No, TLS, secure cookies configured. \\
+% \bottomrule
+% \end{tabular}
+% \caption{Security Checklist Answers}
+% \end{table}
+
+\section{Additional Material}
+% Code snippets, diagrams, setup instructions (e.g., Docker).
+
 
 \end{document}
