@@ -1,5 +1,5 @@
 from django.urls import path
-from .views import health, get_my_record, update_my_record, appoint_doctor, get_patient_record, get_user_public_key, remove_doctor, get_my_doctors, get_current_user
+from .views import health, get_my_record, update_my_record, appoint_doctor, get_patient_record, get_user_public_key, remove_doctor, get_my_doctors, get_current_user, search_doctors, get_my_patients
 from .ca import ca_root, ca_sign, ca_verify
 
 urlpatterns = [

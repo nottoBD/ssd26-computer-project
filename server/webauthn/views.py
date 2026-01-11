@@ -1,4 +1,3 @@
-# Modified server/webauthn/views.py
 import json
 import uuid
 import types
@@ -244,6 +243,14 @@ class FinishRegistration(View):
         del request.session["reg_state"]
         del request.session["reg_user_id"]
         del request.session["reg_device_name"]
+
+        # Handle encrypted private key if provided (from frontend)
+        encrypted_priv = response.get('encrypted_priv')  # Parse from JSON body
+        iv_b64 = response.get('iv_b64')
+        if user.type == User.Type.DOCTOR and encrypted_priv and iv_b64:
+            user.encrypted_private_key = encrypted_priv
+            user.private_key_iv = iv_b64
+            user.save()
 
         return JsonResponse({"status": "OK", "prf_enabled": prf_enabled})
 
@@ -648,6 +655,51 @@ class FinishAddCredential(View):
         )
 
         return JsonResponse({"status": "OK", "prf_enabled": prf_enabled})
+
+
+@method_decorator(csrf_exempt, name="dispatch")
+@method_decorator(login_required, name="dispatch")
+class EncryptDoctorPrivkey(View):
+    def post(self, request):
+        if request.user.type != User.Type.DOCTOR:
+            return JsonResponse({"error": "Not doctor"}, status=403)
+        data = json.loads(request.body)
+        request.user.encrypted_doctor_privkey = data["encrypted"]
+        request.user.privkey_iv = data["iv"]
+        request.user.save()
+
+        # Log for monitoring
+        AuthenticationLog.objects.create(
+            user=request.user,
+            ip_address=request.META.get('REMOTE_ADDR'),
+            success=True,
+            metadata={'privileges': 'encrypt_privkey', 'request_size': len(request.body)}
+        )
+
+        return JsonResponse({"status": "OK"})
+
+@method_decorator(csrf_exempt, name="dispatch")
+@method_decorator(login_required, name="dispatch")
+class GetEncryptedPrivkey(View):
+    def get(self, request):
+        if request.user.type != User.Type.DOCTOR:
+            return JsonResponse({"error": "Not doctor"}, status=403)
+        if not request.user.encrypted_doctor_privkey:
+            return JsonResponse({"error": "No key stored"}, status=404)
+
+        # Log fetch for anomaly detection
+        AuthenticationLog.objects.create(
+            user=request.user,
+            ip_address=request.META.get('REMOTE_ADDR'),
+            success=True,
+            metadata={'privileges': 'fetch_privkey'}
+        )
+
+        return JsonResponse({
+            "encrypted": request.user.encrypted_doctor_privkey,
+            "iv": request.user.privkey_iv
+        })
+
 
 @method_decorator(csrf_exempt, name='dispatch')
 class StartAddWithCode(View):

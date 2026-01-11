@@ -21,6 +21,8 @@ import { useAuth } from './__root'
 import { GoogleReCaptchaProvider, useGoogleReCaptcha } from "react-google-recaptcha-v3";
 import * as pkijs from "pkijs";
 import * as asn1js from "asn1js";
+import QRCode from 'qrcode';
+import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogDescription } from "@/components/ui/dialog";
 
 
 export const Route = createFileRoute("/register")({
@@ -40,127 +42,124 @@ function RegisterPage() {
   const [error, setError] = useState<string | null>(null);
   const [webauthnStarted, setWebauthnStarted] = useState(false);
   const [certFile, setCertFile] = useState<File | null>(null);
+  const [privPem, setPrivPem] = useState<string | null>(null); // Store priv key temporarily for largeBlob or fallback
   const formRef = useRef<HTMLFormElement>(null);
+  const [qrModalOpen, setQrModalOpen] = useState(false);
+  const [qrDataUrl, setQrDataUrl] = useState<string | null>(null);
+  const [modalCloseResolve, setModalCloseResolve] = useState<(() => void) | null>(null);
 
-    const handleGenerateCertificate = async () => {
-      try {
-        if (!formRef.current) {
-          throw new Error("Form not available");
-        }
-        const formData = new FormData(formRef.current);
-        const firstName = formData.get("firstName") as string;
-        const lastName = formData.get("lastName") as string;
-        const email = (formData.get("email") as string).trim().toLowerCase();
-        const medicalOrganization = formData.get("medicalOrganization") as string;
 
-        if (!firstName.trim() || !lastName.trim() || !email.trim()) {
-          throw new Error("Please fill in first name, last name, and email before generating certificate");
-        }
-
-        setLoading(true);
-        const crypto = pkijs.getCrypto();
-
-        const keyPair = await crypto.subtle.generateKey(
-          {
-            name: "RSASSA-PKCS1-v1_5",
-            modulusLength: 2048,
-            publicExponent: new Uint8Array([1, 0, 1]),
-            hash: "SHA-256",
-          },
-          true,
-          ["sign", "verify"]
-        );
-
-        const csr = new pkijs.CertificationRequest();
-
-        // Problem patch : 
-        // Order of DN in CSR
-        // CN is now email and not surname name
-        
-        const cnAttr = new pkijs.AttributeTypeAndValue({
-          type: "2.5.4.3", // CN = email address
-          value: new asn1js.Utf8String({ value: email })
-        });
-
-        csr.subject.typesAndValues.push(cnAttr);
-
-        await csr.subjectPublicKeyInfo.importKey(keyPair.publicKey);
-
-        // Add Subject Alternative Name extension for email
-        const generalNames = new pkijs.GeneralNames({
-          names: [
-            new pkijs.GeneralName({
-              type: 1, // rfc822Name (email)
-              value: email
-            })
-          ]
-        });
-
-        const subjectAltName = new pkijs.Extension({
-          extnID: "2.5.29.17",
-          critical: false,
-          extnValue: generalNames.toSchema().toBER(false)
-        });
-
-        const extensions = new pkijs.Extensions({
-          extensions: [subjectAltName]
-        });
-
-        csr.attributes = [
-          new pkijs.Attribute({
-            type: "1.2.840.113549.1.9.14", // extensionRequest
-            values: [extensions.toSchema()]
-          })
-        ];
-
-        await csr.sign(keyPair.privateKey, "SHA-256");
-
-        const csrDer = csr.toSchema().toBER(false);
-        const csrPem = `-----BEGIN CERTIFICATE REQUEST-----\n${btoa(String.fromCharCode(...new Uint8Array(csrDer))).match(/.{1,64}/g)?.join("\n")}\n-----END CERTIFICATE REQUEST-----`;
-
-        console.log("Generated CSR:", csrPem);
-
-        const signResp = await fetch("/api/ca/sign/", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ csr: csrPem }),
-        });
-
-        if (!signResp.ok) {
-          const err = await signResp.json();
-          throw new Error(err.message || "Signing failed");
-        }
-
-        const { certificate } = await signResp.json();
-
-        // Export PrivKey
-        const privRaw = await crypto.subtle.exportKey("pkcs8", keyPair.privateKey);
-        const privPem = `-----BEGIN PRIVATE KEY-----\n${btoa(String.fromCharCode(...new Uint8Array(privRaw))).match(/.{1,64}/g)?.join("\n")}\n-----END PRIVATE KEY-----`;
-
-        // Download PrivKey
-        const privBlob = new Blob([privPem], { type: "text/plain" });
-        const privUrl = URL.createObjectURL(privBlob);
-        const a = document.createElement("a");
-        a.href = privUrl;
-        a.download = "doctor_private_key.pem";
-        a.click();
-        URL.revokeObjectURL(privUrl);
-
-        // certificate as file
-        const certBlob = new Blob([certificate], { type: "text/plain" });
-        setCertFile(new File([certBlob], "doctor_cert.pem"));
-
-        alert("Certificate generated! Private key downloaded - store it securely.\nNote: Organization info included in CN field.");
-
-      } catch (err) {
-        console.error("Certificate generation error:", err);
-        setError((err as Error).message);
-      } finally {
-        setLoading(false);
+  const handleGenerateCertificate = async () => {
+    try {
+      if (!formRef.current) {
+        throw new Error("Form not available");
       }
-    };
+      const formData = new FormData(formRef.current);
+      const firstName = formData.get("firstName") as string;
+      const lastName = formData.get("lastName") as string;
+      const email = (formData.get("email") as string).trim().toLowerCase();
+      const medicalOrganization = formData.get("medicalOrganization") as string;
 
-    const handleSubmit = async (e: React.FormEvent<HTMLFormElement>) => {
+      if (!firstName.trim() || !lastName.trim() || !email.trim()) {
+        throw new Error("Please fill in first name, last name, and email before generating certificate");
+      }
+
+      setLoading(true);
+      const crypto = pkijs.getCrypto();
+
+      const keyPair = await crypto.subtle.generateKey(
+        {
+          name: "RSASSA-PKCS1-v1_5",
+          modulusLength: 2048,
+          publicExponent: new Uint8Array([1, 0, 1]),
+          hash: "SHA-256",
+        },
+        true, // Must be extractable to export for largeBlob or fallback
+        ["sign", "verify"]
+      );
+
+      const csr = new pkijs.CertificationRequest();
+
+      // Problem patch : 
+      // Order of DN in CSR
+      // CN is now email and not surname name
+      
+      const cnAttr = new pkijs.AttributeTypeAndValue({
+        type: "2.5.4.3", // CN = email address
+        value: new asn1js.Utf8String({ value: email })
+      });
+
+      csr.subject.typesAndValues.push(cnAttr);
+
+      await csr.subjectPublicKeyInfo.importKey(keyPair.publicKey);
+
+      // Add Subject Alternative Name extension for email
+      const generalNames = new pkijs.GeneralNames({
+        names: [
+          new pkijs.GeneralName({
+            type: 1, // rfc822Name (email)
+            value: email
+          })
+        ]
+      });
+
+      const subjectAltName = new pkijs.Extension({
+        extnID: "2.5.29.17",
+        critical: false,
+        extnValue: generalNames.toSchema().toBER(false)
+      });
+
+      const extensions = new pkijs.Extensions({
+        extensions: [subjectAltName]
+      });
+
+      csr.attributes = [
+        new pkijs.Attribute({
+          type: "1.2.840.113549.1.9.14", // extensionRequest
+          values: [extensions.toSchema()]
+        })
+      ];
+
+      await csr.sign(keyPair.privateKey, "SHA-256");
+
+      const csrDer = csr.toSchema().toBER(false);
+      const csrPem = `-----BEGIN CERTIFICATE REQUEST-----\n${btoa(String.fromCharCode(...new Uint8Array(csrDer))).match(/.{1,64}/g)?.join("\n")}\n-----END CERTIFICATE REQUEST-----`;
+
+      console.log("Generated CSR:", csrPem);
+
+      const signResp = await fetch("/api/ca/sign/", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ csr: csrPem }),
+      });
+
+      if (!signResp.ok) {
+        const err = await signResp.json();
+        throw new Error(err.message || "Signing failed");
+      }
+
+      const { certificate } = await signResp.json();
+
+      // Export PrivKey for storage (in largeBlob or fallback)
+      const privRaw = await crypto.subtle.exportKey("pkcs8", keyPair.privateKey);
+      const privPemLocal = `-----BEGIN PRIVATE KEY-----\n${btoa(String.fromCharCode(...new Uint8Array(privRaw))).match(/.{1,64}/g)?.join("\n")}\n-----END PRIVATE KEY-----`;
+      setPrivPem(privPemLocal); // Store temporarily for WebAuthn largeBlob
+
+      // certificate as file
+      const certBlob = new Blob([certificate], { type: "text/plain" });
+      setCertFile(new File([certBlob], "doctor_cert.pem"));
+
+      alert("Certificate generated! Private key will be stored securely during registration (e.g., in TouchID/Windows Hello if supported). If not, you'll be prompted to save it in a password manager.\nNote: Organization info included in CN field.");
+
+    } catch (err) {
+      console.error("Certificate generation error:", err);
+      setError((err as Error).message);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const handleSubmit = async (e: React.FormEvent<HTMLFormElement>) => {
     e.preventDefault();
     if (loading) return;
 
@@ -194,6 +193,9 @@ function RegisterPage() {
         if (!certFile) {
           throw new Error("Certificate required for doctor registration");
         }
+        if (!privPem) {
+          throw new Error("Private key not generated - please generate certificate first");
+        }
         payload.certificate = await certFile.text();
       }
     
@@ -220,13 +222,110 @@ function RegisterPage() {
         throw new Error(err.error || "Server error during registration start");
       }
 
-      const options = await startResp.json();
+      let options = await startResp.json();
+
+      // Cascading secure storage for doctor priv key
+      if (userType === "doctor") {
+        // Prefer platform authenticator (TouchID/Hello/Chrome built-in)
+        const isPlatformAvailable = await PublicKeyCredential.isUserVerifyingPlatformAuthenticatorAvailable();
+        options.authenticatorSelection = {
+          ...options.authenticatorSelection,
+          authenticatorAttachment: isPlatformAvailable ? 'platform' : 'cross-platform',
+          residentKey: 'required', // Ensure discoverable for multi-device
+          userVerification: 'preferred',
+        };
+
+        // Compute salts for PRF
+        const prfSaltFirst = await window.crypto.subtle.digest(
+          "SHA-256",
+          new TextEncoder().encode("HealthSecure Project - PRF salt v1 - first")
+        );
+        const prfSaltSecond = await window.crypto.subtle.digest(
+          "SHA-256",
+          new TextEncoder().encode("HealthSecure Project - PRF salt v1 - second")
+        );
+
+        options.extensions = {
+          ...options.extensions,
+          prf: {
+            eval: {
+              first: new Uint8Array(prfSaltFirst),
+              second: new Uint8Array(prfSaltSecond),
+            },
+          },
+        };
+      }
 
       // 2. Show WebAuthn prompt
       setWebauthnStarted(true);
 
-      // 2. Trigger device prompt
-      const credential = await startRegistration(options);
+      // 2. Trigger device prompt - Wrap in { optionsJSON } to fix call structure
+      const credential = await startRegistration({ optionsJSON: options });
+
+      // Check PRF storage success (for doctors)
+      if (userType === "doctor") {
+        const extResults: any = credential.clientExtensionResults;
+        const prfResults = extResults?.prf?.results ?? {};
+        let prfFirst = prfResults.first ? new Uint8Array(prfResults.first) : null;
+        let prfSecond = prfResults.second ? new Uint8Array(prfResults.second) : null;
+        let prfBytes: Uint8Array | null = null;
+
+        if (prfFirst && prfSecond) {
+          prfBytes = new Uint8Array(prfFirst.length);
+          for (let i = 0; i < prfFirst.length; i++) {
+            prfBytes[i] = prfFirst[i] ^ prfSecond[i];
+          }
+        } else if (prfFirst) {
+          prfBytes = prfFirst;
+        } else if (prfSecond) {
+          prfBytes = prfSecond;
+        }
+
+        if (prfBytes) {
+          // Derive KEK from PRF (AES-256 key)
+          const kek = await window.crypto.subtle.importKey(
+            "raw",
+            prfBytes.slice(0, 32),
+            { name: "AES-GCM" },
+            false,
+            ["encrypt", "decrypt"]
+          );
+
+          // Encrypt privPem
+          const iv = window.crypto.getRandomValues(new Uint8Array(12));  // 96-bit IV
+          const encryptedPriv = await window.crypto.subtle.encrypt(
+            { name: "AES-GCM", iv },
+            kek,
+            new TextEncoder().encode(privPem)
+          );
+          const encryptedB64 = btoa(String.fromCharCode(...new Uint8Array(encryptedPriv)));
+          const ivB64 = btoa(String.fromCharCode(...iv));
+
+          // Include in finish body
+          credential.encrypted_priv = encryptedB64;
+          credential.iv_b64 = ivB64;
+
+          alert("Private key encrypted with PRF-derived KEK and stored securely on server. Accessible across synced devices!");
+        } else {
+          // Fallback: QR code
+          alert("PRF not supported. Generating QR code for secure transfer to password manager (e.g., Bitwarden). Scan and store as a secure note.");
+          const qrData = await QRCode.toDataURL(privPem, { errorCorrectionLevel: 'M', scale: 8 });  // High EC for scan reliability
+
+          setQrDataUrl(qrData);
+          setPrivPem(null); // Clear immediately after QR generation
+          const modalPromise = new Promise<void>(resolve => {
+            setModalCloseResolve(() => resolve);
+          });
+          setQrModalOpen(true);
+          await modalPromise;
+
+          // Proceed to finish after user closes modal
+          setQrDataUrl(qrData);
+          setQrModalOpen(true);
+        }
+        // Clear temp privPem after handling (prevent remanence)
+        setPrivPem(null);
+      }
 
       // 3. Finish registration
       const finishResp = await fetch("/api/webauthn/register/finish/", {
@@ -240,18 +339,18 @@ function RegisterPage() {
        throw new Error(err.error || "Registration failed on server");
       }
 
-      // Success!
-      alert("🎉 Successfully registered and logged in with passkey!");
       await refreshAuth();
       navigate({ to: "/" });
     } catch (err) {
       console.error(err);
       setError(err instanceof Error ? err.message : "Registration failed");
       setWebauthnStarted(false);
+      // Clear privPem on error
+      setPrivPem(null);
     } finally {
       setLoading(false);
     }
-    };
+  };
 
 
   return (
@@ -412,7 +511,7 @@ function RegisterPage() {
                     </p>
                     <p className="text-blue-600 text-xs mt-1">
                       Doctor accounts require certificate-based authentication
-                      (CA-signed certificates required). If generating, save the private key securely.
+                      (CA-signed certificates required). Private key will be stored securely in your device authenticator if supported, or downloaded for password manager storage.
                     </p>
                   </div>
                 </div>
@@ -430,7 +529,7 @@ function RegisterPage() {
 
             {/* WebAuthn Status */}
             {webauthnStarted && (
-              <Alert className="bg-blue-50 border-blue-200 animate-pulse">
+              <Alert className="bg-blue-50 border-blue-200 border animate-pulse">
                 <Fingerprint className="h-4 w-4" />
                 <AlertDescription>
                   Waiting for your device… Use Face ID, Touch ID, Windows Hello,
@@ -480,7 +579,23 @@ function RegisterPage() {
           </CardFooter>
         </form>
       </Card>
+      <Dialog
+        open={qrModalOpen}
+        onOpenChange={(open) => {
+          setQrModalOpen(open);
+          if (!open && modalCloseResolve) { modalCloseResolve(); setModalCloseResolve(null); }
+        }}
+      >
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>Scan Private Key QR Code</DialogTitle>
+            <DialogDescription>
+              Use your phone's password manager app (e.g., Bitwarden) to scan and store this as a secure note. Do not save locally—delete any traces after.
+            </DialogDescription>
+          </DialogHeader>
+          {qrDataUrl && <img src={qrDataUrl} alt="Private Key QR" className="mx-auto" />}
+        </DialogContent>
+      </Dialog>
     </div>
   );
 }
-

@@ -1,4 +1,3 @@
-# Modified server/api/ca.py
 import os
 import tempfile
 import subprocess

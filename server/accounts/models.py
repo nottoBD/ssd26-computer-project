@@ -51,6 +51,10 @@ class User(AbstractBaseUser, PermissionsMixin):
     pending_add_code = models.CharField(max_length=128, blank=True, null=True)
     pending_add_expiry = models.DateTimeField(blank=True, null=True)
     
+    # For PRF-encrypted signing private key (PEM) for doctors
+    encrypted_private_key = models.TextField(null=True, blank=True)  # Base64-encoded AES-GCM encrypted PEM
+    private_key_iv = models.CharField(max_length=24, null=True, blank=True)  # Base64-encoded 96-bit IV
+
     objects = UserManager()
 
     USERNAME_FIELD = "email"
