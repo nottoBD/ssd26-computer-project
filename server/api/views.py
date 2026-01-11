@@ -11,6 +11,7 @@ from accounts.models import User, PatientRecord, DoctorPatientLink
 from django.db.models import Q
 import json
 import logging
+import base64
 
 logger = logging.getLogger('metadata')
 
@@ -53,9 +54,9 @@ def get_my_record(request):
     logger.info(json.dumps(metadata))  # anomaly detection ready
 
     return Response({
-        'encrypted_data': record.encrypted_data.hex() if record.encrypted_data else None,
+        'encrypted_data': base64.b64encode(record.encrypted_data).decode('utf-8') if record.encrypted_data else None,
         'encrypted_deks': record.encrypted_deks,
-        'signature': record.record_signature.hex() if record.record_signature else None,
+        'signature': base64.b64encode(record.record_signature).decode('utf-8') if record.record_signature else None,
     })
 
 @api_view(['POST'])
@@ -66,9 +67,9 @@ def update_my_record(request):
 
     data = request.data
     record = request.user.medical_record
-    record.encrypted_data = bytes.fromhex(data['encrypted_data'])
+    record.encrypted_data = base64.b64decode(data['encrypted_data'])
     record.encrypted_deks = data['encrypted_deks']
-    record.record_signature = bytes.fromhex(data['signature'])
+    record.record_signature = base64.b64decode(data['signature'])
     record.save()
 
     metadata = {
@@ -111,7 +112,6 @@ def appoint_doctor(request, doctor_id):
 
     return Response({'status': 'OK'})
 
-
 @api_view(['GET'])
 @permission_classes([IsAuthenticated])
 def get_patient_record(request, patient_id):
@@ -134,9 +134,9 @@ def get_patient_record(request, patient_id):
   logger.info(json.dumps(metadata))
 
   return Response({
-    'encrypted_data': record.encrypted_data.hex() if record.encrypted_data else None,
+    'encrypted_data': base64.b64encode(record.encrypted_data).decode('utf-8') if record.encrypted_data else None,
     'encrypted_dek': encrypted_dek if encrypted_dek else None,
-    'signature': record.record_signature.hex() if record.record_signature else None,
+    'signature': base64.b64encode(record.record_signature).decode('utf-8') if record.record_signature else None,
     'patient': {
       'name': f"{record.patient.first_name} {record.patient.last_name}",
       'dob': record.patient.date_of_birth.isoformat() if record.patient.date_of_birth else None

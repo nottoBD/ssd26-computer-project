@@ -300,6 +300,7 @@ function RegisterPage() {
             prfBytes.slice(0, 32),
             { name: "AES-GCM" },
             false,
+            window.__KEK__ = new Uint8Array(prfBytes.slice(0, 32)),
             ["encrypt", "decrypt"]
           );
 

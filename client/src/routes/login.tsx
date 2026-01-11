@@ -92,6 +92,7 @@ function LoginPage() {
         const prfBytes = Uint8Array.from(
           result.prf_hex.match(/.{1,2}/g)!.map((byte) => parseInt(byte, 16)),
         );
+        window.__PRF_BYTES__ = prfBytes;
         const kek = await deriveKEK(prfBytes);
 
         // Zero out PRF bytes (data remanence)
@@ -99,6 +100,8 @@ function LoginPage() {
 
         // Fetch encrypted priv + pub
         const keysResp = await fetch("/api/user/me/keys/");
+
+        window.__KEK__ = new Uint8Array(await crypto.subtle.exportKey("raw", kek));
         const { encrypted_priv, pub_key } = await keysResp.json();
 
         if (!pub_key) {

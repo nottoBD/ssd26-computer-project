@@ -6,11 +6,12 @@ import { Card, CardContent, CardFooter, CardHeader, CardTitle } from '@/componen
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table'
 import { Textarea } from '@/components/ui/textarea'
 import { redirect } from '@tanstack/react-router'
-import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogTrigger, DialogFooter } from '@/components/ui/dialog'
+import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogTrigger, DialogFooter, DialogDescription } from '@/components/ui/dialog'
 import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuTrigger, DropdownMenuSeparator, DropdownMenuSub, DropdownMenuSubContent, DropdownMenuSubTrigger, DropdownMenuPortal } from '@/components/ui/dropdown-menu'
-import { ChevronDown, ChevronRight, Folder, FileText, MoreVertical, Plus, Upload, Edit, Trash, User, Calendar, Shield } from 'lucide-react'
-import { encryptAES, decryptAES, signEd25519, verifyEd25519, ecdhSharedSecret, deriveEd25519FromX25519, deriveKEK, randomBytes, bytesToHex, hexToBytes } from '../components/CryptoUtils'
+import { ChevronDown, ChevronRight, Folder, FileText, MoreVertical, Plus, Upload, Edit, Trash, User, Calendar, Shield, Key } from 'lucide-react'
+import { encryptAES, decryptAES, signEd25519, verifyEd25519, ecdhSharedSecret, deriveEd25519FromX25519, randomBytes, bytesToHex, hexToBytes, generateX25519Keypair } from '../components/CryptoUtils'
 import { useAuth } from './__root'
+import { Document, Page, pdfjs } from 'react-pdf';
 
 
 interface RecordNode {
@@ -64,6 +65,28 @@ export const Route = createFileRoute('/record')({
   component: RecordPage,
 });
 
+async function deriveMasterKEK(priv: Uint8Array): Promise<Uint8Array> {
+  const digest = await crypto.subtle.digest('SHA-256', priv);
+  return new Uint8Array(digest);
+}
+
+function bytesToBase64(bytes: Uint8Array): string {
+  const binString = Array.from(bytes, (byte) => String.fromCharCode(byte)).join('');
+  return btoa(binString);
+}
+
+function base64ToBytes(base64: string): Uint8Array {
+  const binString = atob(base64);
+  return new Uint8Array(binString.length).map((_, i) => binString.charCodeAt(i));
+}
+
+function getCookie(name: string): string | undefined {
+  const matches = document.cookie.match(new RegExp(
+    "(?:^|; )" + name.replace(/([\.$?*|{}\(\)\[\]\\\/\+^])/g, '\\$1') + "=([^;]*)"
+  ));
+  return matches ? decodeURIComponent(matches[1]) : undefined;
+}
+
 function RecordPage() {
   const { isAuthenticated } = useAuth()
   const navigate = useNavigate()
@@ -72,6 +95,8 @@ function RecordPage() {
 
   const [user, setUser] = useState<User | null>(null)
   const [record, setRecord] = useState<RecordNode | null>(null)
+  const [isDirty, setIsDirty] = useState(false)
+  const [numPages, setNumPages] = useState<number | null>(null)
   const [selectedPath, setSelectedPath] = useState<string[]>([])
   const [appointedDoctors, setAppointedDoctors] = useState<AppointedDoctor[]>([])
   const [appointedPatients, setAppointedPatients] = useState<Patient[]>([])
@@ -92,6 +117,21 @@ function RecordPage() {
   const [requestFile, setRequestFile] = useState<File | null>(null)
   const [patientPub, setPatientPub] = useState<Uint8Array | null>(null)
   const [error, setError] = useState<string | null>(null)
+  const [rotateOpen, setRotateOpen] = useState(false)
+  const [inputPrivOpen, setInputPrivOpen] = useState(false)
+  const [inputPriv, setInputPriv] = useState('')
+  const [rawRecordData, setRawRecordData] = useState<{ encrypted_data: string; signature: string; encrypted_deks: Record<string, string>; encrypted_dek?: string } | null>(null)
+
+  useEffect(() => {
+    pdfjs.GlobalWorkerOptions.workerSrc = new URL(
+      'pdfjs-dist/build/pdf.worker.min.mjs',
+    import.meta.url
+  ).toString();
+  }, []);
+
+  useEffect(() => {
+    setNumPages(null);
+  }, [selectedPath]);
 
   useEffect(() => {
     // Fetch user info
@@ -120,14 +160,12 @@ function RecordPage() {
           .then(async (r) => {
             if (!r.ok) throw new Error(await r.text())
             const data = await r.json()
-            console.log('Public key data:', data)
             const { public_key } = data
             if (!public_key || typeof public_key !== 'string') {
               throw new Error('Invalid or missing public key: ' + JSON.stringify(data))
             }
             const pubBytes = hexToBytes(public_key)
             setPatientPub(pubBytes)
-            // Now fetch record with the bytes
             await fetchRecord(`/api/record/patient/${patientId}/`, false, pubBytes)
           })
           .catch((err) => {
@@ -145,11 +183,9 @@ function RecordPage() {
       const r = await fetch(url)
       if (!r.ok) {
         const errorText = await r.text()
-        console.error('Fetch record error:', errorText)
         throw new Error('Fetch record failed: ' + errorText)
       }
       const res = await r.json()
-      console.log('Record data:', res)
       const encrypted_data = res.encrypted_data
       const signature = res.signature
       const patient = res.patient
@@ -163,39 +199,14 @@ function RecordPage() {
         encDek = res.encrypted_dek
       }
 
+      setRawRecordData({ encrypted_data, signature, encrypted_deks: res.encrypted_deks, encrypted_dek: res.encrypted_dek })
+
       if (encrypted_data && encDek) {
-        const rawBytes = hexToBytes(encrypted_data)
-        const iv = rawBytes.slice(0, 12)
-        const tag = rawBytes.slice(-16)
-        const ciphertext = rawBytes.slice(12, -16)
-
-        let shared: Uint8Array | undefined
-        let dek: Uint8Array
-        if (isSelf) {
-          if (!window.__KEK__) throw new Error('KEK not available')
-          dek = await decryptDEK(encDek, window.__KEK__)
-        } else {
-          if (!patientPubBytes) {
-            throw new Error('Patient public key required for doctor access')
-          }
-          if (!window.__MY_PRIV__) throw new Error('Private key not available')
-          shared = await ecdhSharedSecret(window.__MY_PRIV__, patientPubBytes)
-          dek = await decryptDEK(encDek, shared)
-        }
-
-        const decrypted = await decryptAES(ciphertext, dek, iv, tag)
-        const parsed = JSON.parse(new TextDecoder().decode(decrypted)) as RecordNode
-        setRecord(parsed)
-
-        // Verify signature if present
-        if (signature) {
-          const edPub = deriveEd25519FromX25519(isSelf ? window.__MY_PRIV__ : patientPubBytes!).publicKey
-          if (!verifyEd25519(hexToBytes(signature), rawBytes, edPub)) {
-            alert('Record tampered!')
-          }
-        }
+        await processRawRecord(isSelf, encrypted_data, signature, encDek, patientPubBytes)
       } else {
         setRecord({ name: 'Root', type: 'folder', children: [], metadata: { created: new Date().toISOString(), size: 0 } })
+        setIsDirty(false)
+        window.__CURRENT_DEK__ = null
       }
     } catch (err) {
       console.error('Record fetch failed:', err)
@@ -203,16 +214,84 @@ function RecordPage() {
     }
   }
 
-  const decryptDEK = async (dekHex: string, key: Uint8Array): Promise<Uint8Array> => {
+  const processRawRecord = async (isSelf: boolean, encrypted_data: string, signature: string, encDek: string, patientPubBytes?: Uint8Array) => {
+    const rawBytes = base64ToBytes(encrypted_data)
+    const iv = rawBytes.slice(0, 12)
+    const tag = rawBytes.slice(-16)
+    const ciphertext = rawBytes.slice(12, -16)
+
+    if (!window.__MY_PRIV__) {
+      setInputPrivOpen(true)
+      return
+    }
+
+    let dek: Uint8Array
+    if (isSelf) {
+      const masterKEK = await deriveMasterKEK(window.__MY_PRIV__)
+      dek = await decryptDEK(encDek, masterKEK)
+    } else {
+      if (!patientPubBytes) throw new Error('Patient public key required')
+      const shared = await ecdhSharedSecret(window.__MY_PRIV__, patientPubBytes)
+      dek = await decryptDEK(encDek, shared)
+    }
+
+    // Verify signature
+    const edPub = deriveEd25519FromX25519(isSelf ? window.__MY_PRIV__ : patientPubBytes!).publicKey
+    const verified = verifyEd25519(base64ToBytes(signature), rawBytes, edPub)
+    if (!verified) {
+      if (isSelf) {
+        setInputPrivOpen(true)
+        return
+      } else {
+        throw new Error('Signature verification failed')
+      }
+    }
+
+    const decrypted = await decryptAES(ciphertext, dek, iv, tag)
+    const parsed = JSON.parse(new TextDecoder().decode(decrypted)) as RecordNode
+    setRecord(parsed)
+    setIsDirty(false)
+    window.__CURRENT_DEK__ = dek
+  }
+
+  const decryptDEK = async (encDekStr: string, key: Uint8Array): Promise<Uint8Array> => {
+    const dekBytes = base64ToBytes(encDekStr)
+    const iv = dekBytes.slice(0, 12)
+    const tag = dekBytes.slice(-16)
+    const ciphertext = dekBytes.slice(12, -16)
+    return await decryptAES(ciphertext, key, iv, tag)
+  }
+
+  const handlePrivInput = async () => {
     try {
-      const dekBytes = hexToBytes(dekHex)
-      const iv = dekBytes.slice(0, 12)
-      const tag = dekBytes.slice(-16)
-      const ciphertext = dekBytes.slice(12, -16)
-      return decryptAES(ciphertext, key, iv, tag)
+      const newPriv = base64ToBytes(inputPriv)
+      window.__MY_PRIV__ = newPriv
+
+      // If has KEK (PRF), encrypt and update on server
+      if (window.__KEK__) {
+        const encryptedPriv = await encryptAES(newPriv, window.__KEK__)
+        const encryptedPrivStr = bytesToBase64(new Uint8Array([...encryptedPriv.iv, ...encryptedPriv.ciphertext, ...encryptedPriv.tag]))
+        const r = await fetch('/api/user/keys/update/', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', 'X-CSRFToken': getCookie('csrftoken') || '' },
+          credentials: 'include',
+          body: JSON.stringify({
+            encrypted_priv: encryptedPrivStr
+          })
+        })
+        if (!r.ok) console.error('Failed to update encrypted priv')
+      }
+
+      // Retry processing record
+      if (rawRecordData && user) {
+        const isSelf = user.type === 'patient'
+        await processRawRecord(isSelf, rawRecordData.encrypted_data, rawRecordData.signature, isSelf ? rawRecordData.encrypted_deks['self'] : rawRecordData.encrypted_dek!, patientPub)
+      }
+
+      setInputPrivOpen(false)
+      setInputPriv('')
     } catch (err) {
-      console.error('DEK decryption failed:', err)
-      throw err
+      setError('Invalid private key')
     }
   }
 
@@ -240,21 +319,37 @@ function RecordPage() {
     }
   }
 
-  const updateRecord = async () => {
-    if (!window.__KEK__ || !window.__MY_PRIV__ || !record) return alert('Encryption keys not available.')
+  const updateRecord = async (rotate = false) => {
+    if (!record) return alert('No record to update.')
+
+    if (!window.__MY_PRIV__) {
+      setInputPrivOpen(true)
+      return
+    }
 
     try {
+      let dek = rotate ? randomBytes(32) : (window.__CURRENT_DEK__ || randomBytes(32))
+      let priv = window.__MY_PRIV__
+      let pubUpdate: string | undefined
+
+      if (rotate) {
+        const newKeypair = generateX25519Keypair()
+        priv = newKeypair.privateKey
+        pubUpdate = bytesToHex(newKeypair.publicKey)
+      }
+
+      const masterKEK = await deriveMasterKEK(priv)
+
       const raw = new TextEncoder().encode(JSON.stringify(record))
-      const dek = randomBytes(32)
       const encrypted = await encryptAES(raw, dek)
       const concatenated = new Uint8Array([...encrypted.iv, ...encrypted.ciphertext, ...encrypted.tag])
-      const edPriv = deriveEd25519FromX25519(window.__MY_PRIV__).privateKey
+      const edPriv = deriveEd25519FromX25519(priv).privateKey
       const sig = signEd25519(concatenated, edPriv)
       const deks: Record<string, string> = {}
 
       // Self
-      const encryptedSelfDek = await encryptAES(dek, window.__KEK__)
-      deks['self'] = bytesToHex(new Uint8Array([...encryptedSelfDek.iv, ...encryptedSelfDek.ciphertext, ...encryptedSelfDek.tag]))
+      const encryptedSelfDek = await encryptAES(dek, masterKEK)
+      deks['self'] = bytesToBase64(new Uint8Array([...encryptedSelfDek.iv, ...encryptedSelfDek.ciphertext, ...encryptedSelfDek.tag]))
 
       // Doctors
       for (const doc of appointedDoctors) {
@@ -262,9 +357,9 @@ function RecordPage() {
         if (!docPubRes.ok) continue
         const { public_key } = await docPubRes.json()
         const docPubBytes = hexToBytes(public_key)
-        const shared = await ecdhSharedSecret(window.__MY_PRIV__, docPubBytes)
+        const shared = await ecdhSharedSecret(priv, docPubBytes)
         const encryptedDek = await encryptAES(dek, shared)
-        deks[doc.id] = bytesToHex(new Uint8Array([...encryptedDek.iv, ...encryptedDek.ciphertext, ...encryptedDek.tag]))
+        deks[doc.id] = bytesToBase64(new Uint8Array([...encryptedDek.iv, ...encryptedDek.ciphertext, ...encryptedDek.tag]))
       }
 
       const metadata = {
@@ -276,19 +371,52 @@ function RecordPage() {
 
       const r = await fetch('/api/record/update/', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: { 'Content-Type': 'application/json', 'X-CSRFToken': getCookie('csrftoken') || '' },
+        credentials: 'include',
         body: JSON.stringify({
-          encrypted_data: bytesToHex(concatenated),
+          encrypted_data: bytesToBase64(concatenated),
           encrypted_deks: deks,
-          signature: bytesToHex(sig),
+          signature: bytesToBase64(sig),
           metadata,
         }),
       })
       if (!r.ok) throw new Error('Update error: ' + await r.text())
+
+      if (rotate) {
+        let body: any = { public_key: pubUpdate }
+        if (window.__KEK__) {
+          const encryptedPriv = await encryptAES(priv, window.__KEK__)
+          body.encrypted_priv = bytesToBase64(new Uint8Array([...encryptedPriv.iv, ...encryptedPriv.ciphertext, ...encryptedPriv.tag]))
+        }
+        const kr = await fetch('/api/user/keys/update/', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', 'X-CSRFToken': getCookie('csrftoken') || '' },
+          credentials: 'include',
+          body: JSON.stringify(body)
+        })
+        if (!kr.ok) throw new Error('Key update failed')
+
+        window.__MY_PRIV__ = priv
+        alert(`Keys rotated successfully. Update your password manager with the new private key: ${bytesToBase64(priv)}`)
+      }
+
+      window.__CURRENT_DEK__ = dek
+      setIsDirty(false)
+      if (rotate) {
+        // Refresh record to verify
+        fetchRecord('/api/record/my/', true)
+      }
     } catch (err) {
       console.error('Update failed:', err)
       setError(err.message)
     }
+  }
+
+  const handleRotate = () => {
+    if (confirm('Rotate encryption keys? This will generate a new identity key and DEK.')) {
+      updateRecord(true)
+    }
+    setRotateOpen(false)
   }
 
   const calculateMaxDepth = (node: RecordNode, current = 0): number => {
@@ -298,7 +426,11 @@ function RecordPage() {
 
   const removeDoctor = async (doctorId: string) => {
     try {
-      const res = await fetch(`/api/appoint/remove/${doctorId}/`, { method: 'DELETE' })
+      const res = await fetch(`/api/appoint/remove/${doctorId}/`, { 
+        method: 'DELETE',
+        headers: { 'X-CSRFToken': getCookie('csrftoken') || '' },
+        credentials: 'include'
+      })
       if (!res.ok) throw new Error('Remove failed: ' + await res.text())
       fetchAppointedDoctors()
     } catch (err) {
@@ -321,8 +453,34 @@ function RecordPage() {
   }
 
   const appointDoctor = async (doctorId: string) => {
+    if (!window.__MY_PRIV__) {
+      setInputPrivOpen(true)
+      return
+    }
+
     try {
-      const res = await fetch(`/api/appoint/add/${doctorId}/`, { method: 'POST' })
+      const docPubRes = await fetch(`/api/user/${doctorId}/public_key/`)
+      if (!docPubRes.ok) throw new Error('Failed to fetch doc pub')
+      const { public_key } = await docPubRes.json()
+      const docPubBytes = hexToBytes(public_key)
+      
+      const shared = await ecdhSharedSecret(window.__MY_PRIV__, docPubBytes)
+      
+      let dek = window.__CURRENT_DEK__;
+      if (!dek) {
+        dek = randomBytes(32);
+        await updateRecord();  
+      }
+      
+      const encryptedDek = await encryptAES(dek, shared)
+      const encryptedDekStr = bytesToBase64(new Uint8Array([...encryptedDek.iv, ...encryptedDek.ciphertext, ...encryptedDek.tag]))
+
+      const res = await fetch(`/api/appoint/add/${doctorId}/`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'X-CSRFToken': getCookie('csrftoken') || '' },
+        credentials: 'include',
+        body: JSON.stringify({ encrypted_dek: encryptedDekStr })
+      })
       if (!res.ok) throw new Error('Appoint failed: ' + await res.text())
       fetchAppointedDoctors()
       setAddDoctorDialogOpen(false)
@@ -351,16 +509,25 @@ function RecordPage() {
     const parent = findNode(newRecord, selectedPath) || newRecord
     if (parent.type !== 'folder' || !parent.children) return
     if (selectedPath.length >= 5 && type === 'folder') return alert('Max tree depth 5 reached')
+    let size = 0
+    if (type === 'text' && content) {
+      const contentBytes = new TextEncoder().encode(content)
+      content = bytesToBase64(contentBytes)
+      size = contentBytes.length
+    } else if (type === 'binary' && content) {
+      size = base64ToBytes(content).length
+    }
     const newNode: RecordNode = {
       name,
       type: type === 'folder' ? 'folder' : 'file',
       children: type === 'folder' ? [] : undefined,
       content,
       mime,
-      metadata: { created: new Date().toISOString(), size: content?.length || 0 },
+      metadata: { created: new Date().toISOString(), size },
     }
     parent.children.push(newNode)
     setRecord(newRecord)
+    setIsDirty(true)
     setAddRecordOpen(false)
     setAddName('')
     setAddType(null)
@@ -377,6 +544,7 @@ function RecordPage() {
     const index = parent.children.findIndex((c) => c.name === path[path.length - 1])
     if (index > -1) parent.children.splice(index, 1)
     setRecord(newRecord)
+    setIsDirty(true)
     setSelectedPath([])
   }
 
@@ -385,9 +553,11 @@ function RecordPage() {
     const newRecord = cloneRecord()
     const node = findNode(newRecord, selectedPath)
     if (!node || node.type !== 'file') return
-    node.content = btoa(newContent)
-    node.metadata.size = newContent.length
+    const contentBytes = new TextEncoder().encode(newContent)
+    node.content = bytesToBase64(contentBytes)
+    node.metadata.size = contentBytes.length
     setRecord(newRecord)
+    setIsDirty(true)
   }
 
   const handleReplaceFile = async (file: File) => {
@@ -398,8 +568,9 @@ function RecordPage() {
     if (!node || node.type !== 'file') return
     node.content = base64
     node.mime = file.type
-    node.metadata.size = base64.length
+    node.metadata.size = file.size
     setRecord(newRecord)
+    setIsDirty(true)
   }
 
   const readFileAsBase64 = (file: File): Promise<string> =>
@@ -511,6 +682,12 @@ function RecordPage() {
 
   const handleRequest = async () => {
     if (!patientId || !patientPub || !requestType) return
+
+    if (!window.__MY_PRIV__) {
+      setInputPrivOpen(true)
+      return
+    }
+
     let body: any = { type: requestType, patient: patientId }
     if (requestType.startsWith('add')) {
       body.path = selectedPath.join('/')
@@ -521,7 +698,6 @@ function RecordPage() {
     let metadata = { time: new Date().toISOString(), size: 0, privileges: 'doctor', tree_depth: selectedPath.length }
 
     if (requestType.includes('text') || requestType.includes('binary')) {
-      // For file-related, encrypt content
       const dek = randomBytes(32)
       let rawContent: string
       if (requestType.includes('binary')) {
@@ -537,11 +713,11 @@ function RecordPage() {
       const sig = signEd25519(concatenated, edPriv)
       const shared = await ecdhSharedSecret(window.__MY_PRIV__, patientPub)
       const encryptedDek = await encryptAES(dek, shared)
-      const encryptedDekHex = bytesToHex(new Uint8Array([...encryptedDek.iv, ...encryptedDek.ciphertext, ...encryptedDek.tag]))
+      const encryptedDekStr = bytesToBase64(new Uint8Array([...encryptedDek.iv, ...encryptedDek.ciphertext, ...encryptedDek.tag]))
 
-      body.encrypted_data = bytesToHex(concatenated)
-      body.encrypted_dek = encryptedDekHex
-      body.signature = bytesToHex(sig)
+      body.encrypted_data = bytesToBase64(concatenated)
+      body.encrypted_dek = encryptedDekStr
+      body.signature = bytesToBase64(sig)
       body.mime = requestType.includes('text') ? 'text/plain' : (requestFile?.type || 'application/octet-stream')
       metadata.size = concatenated.length
     }
@@ -551,7 +727,8 @@ function RecordPage() {
     try {
       const r = await fetch('/api/pending/', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: { 'Content-Type': 'application/json', 'X-CSRFToken': getCookie('csrftoken') || '' },
+        credentials: 'include',
         body: JSON.stringify(body),
       })
       if (!r.ok) console.error('Request error:', await r.text())
@@ -644,7 +821,14 @@ function RecordPage() {
                   ) : selectedNode.mime?.startsWith('image/') ? (
                     <img src={`data:${selectedNode.mime};base64,${selectedNode.content}`} alt={selectedNode.name} className="max-w-full" />
                   ) : selectedNode.mime === 'application/pdf' ? (
-                    <embed src={`data:application/pdf;base64,${selectedNode.content}`} type="application/pdf" width="100%" height="500px" />
+                    <Document
+                      file={`data:application/pdf;base64,${selectedNode.content}`}
+                      onLoadSuccess={({ numPages: np }) => setNumPages(np)}
+                    >
+                      {Array.from(new Array(numPages || 0), (_, index) => (
+                        <Page key={index} pageNumber={index + 1} />
+                      ))}
+                    </Document>
                   ) : (
                     <p>Unsupported file type</p>
                   )}
@@ -660,7 +844,25 @@ function RecordPage() {
                 <p>No item selected.</p>
               )}
             </CardContent>
-            {isPatient && <CardFooter><Button onClick={updateRecord}>Save Record</Button></CardFooter>}
+            {isPatient && <CardFooter className="flex justify-between">
+              <Button onClick={() => updateRecord()} className={isDirty ? 'bg-blue-500 animate-pulse' : ''}>Save Record</Button>
+              <Dialog open={rotateOpen} onOpenChange={setRotateOpen}>
+                <DialogTrigger asChild>
+                  <Button variant="outline"><Key className="w-4 h-4 mr-2" /> Rotate Keys</Button>
+                </DialogTrigger>
+                <DialogContent>
+                  <DialogHeader>
+                    <DialogTitle>Rotate Encryption Keys</DialogTitle>
+                    <DialogDescription>
+                      This will generate a new DEK and identity key, re-encrypt everything, and require updating your password manager.
+                    </DialogDescription>
+                  </DialogHeader>
+                  <DialogFooter>
+                    <Button onClick={handleRotate}>Confirm Rotate</Button>
+                  </DialogFooter>
+                </DialogContent>
+              </Dialog>
+            </CardFooter>}
           </Card>
         </div>
       )}
@@ -753,8 +955,8 @@ function RecordPage() {
                 let content: string | undefined
                 let mime: string | undefined
                 if (addType === 'text') {
-                  content = btoa(addContent)
                   mime = 'text/plain'
+                  content = addContent
                 } else if (addType === 'binary' && addFile) {
                   content = await readFileAsBase64(addFile)
                   mime = addFile.type
@@ -801,6 +1003,22 @@ function RecordPage() {
           ) : null}
           <DialogFooter>
             <Button onClick={handleRequest}>Submit Request</Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      {/* Input Priv Dialog */}
+      <Dialog open={inputPrivOpen} onOpenChange={setInputPrivOpen}>
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>Enter Private Key</DialogTitle>
+            <DialogDescription>
+              Paste the base64-encoded X25519 private key from your password manager. This is required for E2EE on this device.
+            </DialogDescription>
+          </DialogHeader>
+          <Input type="password" value={inputPriv} onChange={(e) => setInputPriv(e.target.value)} placeholder="Base64 private key..." />
+          <DialogFooter>
+            <Button onClick={handlePrivInput}>Submit</Button>
           </DialogFooter>
         </DialogContent>
       </Dialog>
