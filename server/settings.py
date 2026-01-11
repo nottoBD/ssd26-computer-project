@@ -44,11 +44,17 @@ MIDDLEWARE = [
 ROOT_URLCONF = "urls"
 
 DATABASES = {
-    'default': dj_database_url.config(
-        default=f"sqlite:///{BASE_DIR / 'db.sqlite3'}",
-        conn_max_age=600,
-        conn_health_checks=True,
-    )
+    'default': {
+        'ENGINE': 'django.db.backends.postgresql',
+        'NAME': os.environ.get('POSTGRES_DB', 'health'),
+        'USER': os.environ.get('POSTGRES_USER', 'health'),
+        'PASSWORD': os.environ.get('POSTGRES_PASSWORD', 'health'),
+        'HOST': 'db',  # Matches your docker-compose service name
+        'PORT': '5432',
+        'OPTIONS': {
+            'sslmode': 'prefer',  # Optional: Enables SSL if your Postgres supports it for security
+        },
+    }
 }
 
 REST_FRAMEWORK = {

@@ -1,5 +1,3 @@
-"use client";
-
 import { useState, useRef } from "react";
 import { createFileRoute, useNavigate } from "@tanstack/react-router";
 import { Button } from "@/components/ui/button";
@@ -23,6 +21,7 @@ import * as pkijs from "pkijs";
 import * as asn1js from "asn1js";
 import QRCode from 'qrcode';
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogDescription } from "@/components/ui/dialog";
+import { encryptAES, bytesToHex, hexToBytes, generateX25519Keypair, deriveEd25519FromX25519, base64ToBytes } from '../components/CryptoUtils'  // Import encryptAES for X25519 priv encryption
 
 
 export const Route = createFileRoute("/register")({
@@ -42,12 +41,16 @@ function RegisterPage() {
   const [error, setError] = useState<string | null>(null);
   const [webauthnStarted, setWebauthnStarted] = useState(false);
   const [certFile, setCertFile] = useState<File | null>(null);
-  const [privPem, setPrivPem] = useState<string | null>(null); // Store priv key temporarily for largeBlob or fallback
+  const [privPem, setPrivPem] = useState<string | null>(null); // Store RSA priv key temporarily for largeBlob or fallback
   const formRef = useRef<HTMLFormElement>(null);
+  const [xQrModalOpen, setXQrModalOpen] = useState(false);
   const [qrModalOpen, setQrModalOpen] = useState(false);
   const [qrDataUrl, setQrDataUrl] = useState<string | null>(null);
   const [modalCloseResolve, setModalCloseResolve] = useState<(() => void) | null>(null);
-
+  const [privInputModalOpen, setPrivInputModalOpen] = useState(false);
+  const [privInput, setPrivInput] = useState('');
+  const [privInputResolve, setPrivInputResolve] = useState<((value: Uint8Array | null) => void) | null>(null);
+  const [privInputError, setPrivInputError] = useState<string | null>(null);
 
   const handleGenerateCertificate = async () => {
     try {
@@ -71,6 +74,7 @@ function RegisterPage() {
         {
           name: "RSASSA-PKCS1-v1_5",
           modulusLength: 2048,
+          publicExponent: new Uint8Array([1, 0, 1]),
           publicExponent: new Uint8Array([1, 0, 1]),
           hash: "SHA-256",
         },
@@ -256,13 +260,21 @@ function RegisterPage() {
         };
       }
 
+      // Generate X25519 key pair for all users (E2EE) using noble for compatibility
+      const x25519KeyPair = generateX25519Keypair();
+
+      // Public key is already raw Uint8Array (32 bytes)
+      payload.x25519_public = btoa(String.fromCharCode(...x25519KeyPair.publicKey));  // Base64 for sending
+
+      // Private key is raw Uint8Array – store temporarily
+      const x25519PrivRawLocal = x25519KeyPair.privateKey;
+
       // 2. Show WebAuthn prompt
       setWebauthnStarted(true);
 
       // 2. Trigger device prompt - Wrap in { optionsJSON } to fix call structure
       const credential = await startRegistration({ optionsJSON: options });
 
-      // Check PRF storage success (for doctors)
       if (userType === "doctor") {
         const extResults: any = credential.clientExtensionResults;
         const prfResults = extResults?.prf?.results ?? {};
@@ -320,11 +332,93 @@ function RegisterPage() {
           await modalPromise;
 
           // Proceed to finish after user closes modal
-          setQrDataUrl(qrData);
-          setQrModalOpen(true);
         }
         // Clear temp privPem after handling (prevent remanence)
         setPrivPem(null);
+      }
+
+      // Handle X25519 private key encryption for all users (using same PRF logic)
+      const extResults: any = credential.clientExtensionResults;
+      const prfResults = extResults?.prf?.results ?? {};
+      let prfFirst = prfResults.first ? new Uint8Array(prfResults.first) : null;
+      let prfSecond = prfResults.second ? new Uint8Array(prfResults.second) : null;
+      let prfBytes: Uint8Array | null = null;
+
+      if (prfFirst && prfSecond) {
+        prfBytes = new Uint8Array(prfFirst.length);
+        for (let i = 0; i < prfFirst.length; i++) {
+          prfBytes[i] = prfFirst[i] ^ prfSecond[i];
+        }
+      } else if (prfFirst) {
+        prfBytes = prfFirst;
+      } else if (prfSecond) {
+        prfBytes = prfSecond;
+      }
+
+      if (prfBytes) {
+        // Derive KEK from PRF (AES-256 key)
+        const kek = await window.crypto.subtle.importKey(
+          "raw",
+          prfBytes.slice(0, 32),
+          { name: "AES-GCM" },
+          false,
+          ["encrypt", "decrypt"]
+        );
+
+        // Encrypt X25519 privRaw
+        const iv = window.crypto.getRandomValues(new Uint8Array(12));  // 96-bit IV
+        const encryptedXPriv = await window.crypto.subtle.encrypt(
+          { name: "AES-GCM", iv },
+          kek,
+          x25519PrivRawLocal
+        );
+        const encryptedXB64 = btoa(String.fromCharCode(...new Uint8Array(encryptedXPriv)));
+        const ivB64 = btoa(String.fromCharCode(...iv));
+
+        // Include in finish body
+        credential.encrypted_xpriv = encryptedXB64;
+        credential.xiv_b64 = ivB64;
+
+        // Set private key in memory for the session
+        window.__MY_PRIV__ = x25519PrivRawLocal;
+        window.__SIGN_PRIV__ = deriveEd25519FromX25519(window.__MY_PRIV__).privateKey;
+      } else {
+        // Fallback for X25519: QR code
+        alert("PRF not supported for X25519 key storage. Generating QR code for secure transfer to password manager.");
+        const xPrivB64 = btoa(String.fromCharCode(...x25519PrivRawLocal));
+        const qrText = `${xPrivB64}`;
+        const qrData = await QRCode.toDataURL(qrText, { errorCorrectionLevel: 'M', scale: 8 });
+
+        setQrDataUrl(qrData);
+        const modalPromise = new Promise<void>(resolve => {
+          setModalCloseResolve(() => resolve);
+        });
+        setXQrModalOpen(true);
+        await modalPromise;
+
+        // After QR modal closes, prompt for immediate input
+        const privPromise = new Promise<Uint8Array | null>(resolve => {
+          setPrivInputResolve(() => resolve);
+          // Validation function
+          const validatePrivInput = (input: string): boolean => {
+            const trimmed = input.trim();
+            if (trimmed.length !== 44 || !/^[A-Za-z0-9+/=]+$/.test(trimmed)) {
+              setPrivInputError('Invalid base64 key. Must be exactly 44 characters.');
+              return false;
+            }
+            setPrivInputError(null);
+            return true;
+          };
+          setPrivInput('');
+        });
+        setPrivInputModalOpen(true);
+        const privBytes = await privPromise;
+        setPrivInputModalOpen(false);
+        if (!privBytes) {
+          throw new Error("Private key input cancelled or invalid");
+        }
+        window.__MY_PRIV__ = privBytes;
+        window.__SIGN_PRIV__ = deriveEd25519FromX25519(window.__MY_PRIV__).privateKey;
       }
 
       // 3. Finish registration
@@ -594,6 +688,56 @@ function RegisterPage() {
             </DialogDescription>
           </DialogHeader>
           {qrDataUrl && <img src={qrDataUrl} alt="Private Key QR" className="mx-auto" />}
+        </DialogContent>
+      </Dialog>
+      {/* Separate modal for X25519 QR to avoid conflict */}
+      <Dialog
+        open={xQrModalOpen}
+        onOpenChange={(open) => {
+          setXQrModalOpen(open);
+          if (!open && modalCloseResolve) { 
+            modalCloseResolve(); 
+            setModalCloseResolve(null); 
+          }
+        }}
+      >
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>Scan X25519 Private Key QR Code</DialogTitle>
+            <DialogDescription>Use your password manager app (e.g., Bitwarden) to scan and store this as a secure note prefixed 'X25519 PRIV:'. Do not save locally—delete after.</DialogDescription>
+          </DialogHeader>
+          {qrDataUrl && <img src={qrDataUrl} alt="X25519 Private Key QR" className="mx-auto" />}
+        </DialogContent>
+      </Dialog>
+      {/* Dialog for manual priv key input */}
+      <Dialog
+        open={privInputModalOpen}
+        onOpenChange={(open) => {
+          if (!open && privInputResolve) {
+            if (validatePrivInput(privInput)) {
+              setPrivInputModalOpen(false);
+            } else {
+              // Prevent close if invalid
+              setPrivInputModalOpen(true);
+            }
+          }
+        }}
+      >
+        {privInputError && (
+          <Alert variant="destructive"><AlertDescription>{privInputError}</AlertDescription></Alert>
+        )}
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>Enter X25519 Private Key</DialogTitle>
+            <DialogDescription>
+              Paste the base64-encoded X25519 private key from your password manager secure note (after 'X25519 PRIV: '). This is required for E2EE in this session.
+            </DialogDescription>
+          </DialogHeader>
+          <Input type="password" autoComplete="current-password" name="password" id="password" value={privInput} onChange={(e) => setPrivInput(e.target.value)} placeholder="Base64 private key..." />
+          <Button onClick={() => {
+            if (privInputResolve) privInputResolve(base64ToBytes(privInput.trim()));
+            setPrivInputModalOpen(false);
+          }}>Submit</Button>
         </DialogContent>
       </Dialog>
     </div>

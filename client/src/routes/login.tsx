@@ -15,12 +15,14 @@ import { Alert, AlertDescription } from "@/components/ui/alert";
 import { Input } from "@/components/ui/input";
 import { Shield, Fingerprint, Loader2, AlertTriangle } from "lucide-react";
 import { startAuthentication, startRegistration, base64URLStringToBuffer } from "@simplewebauthn/browser";
+import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogDescription } from "@/components/ui/dialog";
 import {
   deriveKEK,
   generateX25519Keypair,
   encryptAES,
   decryptAES,
   deriveEd25519FromX25519,
+  base64ToBytes,
 } from "../components/CryptoUtils";
 import { useAuth } from './__root'
 
@@ -37,6 +39,10 @@ function LoginPage() {
   const [email, setEmail] = useState('');
   const [code, setCode] = useState('');
   const [deviceName, setDeviceName] = useState('New Device');
+  const [privInputModalOpen, setPrivInputModalOpen] = useState(false);
+  const [privInput, setPrivInput] = useState('');
+  const [privInputResolve, setPrivInputResolve] = useState<((value: Uint8Array | null) => void) | null>(null);
+  const [privInputError, setPrivInputError] = useState<string | null>(null);
 
   const handleWebAuthnLogin = async () => {
     setLoading(true);
@@ -134,7 +140,39 @@ function LoginPage() {
         ).privateKey;
 
         console.log("✅ PRF KEK derived and ready for encryption");
+      } else {
+        // Fallback: Prompt for manual private key input from Bitwarden
+        alert("PRF not available on this device. Please paste your X25519 private key base64 from Bitwarden secure note.");
+        const privPromise = new Promise<Uint8Array | null>(resolve => {
+          setPrivInputResolve(() => resolve);
+          setPrivInput('');
+        });
+        setPrivInputModalOpen(true);
+        const privBytes = await privPromise;
+        setPrivInputModalOpen(false);
+        if (!privBytes) {
+          throw new Error("Private key input cancelled or invalid");
+        }
+        window.__MY_PRIV__ = privBytes;
+
+        // Derive Ed25519 for signatures
+        window.__SIGN_PRIV__ = deriveEd25519FromX25519(
+          window.__MY_PRIV__,
+        ).privateKey;
+
+        console.log("✅ Manual X25519 private key loaded");
       }
+
+      // Validation function
+      const validatePrivInput = (input: string): boolean => {
+        const trimmed = input.trim();
+        if (trimmed.length !== 44 || !/^[A-Za-z0-9+/=]+$/.test(trimmed)) {
+          setPrivInputError('Invalid base64 key. Must be exactly 44 characters.');
+          return false;
+        }
+        setPrivInputError(null);
+        return true;
+      };
 
       await refreshAuth();
       navigate({ to: "/" });
@@ -331,6 +369,37 @@ function LoginPage() {
           </div>
         </CardFooter>
       </Card>
+            {/* Dialog for manual priv key input */}
+      <Dialog
+        open={privInputModalOpen}
+        onOpenChange={(open) => {
+          if (!open && privInputResolve) {
+            if (validatePrivInput(privInput)) {
+              setPrivInputModalOpen(false);
+            } else {
+              // Prevent close if invalid
+              setPrivInputModalOpen(true);
+            }
+          }
+        }}
+      >
+        {privInputError && (
+          <Alert variant="destructive"><AlertDescription>{privInputError}</AlertDescription></Alert>
+        )}
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>Enter X25519 Private Key</DialogTitle>
+            <DialogDescription>
+              Paste the base64-encoded X25519 private key from your password manager. This is required for E2EE on this device.
+            </DialogDescription>
+          </DialogHeader>
+          <Input type="password" autoComplete="current-password" name="password" id="password" value={privInput} onChange={(e) => setPrivInput(e.target.value)} placeholder="Base64 private key..." />
+          <Button onClick={() => {
+            if (privInputResolve) privInputResolve(base64ToBytes(privInput.trim()));
+            setPrivInputModalOpen(false);
+          }}>Submit</Button>
+        </DialogContent>
+      </Dialog>
     </div>
   );
 }

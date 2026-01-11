@@ -8,6 +8,7 @@ from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from accounts.models import User, PatientRecord, DoctorPatientLink
+from django.db.models import Q
 import json
 import logging
 
@@ -82,15 +83,11 @@ def update_my_record(request):
 
 @api_view(['POST'])
 @permission_classes([IsAuthenticated])
-def appoint_doctor(request):
+def appoint_doctor(request, doctor_id):
     if request.user.type != User.Type.PATIENT:
         return Response({'error': 'Only patients appoint'}, status=403)
 
-    doctor_id = request.data['doctor_id']
-    encrypted_dek = request.data['encrypted_dek']  # ECDH encrypted for doctor
-    if encrypted_dek:
-        record.encrypted_deks[str(doctor_id)] = encrypted_dek
-        record.save()
+    encrypted_dek = request.data.get('encrypted_dek')
 
     try:
         doctor = User.objects.get(id=doctor_id, type=User.Type.DOCTOR)
@@ -99,13 +96,14 @@ def appoint_doctor(request):
 
     DoctorPatientLink.objects.create(doctor=doctor, patient=request.user)
 
-    record = request.user.medical_record
-    record.encrypted_deks[str(doctor_id)] = encrypted_dek
-    record.save()  # assume client re-signs full record
+    if encrypted_dek:
+        record = request.user.medical_record
+        record.encrypted_deks[str(doctor_id)] = encrypted_dek
+        record.save()
 
     metadata = {
         'time': timezone.now().isoformat(),
-        'size': len(encrypted_dek),
+        'size': len(encrypted_dek) if encrypted_dek else 0,
         'privileges': 'appoint_doctor',
         'tree_depth': 2,  # record + appointment
     }
@@ -150,6 +148,8 @@ def get_patient_record(request, patient_id):
 def get_user_public_key(request, user_id):
     try:
         user = User.objects.get(id=user_id)
+        if not user.encryption_public_key:
+            return Response({'error': 'Public key not available'}, status=400)
         return Response({'public_key': user.encryption_public_key.hex()})
     except User.DoesNotExist:
         return Response({'error': 'User not found'}, status=404)
@@ -194,7 +194,8 @@ def get_my_doctors(request):
     doctors = [
         {
             'id': str(link.doctor.id),  # UUID as string
-            'name': f"{link.doctor.first_name} {link.doctor.last_name}"
+            'name': f"{link.doctor.first_name} {link.doctor.last_name}",
+            'org': link.doctor.medical_organization
         }
         for link in links
     ]

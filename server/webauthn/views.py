@@ -244,12 +244,20 @@ class FinishRegistration(View):
         del request.session["reg_user_id"]
         del request.session["reg_device_name"]
 
-        # Handle encrypted private key if provided (from frontend)
+        # New: Handle encrypted private key if provided (from frontend)
         encrypted_priv = response.get('encrypted_priv')  # Parse from JSON body
         iv_b64 = response.get('iv_b64')
         if user.type == User.Type.DOCTOR and encrypted_priv and iv_b64:
             user.encrypted_private_key = encrypted_priv
             user.private_key_iv = iv_b64
+            user.save()
+
+        # Handle encrypted X25519 private key
+        encrypted_xpriv = response.get('encrypted_xpriv')
+        xiv_b64 = response.get('xiv_b64')
+        if encrypted_xpriv and xiv_b64:
+            user.encrypted_encryption_private = urlsafe_b64decode(encrypted_xpriv + '==')  # BinaryField expects bytes
+            user.xpriv_iv = xiv_b64
             user.save()
 
         return JsonResponse({"status": "OK", "prf_enabled": prf_enabled})

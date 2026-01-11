@@ -36,6 +36,7 @@ class User(AbstractBaseUser, PermissionsMixin):
 
     # Doctor-only
     medical_organization = models.CharField(max_length=255, blank=True)
+    certificate = models.TextField(blank=True, null=True)  # Store PEM cert for doctors
 
     is_active = models.BooleanField(default=True)
     is_staff = models.BooleanField(default=False)  # for admin access
@@ -46,11 +47,12 @@ class User(AbstractBaseUser, PermissionsMixin):
     encryption_public_key = models.BinaryField(null=True, blank=True)
   # AES-KEK encrypted 32 bytes X25519 private key
     encrypted_encryption_private = models.BinaryField(null=True, blank=True)
+    xpriv_iv = models.CharField(max_length=24, null=True, blank=True)  # Base64-encoded 96-bit IV for X25519
 
     # Multi device
     pending_add_code = models.CharField(max_length=128, blank=True, null=True)
     pending_add_expiry = models.DateTimeField(blank=True, null=True)
-    
+
     # For PRF-encrypted signing private key (PEM) for doctors
     encrypted_private_key = models.TextField(null=True, blank=True)  # Base64-encoded AES-GCM encrypted PEM
     private_key_iv = models.CharField(max_length=24, null=True, blank=True)  # Base64-encoded 96-bit IV
@@ -90,4 +92,3 @@ class DoctorPatientLink(models.Model):
 
     class Meta:
         unique_together = ("doctor", "patient")
-
