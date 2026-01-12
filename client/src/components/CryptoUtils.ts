@@ -116,3 +116,10 @@ export function base64ToBytes(base64: string): Uint8Array {
   }
   return bytes;
 }
+
+export function bytesToBase64(bytes: Uint8Array): string {
+  const binString = Array.from(bytes, (byte) => String.fromCharCode(byte)).join(
+    "",
+  );
+  return btoa(binString);
+}

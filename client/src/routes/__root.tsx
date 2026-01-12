@@ -117,7 +117,7 @@ export const Route = createRootRoute({
                     <span>Patient Portal</span>
                   </Link>
                   <div className="h-4 w-px bg-gray-300"></div>
-                  <Link to="/record" className={`flex items-center ${userType === 'doctor' ? 'text-blue-600' : 'text-muted-foreground'}`}>
+                  <Link to="/doctor" className={`flex items-center ${userType === 'doctor' ? 'text-blue-600' : 'text-muted-foreground'}`}>
                     <Stethoscope className="w-4 h-4 mr-1" />
                     <span>Doctor Portal</span>
                   </Link>

@@ -92,3 +92,23 @@ class DoctorPatientLink(models.Model):
 
     class Meta:
         unique_together = ("doctor", "patient")
+
+
+class PendingRequest(models.Model):
+    class StatusChoices(models.TextChoices):
+        PENDING = 'pending', 'Pending'
+        APPROVED = 'approved', 'Approved'
+        REJECTED = 'rejected', 'Rejected'
+
+    requester = models.ForeignKey(User, on_delete=models.CASCADE, related_name='sent_requests')
+    target = models.ForeignKey(User, on_delete=models.CASCADE, related_name='received_requests')
+    type = models.CharField(max_length=50)  # e.g., 'appointment', 'file_add_folder', etc.
+    details = models.JSONField(default=dict)  # e.g., {path, name, encrypted_data, mime, encrypted_dek}
+    signature = models.BinaryField(null=True)  # Ed25519 sig for non-repudiation
+    cert_chain = models.JSONField(default=dict)  # {root, intermediate, doctor PEMs}
+    status = models.CharField(max_length=20, choices=StatusChoices.choices, default=StatusChoices.PENDING)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    def __str__(self):
+        return f"{self.type} request from {self.requester} to {self.target}"
