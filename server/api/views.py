@@ -22,13 +22,12 @@ def get_current_user(request):
     data = {
         'id': str(user.id),
         'type': user.type,
-        'first_name': user.first_name,
-        'last_name': user.last_name,
+        'name': f"{user.first_name} {user.last_name}",
     }
     if user.type == User.Type.PATIENT:
-        data['date_of_birth'] = user.date_of_birth.isoformat() if user.date_of_birth else None
+        data['dob'] = user.date_of_birth.isoformat() if user.date_of_birth else None
     elif user.type == User.Type.DOCTOR:
-        data['medical_organization'] = user.medical_organization
+        data['org'] = user.medical_organization
     metadata = {
         'time': timezone.now().isoformat(),
         'size': 0,
@@ -264,6 +263,42 @@ def search_doctors(request):
     logger.info(json.dumps(metadata))
 
     return Response({'doctors': data})
+
+
+@api_view(['POST'])
+@permission_classes([IsAuthenticated])
+def update_user_keys(request):
+    user = request.user
+    data = request.data
+
+    if 'public_key' in data:
+        try:
+            public_key_bytes = bytes.fromhex(data['public_key'])
+            X25519PublicKey.from_public_bytes(public_key_bytes)
+            user.encryption_public_key = public_key_bytes
+        except ValueError:
+            return Response({'error': 'Invalid public key'}, status=400)
+
+    if 'encrypted_priv' in data:
+        try:
+            encrypted_priv_bytes = base64.b64decode(data['encrypted_priv'])
+            if len(encrypted_priv_bytes) != 12 + 32 + 16:  # iv + ciphertext + tag for 32-byte priv
+                raise ValueError
+            user.encrypted_priv = encrypted_priv_bytes
+        except ValueError:
+            return Response({'error': 'Invalid encrypted private key'}, status=400)
+
+    user.save()
+
+    metadata = {
+        'time': timezone.now().isoformat(),
+        'size': len(data.get('public_key', '')) + len(data.get('encrypted_priv', '')),
+        'privileges': 'update_keys',
+        'tree_depth': 1,
+    }
+    logger.info(json.dumps(metadata))
+
+    return Response({'status': 'OK'})
 
 @api_view(['GET'])
 def health(request):

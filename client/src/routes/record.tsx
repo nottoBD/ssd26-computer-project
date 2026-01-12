@@ -125,8 +125,15 @@ function RecordPage() {
   useEffect(() => {
     pdfjs.GlobalWorkerOptions.workerSrc = new URL(
       'pdfjs-dist/build/pdf.worker.min.mjs',
-    import.meta.url
-  ).toString();
+      import.meta.url
+    ).toString();
+  }, []);
+
+  useEffect(() => {
+    const stored = sessionStorage.getItem('x25519_priv_b64');
+    if (stored) {
+      window.__MY_PRIV__ = base64ToBytes(stored);
+    }
   }, []);
 
   useEffect(() => {
@@ -226,32 +233,42 @@ function RecordPage() {
     }
 
     let dek: Uint8Array
-    if (isSelf) {
-      const masterKEK = await deriveMasterKEK(window.__MY_PRIV__)
-      dek = await decryptDEK(encDek, masterKEK)
-    } else {
-      if (!patientPubBytes) throw new Error('Patient public key required')
-      const shared = await ecdhSharedSecret(window.__MY_PRIV__, patientPubBytes)
-      dek = await decryptDEK(encDek, shared)
-    }
+    try {
+      if (isSelf) {
+        const masterKEK = await deriveMasterKEK(window.__MY_PRIV__)
+        dek = await decryptDEK(encDek, masterKEK)
+      } else {
+        if (!patientPubBytes) throw new Error('Patient public key required')
+        const shared = await ecdhSharedSecret(window.__MY_PRIV__, patientPubBytes)
+        dek = await decryptDEK(encDek, shared)
+      }
 
-    // Verify signature
-    const edPub = deriveEd25519FromX25519(isSelf ? window.__MY_PRIV__ : patientPubBytes!).publicKey
-    const verified = verifyEd25519(base64ToBytes(signature), rawBytes, edPub)
-    if (!verified) {
+      // Verify signature
+      const edPub = deriveEd25519FromX25519(isSelf ? window.__MY_PRIV__ : patientPubBytes!).publicKey
+      const verified = verifyEd25519(base64ToBytes(signature), rawBytes, edPub)
+      if (!verified) {
+        if (isSelf) {
+          setInputPrivOpen(true)
+          return
+        } else {
+          throw new Error('Signature verification failed')
+        }
+      }
+
+      const decrypted = await decryptAES(ciphertext, dek, iv, tag)
+      const parsed = JSON.parse(new TextDecoder().decode(decrypted)) as RecordNode
+      setRecord(parsed)
+      setIsDirty(false)
+      window.__CURRENT_DEK__ = dek
+    } catch (err) {
+      console.error('Decryption failed:', err)
       if (isSelf) {
         setInputPrivOpen(true)
-        return
       } else {
-        throw new Error('Signature verification failed')
+        setError('Failed to decrypt patient record')
       }
+      return
     }
-
-    const decrypted = await decryptAES(ciphertext, dek, iv, tag)
-    const parsed = JSON.parse(new TextDecoder().decode(decrypted)) as RecordNode
-    setRecord(parsed)
-    setIsDirty(false)
-    window.__CURRENT_DEK__ = dek
   }
 
   const decryptDEK = async (encDekStr: string, key: Uint8Array): Promise<Uint8Array> => {
@@ -266,6 +283,7 @@ function RecordPage() {
     try {
       const newPriv = base64ToBytes(inputPriv)
       window.__MY_PRIV__ = newPriv
+      sessionStorage.setItem('x25519_priv_b64', inputPriv);
 
       // If has KEK (PRF), encrypt and update on server
       if (window.__KEK__) {
@@ -397,6 +415,7 @@ function RecordPage() {
         if (!kr.ok) throw new Error('Key update failed')
 
         window.__MY_PRIV__ = priv
+        sessionStorage.setItem('x25519_priv_b64', bytesToBase64(priv));
         alert(`Keys rotated successfully. Update your password manager with the new private key: ${bytesToBase64(priv)}`)
       }
 
@@ -460,22 +479,30 @@ function RecordPage() {
 
     try {
       const docPubRes = await fetch(`/api/user/${doctorId}/public_key/`)
-      if (!docPubRes.ok) throw new Error('Failed to fetch doc pub')
-      const { public_key } = await docPubRes.json()
-      const docPubBytes = hexToBytes(public_key)
-      
-      const shared = await ecdhSharedSecret(window.__MY_PRIV__, docPubBytes)
-      
-      let dek = window.__CURRENT_DEK__;
-      if (!dek) {
-        dek = randomBytes(32);
-        await updateRecord();  
-      }
-      
-      const encryptedDek = await encryptAES(dek, shared)
-      const encryptedDekStr = bytesToBase64(new Uint8Array([...encryptedDek.iv, ...encryptedDek.ciphertext, ...encryptedDek.tag]))
+      let encryptedDekStr: string | null = null
 
-      const res = await fetch(`/api/appoint/add/${doctorId}/`, {
+      if (docPubRes.status === 404) {
+        throw new Error('Doctor not found')
+      }
+
+      if (docPubRes.ok) {
+        const { public_key } = await docPubRes.json()
+        if (public_key) {
+          const docPubBytes = hexToBytes(public_key)
+          const shared = await ecdhSharedSecret(window.__MY_PRIV__, docPubBytes)
+          
+          let dek = window.__CURRENT_DEK__;
+          if (!dek) {
+            dek = randomBytes(32);
+            await updateRecord();  
+          }
+          
+          const encryptedDek = await encryptAES(dek, shared)
+          encryptedDekStr = bytesToBase64(new Uint8Array([...encryptedDek.iv, ...encryptedDek.ciphertext, ...encryptedDek.tag]))
+        }
+      }
+
+      const res = await fetch(`/api/appoint/${doctorId}/`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', 'X-CSRFToken': getCookie('csrftoken') || '' },
         credentials: 'include',
