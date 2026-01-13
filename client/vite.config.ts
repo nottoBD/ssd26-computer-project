@@ -45,8 +45,9 @@ export default defineConfig({
     hmr: {
       protocol: "wss",
       host: "healthsecure.local",
-      port: 3443,
+      port: 5173,
       clientPort: 3443,
+      timeout: 6,
     },
   },
   resolve: {
