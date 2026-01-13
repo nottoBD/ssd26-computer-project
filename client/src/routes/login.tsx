@@ -23,6 +23,8 @@ import {
   decryptAES,
   deriveEd25519FromX25519,
   base64ToBytes,
+  hexToBytes,
+  getX25519PublicFromPrivate
 } from "../components/CryptoUtils";
 import { useAuth } from './__root'
 
@@ -146,17 +148,11 @@ function LoginPage() {
       } else {
         // Fallback: Prompt for manual private key input from Bitwarden
         alert("PRF not available on this device. Please paste your X25519 private key base64 from Bitwarden secure note.");
-        const privPromise = new Promise<Uint8Array | null>(resolve => {
-          setPrivInputResolve(() => resolve);
-          setPrivInput('');
-        });
-        setPrivInputModalOpen(true);
-        const privBytes = await privPromise;
-        setPrivInputModalOpen(false);
-        if (!privBytes) {
-          throw new Error("Private key input cancelled or invalid");
+        const priv = await promptForPrivateKey();
+        if (!priv) {
+          throw new Error("Private key input cancelled");
         }
-        window.__MY_PRIV__ = privBytes;
+        window.__MY_PRIV__ = priv;
 
         // Derive Ed25519 for signatures
         window.__SIGN_PRIV__ = deriveEd25519FromX25519(
@@ -166,16 +162,37 @@ function LoginPage() {
         console.log("✅ Manual X25519 private key loaded");
       }
 
-      // Validation function
-      const validatePrivInput = (input: string): boolean => {
-        const trimmed = input.trim();
-        if (trimmed.length !== 44 || !/^[A-Za-z0-9+/=]+$/.test(trimmed)) {
-          setPrivInputError('Invalid base64 key. Must be exactly 44 characters.');
-          return false;
+      // Common: Verify loaded private key matches server public key (prevents mismatch issues)
+      const meResp = await fetch('/api/user/me/');
+      if (!meResp.ok) throw new Error('Failed to fetch user info');
+      const me = await meResp.json();
+      const userId = me.id;
+
+      const rPub = await fetch(`/api/user/public_key/${userId}`);
+      if (!rPub.ok) throw new Error('Failed to fetch public key');
+      const { public_key } = await rPub.json();
+      if (!public_key) throw new Error('No public key on server');
+
+      const serverPub = hexToBytes(public_key);
+      const derivedPub = getX25519PublicFromPrivate(window.__MY_PRIV__);
+      const match = derivedPub.every((val, i) => val === serverPub[i]);
+
+      if (!match) {
+        window.__MY_PRIV__ = null;
+        window.__SIGN_PRIV__ = null;
+        if (result.prf_hex) {
+          // PRF mismatch rare, fallback to manual
+          alert('Decrypted private key does not match server public key. Falling back to manual input.');
+          const priv = await promptForPrivateKey();
+          if (!priv) throw new Error('Private key input cancelled');
+          window.__MY_PRIV__ = priv;
+          window.__SIGN_PRIV__ = deriveEd25519FromX25519(window.__MY_PRIV__).privateKey;
+        } else {
+          // Fallback case, re-prompt
+          throw new Error('Entered private key does not match server public key. Please try again.');
         }
-        setPrivInputError(null);
-        return true;
-      };
+      }
+      console.log('Private key verified successfully');
 
       await refreshAuth();
       navigate({ to: "/" });
@@ -194,6 +211,13 @@ function LoginPage() {
     }
   };
 
+  const promptForPrivateKey = async (): Promise<Uint8Array | null> => {
+    return new Promise((resolve) => {
+      setPrivInputResolve(() => resolve);
+      setPrivInput('');
+      setPrivInputModalOpen(true);
+    });
+  };
 
   const handleAddDevice = async () => {
     setLoading(true);
@@ -226,6 +250,16 @@ function LoginPage() {
     } finally {
       setLoading(false);
     }
+  };
+
+  const validatePrivInput = (input: string): boolean => {
+    const trimmed = input.trim();
+    if (trimmed.length !== 44 || !/^[A-Za-z0-9+/=]+$/.test(trimmed)) {
+      setPrivInputError('Invalid base64 key. Must be exactly 44 characters.');
+      return false;
+    }
+    setPrivInputError(null);
+    return true;
   };
 
   return (
@@ -378,6 +412,7 @@ function LoginPage() {
         onOpenChange={(open) => {
           if (!open && privInputResolve) {
             if (validatePrivInput(privInput)) {
+              privInputResolve(base64ToBytes(privInput.trim()));
               setPrivInputModalOpen(false);
             } else {
               // Prevent close if invalid
@@ -398,8 +433,10 @@ function LoginPage() {
           </DialogHeader>
           <Input type="password" autoComplete="current-password" name="password" id="password" value={privInput} onChange={(e) => setPrivInput(e.target.value)} placeholder="Base64 private key..." />
           <Button onClick={() => {
-            if (privInputResolve) privInputResolve(base64ToBytes(privInput.trim()));
-            setPrivInputModalOpen(false);
+            if (validatePrivInput(privInput) && privInputResolve) {
+              privInputResolve(base64ToBytes(privInput.trim()));
+              setPrivInputModalOpen(false);
+            }
           }}>Submit</Button>
         </DialogContent>
       </Dialog>

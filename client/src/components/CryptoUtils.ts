@@ -123,3 +123,7 @@ export function bytesToBase64(bytes: Uint8Array): string {
   );
   return btoa(binString);
 }
+
+export function getX25519PublicFromPrivate(priv: Uint8Array): Uint8Array {
+  return x25519.getPublicKey(priv);
+}

@@ -13,6 +13,9 @@ from django.utils.decorators import method_decorator
 from django.contrib.auth import login, logout
 from django.contrib.auth.decorators import login_required
 
+from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PublicKey
+from cryptography.exceptions import InvalidKey
+
 from fido2.webauthn import PublicKeyCredentialRpEntity, AttestedCredentialData, CollectedClientData, AttestationObject, AuthenticatorData
 from fido2.server import Fido2Server
 from fido2 import cbor
@@ -204,63 +207,79 @@ class FinishRegistration(View):
             return JsonResponse({"error": "No registration in progress"}, status=400)
 
         user = User.objects.get(id=uuid.UUID(user_id))
-        response = json.loads(request.body)
+        try:
+            response = json.loads(request.body)
 
-        client_data_json = websafe_decode(response["response"]["clientDataJSON"])
-        attestation_object = websafe_decode(response["response"]["attestationObject"])
+            client_data_json = websafe_decode(response["response"]["clientDataJSON"])
+            attestation_object = websafe_decode(response["response"]["attestationObject"])
 
-        client_data = CollectedClientData(client_data_json)
-        att_obj = AttestationObject(attestation_object)
+            client_data = CollectedClientData(client_data_json)
+            att_obj = AttestationObject(attestation_object)
 
-        auth_data = server.register_complete(state, client_data, att_obj)  # returns AuthenticatorData in fido2==1.1.3
-        prf_enabled = response.get("clientExtensionResults", {}).get("prf", {}).get("enabled", False)
+            auth_data = server.register_complete(state, client_data, att_obj)  # returns AuthenticatorData in fido2==1.1.3
+            prf_enabled = response.get("clientExtensionResults", {}).get("prf", {}).get("enabled", False)
 
-        credential = WebAuthnCredential.objects.create(
-            user=user,
-            credential_id=auth_data.credential_data.credential_id,
-            public_key=cbor2.dumps(auth_data.credential_data.public_key),  # COSE key dict to CBOR bytes
-            name=request.session.get('reg_device_name', 'Unnamed Device'),
-            sign_count=auth_data.counter,  # fido2 1.1.3
-            transports=response.get("transports", []),
-            prf_enabled=prf_enabled,
-            aaguid=auth_data.credential_data.aaguid,  # for authenticator type insights
-        )
+            credential = WebAuthnCredential.objects.create(
+                user=user,
+                credential_id=auth_data.credential_data.credential_id,
+                public_key=cbor2.dumps(auth_data.credential_data.public_key),  # COSE key dict to CBOR bytes
+                name=request.session.get('reg_device_name', 'Unnamed Device'),
+                sign_count=auth_data.counter,  # fido2 1.1.3
+                transports=response.get("transports", []),
+                prf_enabled=prf_enabled,
+                aaguid=auth_data.credential_data.aaguid,  # for authenticator type insights
+            )
 
-        # Mark as primary if first credential
-        if not WebAuthnCredential.objects.filter(user=user, is_primary=True).exists():
-            credential.is_primary = True
-            credential.save()
-
-
-        user.is_active = True
-        user.save()
-        login(request, user)
-        # Mark which credential was used for this session
-        request.session['used_credential_id'] = websafe_encode(credential.credential_id)
-        request.session['device_role'] = 'primary' if credential.is_primary else 'secondary'
+            # Mark as primary if first credential
+            if not WebAuthnCredential.objects.filter(user=user, is_primary=True).exists():
+                credential.is_primary = True
+                credential.save()
 
 
-        del request.session["reg_state"]
-        del request.session["reg_user_id"]
-        del request.session["reg_device_name"]
+            user.is_active = True
 
-        # New: Handle encrypted private key if provided (from frontend)
-        encrypted_priv = response.get('encrypted_priv')  # Parse from JSON body
-        iv_b64 = response.get('iv_b64')
-        if user.type == User.Type.DOCTOR and encrypted_priv and iv_b64:
-            user.encrypted_private_key = encrypted_priv
-            user.private_key_iv = iv_b64
+            if 'public_key' in response:
+                try:
+                    public_key_bytes = bytes.fromhex(response['public_key'])
+                    X25519PublicKey.from_public_bytes(public_key_bytes)
+                    user.encryption_public_key = public_key_bytes
+                    logger.info(f"Public key set for user {user.email} during registration")
+                except (ValueError, InvalidKey):
+                    logger.error(f"Invalid public key during registration for {user.email}")
+                    return JsonResponse({'error': 'Invalid public key'}, status=400)
+
             user.save()
+            login(request, user)
+            # Mark which credential was used for this session
+            request.session['used_credential_id'] = websafe_encode(credential.credential_id)
+            request.session['device_role'] = 'primary' if credential.is_primary else 'secondary'
 
-        # Handle encrypted X25519 private key
-        encrypted_xpriv = response.get('encrypted_xpriv')
-        xiv_b64 = response.get('xiv_b64')
-        if encrypted_xpriv and xiv_b64:
-            user.encrypted_encryption_private = urlsafe_b64decode(encrypted_xpriv + '==')  # BinaryField expects bytes
-            user.xpriv_iv = xiv_b64
-            user.save()
 
-        return JsonResponse({"status": "OK", "prf_enabled": prf_enabled})
+            del request.session["reg_state"]
+            del request.session["reg_user_id"]
+            del request.session["reg_device_name"]
+
+            # New: Handle encrypted private key if provided (from frontend)
+            encrypted_priv = response.get('encrypted_priv')  # Parse from JSON body
+            iv_b64 = response.get('iv_b64')
+            if user.type == User.Type.DOCTOR and encrypted_priv and iv_b64:
+                user.encrypted_private_key = encrypted_priv
+                user.private_key_iv = iv_b64
+                user.save()
+
+            # Handle encrypted X25519 private key
+            encrypted_xpriv = response.get('encrypted_xpriv')
+            xiv_b64 = response.get('xiv_b64')
+            if encrypted_xpriv and xiv_b64:
+                user.encrypted_encryption_private = urlsafe_b64decode(encrypted_xpriv + '==')  # BinaryField expects bytes
+                user.xpriv_iv = xiv_b64
+                user.save()
+
+            return JsonResponse({"status": "OK", "prf_enabled": prf_enabled, "user_id": str(user.id)})  # Added user_id
+        except Exception as e:
+            import traceback
+            logger.error(traceback.format_exc())
+            return JsonResponse({"error": f"Registration failed: {str(e)}"}, status=400)
 
 
 @method_decorator(csrf_exempt, name="dispatch")
@@ -454,11 +473,13 @@ class FinishAddCredentialApproval(View):
             raise ValueError("User verification required")
         current_counter = authenticator_data_obj.counter
         if credential.supports_sign_count and current_counter <= credential.sign_count:
-            logger.warning(f"Possible clone during approval for user {request.user.id}")
+            logger.warning(f"Possible clone detected for credential {credential.id} (counter {current_counter} <= {credential.sign_count}) from IP {request.META.get('REMOTE_ADDR')}")
             raise ValueError("Possible cloned authenticator detected")
+
         if current_counter > credential.sign_count:
             if not credential.supports_sign_count:
                 credential.supports_sign_count = True
+
         credential.sign_count = current_counter
         credential.save()
 
@@ -615,6 +636,56 @@ class FinishDeleteCredentialApproval(View):
 
 
 @method_decorator(csrf_exempt, name='dispatch')
+class StartAddWithCode(View):
+    def post(self, request):
+        data = json.loads(request.body)
+        email = data.get('email', '').strip().lower()
+        code = data.get('code', '')
+        device_name = data.get('device_name', 'New Device')
+
+        if not email or not code:
+            return JsonResponse({"error": "Email and code required"}, status=400)
+
+        try:
+            user = User.objects.get(email=email)
+            if not WebAuthnCredential.objects.filter(user=user, is_primary=True).exists():
+                return JsonResponse({"error": "Primary device required"}, status=403)
+
+            if user.pending_add_code != code or user.pending_add_expiry < timezone.now():
+                raise ValueError("Invalid or expired code")
+
+            # Clear code
+            user.pending_add_code = None
+            user.pending_add_expiry = None
+            user.save()
+
+            options, state = server.register_begin(
+                user={
+                    "id": str(user.id).encode(),
+                    "name": user.email,
+                    "displayName": f"{user.first_name} {user.last_name}",
+                },
+                credentials=[c.get_credential_data() for c in user.webauthn_credentials.all()],
+                user_verification="required",
+            )
+            pk_options = dict(options.public_key)
+            pk_options["authenticatorSelection"] = {
+                "requireResidentKey": True,
+                "residentKey": "required",
+                "userVerification": "required",
+            }
+            pk_options["extensions"] = {"prf": {}}
+            request.session["add_cred_state"] = state
+            request.session["add_cred_user_id"] = str(user.id)
+            request.session["add_cred_device_name"] = device_name
+            return JsonResponse(to_serializable(pk_options))
+
+        except User.DoesNotExist:
+            return JsonResponse({"error": "User not found"}, status=404)
+        except ValueError as e:
+            return JsonResponse({"error": str(e)}, status=400)
+
+@method_decorator(csrf_exempt, name='dispatch')
 class FinishAddCredential(View):
     def post(self, request):
         state = request.session.get("add_cred_state")
@@ -686,8 +757,8 @@ class EncryptDoctorPrivkey(View):
 
         return JsonResponse({"status": "OK"})
 
-@method_decorator(csrf_exempt, name="dispatch")
-@method_decorator(login_required, name="dispatch")
+@method_decorator(csrf_exempt, name='dispatch')
+@method_decorator(login_required, name='dispatch')
 class GetEncryptedPrivkey(View):
     def get(self, request):
         if request.user.type != User.Type.DOCTOR:
@@ -710,54 +781,44 @@ class GetEncryptedPrivkey(View):
 
 
 @method_decorator(csrf_exempt, name='dispatch')
-class StartAddWithCode(View):
+class AuthStatus(View):
+    def get(self, request):
+        return JsonResponse({
+            'authenticated': request.user.is_authenticated
+        })
+
+@method_decorator(csrf_exempt, name='dispatch')
+class LogoutView(View):
     def post(self, request):
-        data = json.loads(request.body)
-        email = data.get('email', '').strip().lower()
-        code = data.get('code', '')
-        device_name = data.get('device_name', 'New Device')
+        response = JsonResponse({"status": "OK"})
+        if request.user.is_authenticated:
+            logout(request)
+            request.session.flush()
+        else:
+            request.session.flush()
+        response.delete_cookie('sessionid')
+        response.delete_cookie('csrftoken')
+        return response
 
-        if not email or not code:
-            return JsonResponse({"error": "Email and code required"}, status=400)
 
-        try:
-            user = User.objects.get(email=email)
-            if not WebAuthnCredential.objects.filter(user=user, is_primary=True).exists():
-                return JsonResponse({"error": "Primary device required"}, status=403)
+def is_primary_device(request):
+    if not request.user.is_authenticated:
+        return False
 
-            if user.pending_add_code != code or user.pending_add_expiry < timezone.now():
-                raise ValueError("Invalid or expired code")
+    cid = request.session.get('used_credential_id')
+    if not cid:
+        return False
 
-            # Clear code
-            user.pending_add_code = None
-            user.pending_add_expiry = None
-            user.save()
+    try:
+        WebAuthnCredential.objects.get(
+            credential_id=websafe_decode(cid),
+            user=request.user,
+            is_primary=True,
+        )
+        return True
+    except WebAuthnCredential.DoesNotExist:
+        return False
 
-            options, state = server.register_begin(
-                user={
-                    "id": str(user.id).encode(),
-                    "name": user.email,
-                    "displayName": f"{user.first_name} {user.last_name}",
-                },
-                credentials=[c.get_credential_data() for c in user.webauthn_credentials.all()],
-                user_verification="required",
-            )
-            pk_options = dict(options.public_key)
-            pk_options["authenticatorSelection"] = {
-                "requireResidentKey": True,
-                "residentKey": "required",
-                "userVerification": "required",
-            }
-            pk_options["extensions"] = {"prf": {}}
-            request.session["add_cred_state"] = state
-            request.session["add_cred_user_id"] = str(user.id)
-            request.session["add_cred_device_name"] = device_name
-            return JsonResponse(to_serializable(pk_options))
-
-        except User.DoesNotExist:
-            return JsonResponse({"error": "User not found"}, status=404)
-        except ValueError as e:
-            return JsonResponse({"error": str(e)}, status=400)
 
 class UserCredentials(View):
     @method_decorator(login_required)
@@ -846,4 +907,3 @@ def is_primary_device(request):
         return True
     except WebAuthnCredential.DoesNotExist:
         return False
-

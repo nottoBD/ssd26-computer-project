@@ -5,15 +5,42 @@ import { Card, CardContent, CardHeader, CardTitle, CardFooter } from '@/componen
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table'
 import { Input } from '@/components/ui/input'
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogTrigger, DialogFooter, DialogDescription } from '@/components/ui/dialog'
+import { Textarea } from '@/components/ui/textarea'
 import { Plus, User, Calendar, Stethoscope, Search, Key, ShieldCheck, Edit, Trash, Upload, Folder } from 'lucide-react'
 import { useAuth } from './__root'
-import { bytesToBase64, signEd25519, deriveEd25519FromX25519, encryptAES, randomBytes } from '../components/CryptoUtils'
+import { bytesToBase64, signEd25519, deriveEd25519FromX25519, encryptAES, randomBytes, base64ToBytes, hexToBytes, ecdhSharedSecret } from '../components/CryptoUtils'
 
 function getCookie(name: string): string | undefined {
   const matches = document.cookie.match(new RegExp(
     "(?:^|; )" + name.replace(/([\.$?*|{}\(\)\[\]\\\/\+^])/g, '\\$1') + "=([^;]*)"
   ));
   return matches ? decodeURIComponent(matches[1]) : undefined;
+}
+
+interface Patient {
+  id: string
+  name: string
+  dob: string
+  appointedDate: string
+}
+
+interface SearchedPatient {
+  id: string
+  name: string
+  dob: string
+}
+
+interface PendingRequest {
+  id: string
+  type: string
+  status: string
+  details: any
+}
+
+interface CertChain {
+  root: string
+  intermediate: string
+  doctor: string
 }
 
 export const Route = createFileRoute('/doctor')({
@@ -63,6 +90,8 @@ function DoctorPortal() {
   const [certChain, setCertChain] = useState<CertChain | null>(null)
   const [error, setError] = useState<string | null>(null)
   const [loading, setLoading] = useState(true)
+  const [inputPrivOpen, setInputPrivOpen] = useState(false)
+  const [inputPriv, setInputPriv] = useState('')
 
   useEffect(() => {
     const stored = sessionStorage.getItem('x25519_priv_b64')
@@ -73,6 +102,34 @@ function DoctorPortal() {
     fetchPendingRequests()
     fetchCertChain()
   }, [])
+
+  const handlePrivInput = async () => {
+    try {
+      const newPriv = base64ToBytes(inputPriv)
+      window.__MY_PRIV__ = newPriv
+      sessionStorage.setItem('x25519_priv_b64', inputPriv)
+
+      // If has KEK (PRF), encrypt and update on server
+      if (window.__KEK__) {
+        const encryptedPriv = await encryptAES(newPriv, window.__KEK__)
+        const encryptedPrivStr = bytesToBase64(new Uint8Array([...encryptedPriv.iv, ...encryptedPriv.ciphertext, ...encryptedPriv.tag]))
+        const r = await fetch('/api/user/keys/update/', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', 'X-CSRFToken': getCookie('csrftoken') || '' },
+          credentials: 'include',
+          body: JSON.stringify({
+            encrypted_priv: encryptedPrivStr
+          })
+        })
+        if (!r.ok) console.error('Failed to update encrypted priv')
+      }
+
+      setInputPrivOpen(false)
+      setInputPriv('')
+    } catch (err) {
+      setError('Invalid private key')
+    }
+  }
 
   const fetchAppointedPatients = async () => {
     try {
@@ -134,8 +191,12 @@ function DoctorPortal() {
   }
 
   const requestAppointment = async (patientId: string) => {
-    if (!window.__MY_PRIV__ || !certChain) {
-      setError('Private key or PKI chain missing')
+    if (!window.__MY_PRIV__) {
+      setInputPrivOpen(true)
+      return
+    }
+    if (!certChain) {
+      setError('PKI chain missing')
       return
     }
 
@@ -171,8 +232,16 @@ function DoctorPortal() {
   }
 
   const requestFileChange = async () => {
-    if (!selectedPatientId || !requestType || !window.__MY_PRIV__ || !certChain) {
-      setError('Selection or keys missing')
+    if (!selectedPatientId || !requestType) {
+      setError('Selection missing')
+      return
+    }
+    if (!window.__MY_PRIV__) {
+      setInputPrivOpen(true)
+      return
+    }
+    if (!certChain) {
+      setError('PKI chain missing')
       return
     }
 
@@ -412,6 +481,22 @@ function DoctorPortal() {
           )}
           <DialogFooter>
             <Button onClick={requestFileChange}>Send Signed Request</Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      {/* Input Priv Dialog */}
+      <Dialog open={inputPrivOpen} onOpenChange={setInputPrivOpen}>
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>Enter Private Key</DialogTitle>
+            <DialogDescription>
+              Paste the base64-encoded X25519 private key from your password manager. This is required for E2EE on this device.
+            </DialogDescription>
+          </DialogHeader>
+          <Input type="password" value={inputPriv} onChange={(e) => setInputPriv(e.target.value)} placeholder="Base64 private key..." />
+          <DialogFooter>
+            <Button onClick={handlePrivInput}>Submit</Button>
           </DialogFooter>
         </DialogContent>
       </Dialog>

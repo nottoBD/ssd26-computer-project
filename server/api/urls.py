@@ -26,7 +26,7 @@ urlpatterns = [
     path('record/patient/<uuid:patient_id>/', get_patient_record),
     path('record/update/', update_my_record),
 
-    path('user/<uuid:user_id>/public_key/', get_user_public_key),
+    path('user/public_key/<uuid:user_id>', get_user_public_key),
     path('user/keys/update/', update_user_keys),
     path('user/me/', get_current_user),
 ]

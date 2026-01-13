@@ -7,6 +7,8 @@ from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PublicKey
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey, Ed25519PublicKey
+from cryptography.hazmat.primitives.asymmetric import padding
+from cryptography.hazmat.primitives import hashes
 from accounts.models import User, PatientRecord, DoctorPatientLink, PendingRequest
 from django.db.models import Q
 import json
@@ -20,6 +22,7 @@ from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.exceptions import InvalidSignature
 from django.conf import settings
 
+from django.views.decorators.csrf import csrf_exempt
 
 
 logger = logging.getLogger('metadata')
@@ -157,7 +160,7 @@ def get_user_public_key(request, user_id):
     try:
         user = User.objects.get(id=user_id)
         if not user.encryption_public_key:
-            return Response({'error': 'Public key not available'}, status=400)
+            return Response({'public_key': None})
         return Response({'public_key': user.encryption_public_key.hex()})
     except User.DoesNotExist:
         return Response({'error': 'User not found'}, status=404)
@@ -301,6 +304,7 @@ def search_patients(request):
 
     return Response({'patients': data})
 
+@csrf_exempt
 @api_view(['POST'])
 @permission_classes([IsAuthenticated])
 def update_user_keys(request):
@@ -312,7 +316,9 @@ def update_user_keys(request):
             public_key_bytes = bytes.fromhex(data['public_key'])
             X25519PublicKey.from_public_bytes(public_key_bytes)
             user.encryption_public_key = public_key_bytes
-        except ValueError:
+            logger.info(f"Public key updated for user {user.email} during registration")
+        except (ValueError, binascii.Error):
+            logger.error(f"Invalid public key during registration for {user.email}")
             return Response({'error': 'Invalid public key'}, status=400)
 
     if 'encrypted_priv' in data:
@@ -321,10 +327,17 @@ def update_user_keys(request):
             if len(encrypted_priv_bytes) != 12 + 32 + 16:  # iv + ciphertext + tag for 32-byte priv
                 raise ValueError
             user.encrypted_priv = encrypted_priv_bytes
+            logger.info(f"Encrypted private key updated for user {user.email}")
         except ValueError:
+            logger.error(f"Invalid encrypted private key for user {user.email}")
             return Response({'error': 'Invalid encrypted private key'}, status=400)
 
+    if 'xiv_b64' in data:
+        user.xpriv_iv = data['xiv_b64']
+        logger.info(f"IV updated for user {user.email}")
+
     user.save()
+    logger.info(f"User {user.email} saved after key update")
 
     metadata = {
         'time': timezone.now().isoformat(),
@@ -352,8 +365,18 @@ def request_appointment(request):
         # Verif signature and chain
         doctor_pub = load_pub_from_cert(cert_chain['doctor'])
         request_msg = json.dumps({ 'type': 'appointment_request', 'patient_id': str(patient_id), 'timestamp': data.get('timestamp', timezone.now().isoformat()) }).encode()
-        doctor_pub.verify(signature, request_msg)
-        # Verif chain (root/intermediate)
+        if isinstance(doctor_pub, RSAPublicKey):
+            doctor_pub.verify(
+                signature,
+                request_msg,
+                padding.PSS(
+                    mgf=padding.MGF1(hashes.SHA256()),
+                    salt_length=padding.PSS.MAX_LENGTH
+                ),
+                hashes.SHA256()
+            )
+        else:
+            doctor_pub.verify(signature, request_msg)
         verify_cert_chain(cert_chain)
 
         PendingRequest.objects.create(
@@ -398,7 +421,7 @@ def get_my_cert_chain(request):
         'doctor_pem': request.user.certificate or '-----BEGIN CERTIFICATE-----...',
     })
 
-def load_pub_from_cert(pem: str) -> Ed25519PublicKey:
+def load_pub_from_cert(pem: str):
     cert = load_pem_x509_certificate(pem.encode(), default_backend())
     return cert.public_key()
 
@@ -468,7 +491,18 @@ def create_pending_request(request):
         # Verify sig and chain
         doctor_pub = load_pub_from_cert(cert_chain['doctor'])
         request_msg = json.dumps({ 'type': type_, 'patient_id': str(patient_id), 'details': details, 'timestamp': data.get('timestamp', timezone.now().isoformat()) }).encode()
-        doctor_pub.verify(signature, request_msg)
+        if isinstance(doctor_pub, RSAPublicKey):
+            doctor_pub.verify(
+                signature,
+                request_msg,
+                padding.PSS(
+                    mgf=padding.MGF1(hashes.SHA256()),
+                    salt_length=padding.PSS.MAX_LENGTH
+                ),
+                hashes.SHA256()
+            )
+        else:
+            doctor_pub.verify(signature, request_msg)
         verify_cert_chain(cert_chain)
 
         PendingRequest.objects.create(

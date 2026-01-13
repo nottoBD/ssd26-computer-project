@@ -75,7 +75,6 @@ function RegisterPage() {
           name: "RSASSA-PKCS1-v1_5",
           modulusLength: 2048,
           publicExponent: new Uint8Array([1, 0, 1]),
-          publicExponent: new Uint8Array([1, 0, 1]),
           hash: "SHA-256",
         },
         true, // Must be extractable to export for largeBlob or fallback
@@ -171,63 +170,61 @@ function RegisterPage() {
     setError(null);
 
     const formData = new FormData(e.currentTarget);
-    try {
-      if (!executeRecaptcha) {
-        throw new Error("reCAPTCHA not yet available - please try again");
-      }
-      const recaptcha_token = await executeRecaptcha("register");
+try {
+  if (!executeRecaptcha) {
+    throw new Error("reCAPTCHA not yet available - please try again");
+  }
+  const recaptcha_token = await executeRecaptcha("register");
 
-      
-      const payload: any = {
-        email: (formData.get("email") as string).trim().toLowerCase(),
-        first_name: (formData.get("firstName") as string),
-        last_name: (formData.get("lastName") as string),
-        type: userType,
-        date_of_birth:
-          userType === "patient" ? (formData.get("dateOfBirth") as string) : null,
-        medical_organization:
-          userType === "doctor"
-            ? (formData.get("medicalOrganization") as string) : "",
+  const payload: any = {
+    email: (formData.get("email") as string).trim().toLowerCase(),
+    first_name: (formData.get("firstName") as string),
+    last_name: (formData.get("lastName") as string),
+    type: userType,
+    date_of_birth:
+      userType === "patient" ? (formData.get("dateOfBirth") as string) : null,
+    medical_organization:
+      userType === "doctor"
+        ? (formData.get("medicalOrganization") as string) : "",
 
-        device_name: (formData.get("deviceName") as string) || "",
-        recaptcha_token,
-      };
-    
-      if (userType === "doctor") {
-        if (!certFile) {
-          throw new Error("Certificate required for doctor registration");
-        }
-        if (!privPem) {
-          throw new Error("Private key not generated - please generate certificate first");
-        }
-        payload.certificate = await certFile.text();
-      }
-    
-      // Check already authenticated
-      const authCheck = await fetch("/api/webauthn/auth/status/", { credentials: 'include' });
-    
-      if (authCheck.ok) {
-        const { authenticated } = await authCheck.json();
-        if (authenticated) {
-          setError("Already logged in - logout first to register new account");
-          setLoading(false);
-          return;
-        }
-      } 
+    device_name: (formData.get("deviceName") as string) || "",
+    recaptcha_token,
+  };
+
+  if (userType === "doctor") {
+    if (!certFile) {
+      throw new Error("Certificate required for doctor registration");
+    }
+    if (!privPem) {
+      throw new Error("Private key not generated - please generate certificate first");
+    }
+    payload.certificate = await certFile.text();
+  }
+
+  // Check already authenticated
+  const authCheck = await fetch("/api/webauthn/auth/status/", { credentials: 'include' });
+  
+  if (authCheck.ok) {
+    const { authenticated } = await authCheck.json();
+    if (authenticated) {
+      setError("Already logged in - logout first to register new account");
+      setLoading(false);
+      return;
+    }
+  } 
         
-      const startResp = await fetch("/api/webauthn/register/start/", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(payload),
-      });
+  const startResp = await fetch("/api/webauthn/register/start/", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  });
 
-      if (!startResp.ok) {
-        const err = await startResp.json();
-        throw new Error(err.error || "Server error during registration start");
-      }
+  if (!startResp.ok) {
+    const err = await startResp.json();
+    throw new Error(err.error || "Server error during registration start");
+  }
 
-      let options = await startResp.json();
-
+  let options = await startResp.json();
       // Cascading secure storage for doctor priv key
       if (userType === "doctor") {
         // Prefer platform authenticator (TouchID/Hello/Chrome built-in)
@@ -264,12 +261,13 @@ function RegisterPage() {
       const x25519KeyPair = generateX25519Keypair();
 
       // Public key is already raw Uint8Array (32 bytes)
-      payload.x25519_public = btoa(String.fromCharCode(...x25519KeyPair.publicKey));  // Base64 for sending
+      payload.x25519_public = bytesToHex(x25519KeyPair.publicKey);
 
       // Private key is raw Uint8Array – store temporarily
       const x25519PrivRawLocal = x25519KeyPair.privateKey;
 
-      // 2. Show WebAuthn prompt
+const edPub = deriveEd25519FromX25519(x25519PrivRawLocal).publicKey;
+  // 2. Show WebAuthn prompt
       setWebauthnStarted(true);
 
       // 2. Trigger device prompt - Wrap in { optionsJSON } to fix call structure
@@ -422,6 +420,8 @@ function RegisterPage() {
         window.__SIGN_PRIV__ = deriveEd25519FromX25519(window.__MY_PRIV__).privateKey;
       }
 
+      credential.public_key = bytesToHex(x25519KeyPair.publicKey);
+  credential.signing_public_key = bytesToHex(edPub);
       // 3. Finish registration
       const finishResp = await fetch("/api/webauthn/register/finish/", {
         method: "POST",
@@ -429,15 +429,49 @@ function RegisterPage() {
         body: JSON.stringify(credential),
       });
 
-      if (!finishResp.ok) {
-       const err = await finishResp.json();
-       throw new Error(err.error || "Registration failed on server");
-      }
+        if (!finishResp.ok) {
+            const text = await finishResp.text();
+            console.log('Finish response text:', text);
+            const err = JSON.parse(text); // or try/catch
+            throw new Error(err.error || "Registration failed on server");
+        }
+      const finishData = await finishResp.json();  // Assume backend returns {status: 'OK', user_id: str} on success
+      const userId = finishData.user_id;  // Get from response; if not, fetch /api/user/me/ below
+      console.log(`Registration finished for user ID: ${userId}`);
 
-      await refreshAuth();
+      await refreshAuth();  // This sets session/cookies
+
+      // Fetch own pubkey to verify
+      const meResp = await fetch('/api/user/me/');
+      if (!meResp.ok) throw new Error('Failed to fetch user ID post-reg');
+      const meData = await meResp.json();
+      const userIdFromMe = meData.id;  // Use this if finish doesn't provide
+
+      const verifyKeys = await fetch(`/api/user/public_key/${userIdFromMe}`);
+      if (!verifyKeys.ok || !(await verifyKeys.json()).public_key) {
+        // Retry sending keys if not included (e.g., due to PRF failure)
+        console.warn("Public key not saved - retrying update");
+        const retryResp = await fetch("/api/user/keys/update/", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            public_key: bytesToHex(x25519KeyPair.publicKey),
+          }),
+        });
+        if (!retryResp.ok) {
+          const retryErr = await retryResp.json();
+          console.error(`Retry failed: ${retryErr.error}`);
+          setError('Failed to save encryption keys. Please try logging in and updating in settings.');
+          return;  // Don't navigate; let user retry
+        }
+        console.log("Public key retry successful");
+      } else {
+        console.log("Public key verified as saved");
+      }
       navigate({ to: "/" });
     } catch (err) {
       console.error(err);
+      console.error("Registration error:", err);
       setError(err instanceof Error ? err.message : "Registration failed");
       setWebauthnStarted(false);
       // Clear privPem on error
@@ -446,7 +480,6 @@ function RegisterPage() {
       setLoading(false);
     }
   };
-
 
   return (
     <div className="min-h-[calc(100vh-4rem)] flex items-center justify-center p-4 bg-gradient-to-br from-blue-50 to-indigo-50">
@@ -710,7 +743,7 @@ function RegisterPage() {
           {qrDataUrl && <img src={qrDataUrl} alt="X25519 Private Key QR" className="mx-auto" />}
         </DialogContent>
       </Dialog>
-      {/* Dialog for manual priv key input */}
+      {/* Dialog for manual priv key input input */}
       <Dialog
         open={privInputModalOpen}
         onOpenChange={(open) => {

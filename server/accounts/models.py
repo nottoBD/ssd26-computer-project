@@ -45,6 +45,7 @@ class User(AbstractBaseUser, PermissionsMixin):
 # Encryption keys for E2EE (X25519)
 #   # 32 bytes X25519 public key
     encryption_public_key = models.BinaryField(null=True, blank=True)
+    signing_public_key = models.BinaryField(null=True, blank=True)  # 32 bytes Ed25519 public key derived from X25519
   # AES-KEK encrypted 32 bytes X25519 private key
     encrypted_encryption_private = models.BinaryField(null=True, blank=True)
     xpriv_iv = models.CharField(max_length=24, null=True, blank=True)  # Base64-encoded 96-bit IV for X25519
