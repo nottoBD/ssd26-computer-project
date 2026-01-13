@@ -47,6 +47,7 @@
     "sha256": "link:@noble/hashes/sha256",
     "shadcn": "^3.6.3",
     "tailwind-merge": "^3.4.0",
+    "tailwindcss-animate": "^1.0.7",
     "zod": "^4.1.13"
   },
   "devDependencies": {

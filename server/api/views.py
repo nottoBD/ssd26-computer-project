@@ -8,7 +8,9 @@ from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey, Ed25519PublicKey
 from cryptography.hazmat.primitives.asymmetric import padding
+from cryptography.hazmat.primitives.asymmetric.rsa import RSAPublicKey
 from cryptography.hazmat.primitives import hashes
+
 from accounts.models import User, PatientRecord, DoctorPatientLink, PendingRequest
 from django.db.models import Q
 import json
@@ -154,18 +156,6 @@ def get_patient_record(request, patient_id):
     }
   })
 
-@api_view(['GET'])
-@permission_classes([IsAuthenticated])
-def get_user_public_key(request, user_id):
-    try:
-        user = User.objects.get(id=user_id)
-        response_data = {
-            'public_key': user.encryption_public_key.hex() if user.encryption_public_key else None,
-            'signing_public_key': user.signing_public_key.hex() if user.signing_public_key else None
-        }
-        return Response(response_data)
-    except User.DoesNotExist:
-        return Response({'error': 'User not found'}, status=404)
 
 @api_view(['DELETE'])
 @permission_classes([IsAuthenticated])
@@ -322,6 +312,16 @@ def update_user_keys(request):
         except (ValueError, binascii.Error):
             logger.error(f"Invalid public key during registration for {user.email}")
             return Response({'error': 'Invalid public key'}, status=400)
+
+    if 'signing_public_key' in data:
+        try:
+            signing_public_key_bytes = bytes.fromhex(data['signing_public_key'])
+            Ed25519PublicKey.from_public_bytes(signing_public_key_bytes)
+            user.signing_public_key = signing_public_key_bytes
+            logger.info(f"Signing public key updated for user {user.email}")
+        except (ValueError, binascii.Error):
+            logger.error(f"Invalid signing public key for user {user.email}")
+            return Response({'error': 'Invalid signing public key'}, status=400)
 
     if 'encrypted_priv' in data:
         try:
@@ -527,8 +527,88 @@ def create_pending_request(request):
         return Response({'status': 'OK'})
     except Exception as e:
         return Response({'error': str(e)}, status=400)
-
     
+@api_view(['GET'])
+@permission_classes([IsAuthenticated])
+def get_user_public_key(request, user_id):
+    try:
+        user = User.objects.get(id=user_id)
+        response_data = {
+            'public_key': user.encryption_public_key.hex() if user.encryption_public_key else None,
+            'signing_public_key': user.signing_public_key.hex() if user.signing_public_key else None
+        }
+        return Response(response_data)
+    except User.DoesNotExist:
+        return Response({'error': 'User not found'}, status=404)
+    
+
+@api_view(['GET'])
+@permission_classes([IsAuthenticated])
+def get_pending_appointments(request):
+    if request.user.type != User.Type.PATIENT:
+        return Response({'error': 'Patients only'}, status=403)
+    requests = PendingRequest.objects.filter(target=request.user, type='appointment', status='pending')
+    data = [{
+        'id': str(r.id),
+        'requester': {'id': str(r.requester.id), 'name': f"{r.requester.first_name} {r.requester.last_name}"},
+        'timestamp': r.created_at.isoformat(),
+    } for r in requests]
+    metadata = {
+        'time': timezone.now().isoformat(),
+        'size': len(data),
+        'privileges': 'get_pending_appointments',
+        'tree_depth': 1,
+    }
+    logger.info(json.dumps(metadata))
+    return Response({'requests': data})
+
+@api_view(['POST'])
+@permission_classes([IsAuthenticated])
+def approve_pending(request, pk):
+    if request.user.type != User.Type.PATIENT:
+        return Response({'error': 'Patients only'}, status=403)
+    try:
+        pending = PendingRequest.objects.get(id=pk, target=request.user, type='appointment', status='pending')
+    except PendingRequest.DoesNotExist:
+        return Response({'error': 'Request not found'}, status=404)
+    encrypted_dek = request.data.get('encrypted_dek')
+    if not encrypted_dek:
+        return Response({'error': 'Missing encrypted_dek'}, status=400)
+    record = request.user.medical_record
+    record.encrypted_deks[str(pending.requester.id)] = encrypted_dek
+    record.save()
+    DoctorPatientLink.objects.get_or_create(doctor=pending.requester, patient=request.user)
+    pending.status = 'approved'
+    pending.save()
+    metadata = {
+        'time': timezone.now().isoformat(),
+        'size': len(encrypted_dek),
+        'privileges': 'approve_appointment',
+        'tree_depth': 2,
+    }
+    logger.info(json.dumps(metadata))
+    return Response({'status': 'approved'})
+
+@api_view(['POST'])
+@permission_classes([IsAuthenticated])
+def deny_pending(request, pk):
+    if request.user.type != User.Type.PATIENT:
+        return Response({'error': 'Patients only'}, status=403)
+    try:
+        pending = PendingRequest.objects.get(id=pk, target=request.user, type='appointment', status='pending')
+    except PendingRequest.DoesNotExist:
+        return Response({'error': 'Request not found'}, status=404)
+    pending.status = 'denied'
+    pending.save()
+    metadata = {
+        'time': timezone.now().isoformat(),
+        'size': 0,
+        'privileges': 'deny_appointment',
+        'tree_depth': 2,
+    }
+    logger.info(json.dumps(metadata))
+    return Response({'status': 'denied'})
+
 @api_view(['GET'])
 def health(request):
     return Response({"status": "ok", "message": "Backend is running!"})
