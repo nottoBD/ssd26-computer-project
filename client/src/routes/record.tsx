@@ -122,6 +122,7 @@ function RecordPage() {
   const [inputPrivOpen, setInputPrivOpen] = useState(false)
   const [inputPriv, setInputPriv] = useState('')
   const [rawRecordData, setRawRecordData] = useState<{ encrypted_data: string; signature: string; encrypted_deks: Record<string, string>; encrypted_dek?: string } | null>(null)
+  const [refreshKey, setRefreshKey] = useState(0);
 
   useEffect(() => {
     pdfjs.GlobalWorkerOptions.workerSrc = new URL(
@@ -189,7 +190,7 @@ useEffect(() => {
     } else if (user.type === 'doctor') {
       if (patientId) {
         // Fetch patient pub first, then record
-        const rPub = await fetch(`/api/user/public_key/${patientId}`);
+        const rPub = await fetch(`/api/user/public_key/${patientId}?_=${refreshKey}`); // Cache bust
         if (!rPub.ok) {
           const errText = await rPub.text();
           throw new Error('Failed to fetch patient public key: ' + errText);
@@ -389,18 +390,16 @@ try {
 
 const updateRecord = async (rotate = false) => {
   if (!record) return alert('No record to update.')
-
   if (!window.__MY_PRIV__) {
     setInputPrivOpen(true)
     return
   }
-
   try {
+    await fetchAppointedDoctors();  // Refresh appointed doctors to ensure latest list before computing DEKs
     let dek = rotate ? randomBytes(32) : (window.__CURRENT_DEK__ || randomBytes(32))
     let priv = window.__MY_PRIV__
     let pubUpdate: string | undefined
     let signPubUpdate: string | undefined
-
     if (rotate) {
       const newKeypair = generateX25519Keypair()
       priv = newKeypair.privateKey
@@ -408,23 +407,19 @@ const updateRecord = async (rotate = false) => {
       pubUpdate = bytesToHex(newKeypair.publicKey)
       signPubUpdate = bytesToHex(newEdPair.publicKey)
     }
-
     const masterKEK = await deriveMasterKEK(priv)
-
     const raw = new TextEncoder().encode(JSON.stringify(record))
     const encrypted = await encryptAES(raw, dek)
     const concatenated = new Uint8Array([...encrypted.iv, ...encrypted.ciphertext, ...encrypted.tag])
     const edPriv = deriveEd25519FromX25519(priv).privateKey
     const sig = signEd25519(concatenated, edPriv)
     const deks: Record<string, string> = {}
-
     // Self
     const encryptedSelfDek = await encryptAES(dek, masterKEK)
     deks['self'] = bytesToBase64(new Uint8Array([...encryptedSelfDek.iv, ...encryptedSelfDek.ciphertext, ...encryptedSelfDek.tag]))
-
     // Doctors
     for (const doc of appointedDoctors) {
-      const docPubRes = await fetch(`/api/user/${doc.id}/public_key`)
+      const docPubRes = await fetch(`/api/user/public_key/${doc.id}`)
       if (!docPubRes.ok) continue
       const { public_key } = await docPubRes.json()
       const docPubBytes = hexToBytes(public_key)
@@ -432,14 +427,12 @@ const updateRecord = async (rotate = false) => {
       const encryptedDek = await encryptAES(dek, shared)
       deks[doc.id] = bytesToBase64(new Uint8Array([...encryptedDek.iv, ...encryptedDek.ciphertext, ...encryptedDek.tag]))
     }
-
     const metadata = {
       time: new Date().toISOString(),
       size: concatenated.length,
       privileges: 'patient',
       tree_depth: calculateMaxDepth(record),
     }
-
     const r = await fetch('/api/record/update/', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'X-CSRFToken': getCookie('csrftoken') || '' },
@@ -452,7 +445,6 @@ const updateRecord = async (rotate = false) => {
       }),
     })
     if (!r.ok) throw new Error('Update error: ' + await r.text())
-
     if (rotate) {
       let body: any = { public_key: pubUpdate, signing_public_key: signPubUpdate }
       if (window.__KEK__) {
@@ -466,12 +458,10 @@ const updateRecord = async (rotate = false) => {
         body: JSON.stringify(body)
       })
       if (!kr.ok) throw new Error('Key update failed')
-
       window.__MY_PRIV__ = priv
       sessionStorage.setItem('x25519_priv_b64', bytesToBase64(priv));
       alert(`Keys rotated successfully. Update your password manager with the new private key: ${bytesToBase64(priv)}`)
     }
-
     window.__CURRENT_DEK__ = dek
     setIsDirty(false)
     if (rotate) {
@@ -483,6 +473,7 @@ const updateRecord = async (rotate = false) => {
     setError(err.message)
   }
 }
+  
   const handleRotate = () => {
     if (confirm('Rotate encryption keys? This will generate a new identity key and DEK.')) {
       updateRecord(true)
@@ -490,6 +481,13 @@ const updateRecord = async (rotate = false) => {
     setRotateOpen(false)
   }
 
+  const handleRefresh = async () => {
+    if (user?.type === 'doctor' && patientId) {
+      setRefreshKey(prev => prev + 1); // Trigger useEffect re-run with new key for cache bust
+    }
+  };
+
+  
   const calculateMaxDepth = (node: RecordNode, current = 0): number => {
     if (node.type !== 'folder' || !node.children) return current
     return Math.max(...node.children.map((child) => calculateMaxDepth(child, current + 1)), current)

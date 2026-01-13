@@ -159,9 +159,11 @@ def get_patient_record(request, patient_id):
 def get_user_public_key(request, user_id):
     try:
         user = User.objects.get(id=user_id)
-        if not user.encryption_public_key:
-            return Response({'public_key': None})
-        return Response({'public_key': user.encryption_public_key.hex()})
+        response_data = {
+            'public_key': user.encryption_public_key.hex() if user.encryption_public_key else None,
+            'signing_public_key': user.signing_public_key.hex() if user.signing_public_key else None
+        }
+        return Response(response_data)
     except User.DoesNotExist:
         return Response({'error': 'User not found'}, status=404)
 

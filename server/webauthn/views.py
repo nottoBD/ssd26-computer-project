@@ -235,7 +235,6 @@ class FinishRegistration(View):
                 credential.is_primary = True
                 credential.save()
 
-
             user.is_active = True
 
             if 'public_key' in response:
@@ -248,12 +247,23 @@ class FinishRegistration(View):
                     logger.error(f"Invalid public key during registration for {user.email}")
                     return JsonResponse({'error': 'Invalid public key'}, status=400)
 
+            # New: Handle signing_public_key
+            if 'signing_public_key' in response:
+                try:
+                    signing_pub_bytes = bytes.fromhex(response['signing_public_key'])
+                    if len(signing_pub_bytes) != 32:
+                        raise ValueError("Invalid signing public key length")
+                    user.signing_public_key = signing_pub_bytes
+                    logger.info(f"Signing public key set for user {user.email} during registration")
+                except ValueError as e:
+                    logger.error(f"Invalid signing public key during registration for {user.email}: {str(e)}")
+                    return JsonResponse({'error': 'Invalid signing public key'}, status=400)
+
             user.save()
             login(request, user)
             # Mark which credential was used for this session
             request.session['used_credential_id'] = websafe_encode(credential.credential_id)
             request.session['device_role'] = 'primary' if credential.is_primary else 'secondary'
-
 
             del request.session["reg_state"]
             del request.session["reg_user_id"]
@@ -280,7 +290,6 @@ class FinishRegistration(View):
             import traceback
             logger.error(traceback.format_exc())
             return JsonResponse({"error": f"Registration failed: {str(e)}"}, status=400)
-
 
 @method_decorator(csrf_exempt, name="dispatch")
 class StartAuthentication(View):
