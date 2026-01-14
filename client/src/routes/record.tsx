@@ -1,3 +1,41 @@
+/**
+ * FILE: record.tsx
+ *
+ * PURPOSE:
+ *      Implements the Medical Record page 
+ *      Provides a patient-facing portal to manage an encrypted record tree,
+ *      and a doctor-facing portal to view a patient record and submit encrypted change requests.
+ *
+ * CORE SECURITY GOALS:
+ *  - End-to-End Encryption (E2EE): server stores ciphertext only.
+ *  - Fine-grained sharing: patient selectively grants doctors access to the Data Encryption Key (DEK).
+ *  - Integrity + authenticity: Ed25519 signatures protect record ciphertext from tampering.
+ *  - Zero-knowledge server: the backend cannot decrypt medical content.
+ *
+ * CRYPTO DESIGN OVERVIEW:
+ *  - Record payload is JSON serialized then encrypted with a random DEK (AES-GCM).
+ *  - The encrypted record blob is signed using an Ed25519 key derived from the user X25519 private key.
+ *  - The DEK is wrapped (encrypted) multiple times:
+ *      (a) For patient self-access: DEK wrapped under masterKEK = SHA256(patient_x25519_priv).
+ *      (b) For each appointed doctor: DEK wrapped under shared_secret = X25519(patient_priv, doctor_pub).
+ *  - Doctors never receive plaintext record content unless they can derive the shared_secret for DEK unwrap.
+ *
+ * KEY MATERIAL HANDLING:
+ *  - X25519 private key is expected in memory (window.__MY_PRIV__) or sessionStorage fallback.
+ *  - The page verifies that the supplied private key matches the public key stored server-side
+ *    to prevent accidental key mismatch and signature verification failures.
+ *
+ * ROLE-BASED BEHAVIOR:
+ *  - Patient:
+ *      - Can add/edit/delete record nodes locally, then "Save Record" to re-encrypt and upload ciphertext.
+ *      - Can appoint/revoke doctors; appointing includes sending a DEK wrapped for that doctor.
+ *      - Can rotate keys (new X25519 identity + new DEK) and re-encrypt everything.
+ *  - Doctor:
+ *      - Can list appointed patients and view a selected patient record (read-only).
+ *      - Cannot directly modify record; instead submits encrypted "pending requests" to patient.
+ */
+
+
 import { useState, useEffect, useMemo } from 'react'
 import { createFileRoute, Link, useNavigate, useSearch } from '@tanstack/react-router'
 import { Input } from '@/components/ui/input'
@@ -44,6 +82,19 @@ interface AppointedDoctor {
   name: string
   org: string
 }
+/**
+ * ROUTE GUARD: beforeLoad
+ *
+ * PURPOSE:
+ *      Enforces that /record is only accessible to authenticated users.
+ *
+ * FLOW:
+ *  1) Call backend /api/webauthn/auth/status/ with session cookies.
+ *  2) If not authenticated, redirect to /login.
+ *
+ * SECURITY NOTE:
+ *  - This is a UI guard only. The backend must still enforce authorization on every API endpoint.
+ */
 
 export const Route = createFileRoute('/record')({
   beforeLoad: async () => {
@@ -66,6 +117,24 @@ export const Route = createFileRoute('/record')({
   component: RecordPage,
 });
 
+/**
+ * FUNCTION: deriveMasterKEK
+ *
+ * PURPOSE:
+ *      Derives a patient-local “master key encryption key” used to wrap/unwrap
+ *      the record DEK for patient self-access.
+ *
+ * INPUT:
+ *  - priv: patient's X25519 private key bytes
+ *
+ * OUTPUT:
+ *  - 32-byte key = SHA-256(priv)
+ *
+ * SECURITY RATIONALE:
+ *  - Enables the patient to decrypt their own DEK without involving any doctor keys.
+ *  - Note: hashing a private key into a KEK is a pragmatic derivation; in a hardened design,
+ *    HKDF with context info would be preferable to avoid key reuse across domains.
+ */
 async function deriveMasterKEK(priv: Uint8Array): Promise<Uint8Array> {
   const digest = await crypto.subtle.digest('SHA-256', priv);
   return new Uint8Array(digest);
@@ -80,6 +149,18 @@ function base64ToBytes(base64: string): Uint8Array {
   const binString = atob(base64);
   return new Uint8Array(binString.length).map((_, i) => binString.charCodeAt(i));
 }
+
+
+/**
+ * FUNCTION: getCookie
+ *
+ * PURPOSE:
+ *      Reads CSRF token (or other cookie values) from document.cookie to attach
+ *      to state-changing requests.
+ *
+ * SECURITY NOTE:
+ *  - Used for X-CSRFToken header on write operations.
+ */
 
 function getCookie(name: string): string | undefined {
   const matches = document.cookie.match(new RegExp(
@@ -154,6 +235,30 @@ function RecordPage() {
 
   useEffect(() => {
     // Fetch user info
+    /**
+    * EFFECT: initialize record context after user load
+    *
+    * PURPOSE:
+    *      Loads cryptographic context (private key), verifies key consistency,
+    *      then loads the correct record depending on role (patient vs doctor).
+    *
+    * FLOW:
+    *  1) Ensure X25519 private key is available:
+    *      - Prefer window.__MY_PRIV__ (set during login), else sessionStorage fallback.
+    *      - If missing, force user to input private key (password manager fallback).
+    *  2) Verify private key matches the public key stored server-side:
+    *      - derivedPub(priv) must equal server public_key
+    *      - prevents mismatch and prevents false decrypt/sign verification attempts
+    *  3) Patient:
+    *      - Fetch own record (/api/record/my/)
+    *      - Fetch appointed doctors
+    *  4) Doctor with patientId:
+    *      - Fetch patient's encryption public key + signing public key
+    *      - Fetch patient record (/api/record/patient/{id}/) and decrypt using shared secret
+    *  5) Doctor without patientId:
+    *      - List appointed patients
+ */
+
     fetch('/api/user/me/')
       .then(async (r) => {
         if (!r.ok) throw new Error(await r.text())
@@ -226,6 +331,30 @@ useEffect(() => {
   })();
 }, [user, patientId, refreshKey])
 
+/**
+ * FUNCTION: fetchRecord
+ *
+ * PURPOSE:
+ *      Fetches encrypted medical record data from backend and triggers
+ *      client-side decryption + signature verification.
+ *
+ * INPUTS:
+ *  - url: API endpoint to fetch record
+ *  - isSelf: true for patient accessing own record; false for doctor accessing patient record
+ *  - patientPubBytes / patientSignPubBytes: required for doctor case (shared secret + signature verify)
+ *
+ * FLOW:
+ *  1) Fetch encrypted record blob + signature + DEK wrapper(s).
+ *  2) Determine which encrypted DEK wrapper applies:
+ *      - patient self: encrypted_deks["self"]
+ *      - doctor view: encrypted_dek (already pre-selected by backend)
+ *  3) Store raw data in state (rawRecordData) for debugging/inspection.
+ *  4) If ciphertext exists, call processRawRecord(...). Otherwise initialize empty record tree.
+ *
+ * FAILURE MODE:
+ *  - If fetch fails or data missing, surface error to UI and avoid partial decrypt states.
+ */
+
   const fetchRecord = async (url: string, isSelf: boolean, patientPubBytes?: Uint8Array, patientSignPubBytes?: Uint8Array) => {
     try {
       const r = await fetch(url)
@@ -261,6 +390,30 @@ useEffect(() => {
       setError(err.message)
     }
   }
+
+/**
+ * FUNCTION: processRawRecord
+ *
+ * PURPOSE:
+ *      Decrypts and validates an encrypted record blob, then loads it into the UI.
+ *
+ * FLOW:
+ *  1) Split encrypted record blob into (iv | ciphertext | tag) for AES-GCM.
+ *  2) Obtain DEK:
+ *      - patient self: decryptDEK(encDek, masterKEK) where masterKEK = SHA256(patient_priv)
+ *      - doctor view: decryptDEK(encDek, shared_secret) where shared_secret = X25519(doctor_priv, patient_pub)
+ *  3) Verify integrity/authenticity:
+ *      - verifyEd25519(signature, rawBytes, edPub)
+ *      - patient case uses Ed25519 derived from local priv
+ *      - doctor case uses patient signing public key fetched from server
+ *  4) AES-GCM decrypt ciphertext → JSON parse → setRecord(...)
+ *  5) Cache the active DEK into window.__CURRENT_DEK__ for later edits/saves.
+ *
+ * SECURITY NOTES:
+ *  - Signature verification is essential: AES-GCM already provides integrity for ciphertext,
+ *    but signature ties the record to the patient's identity key and defends against server-side swapping.
+ *  - If signature fails in self-mode, the UI forces private-key re-entry (reduces “wrong key” confusion).
+ */
 
   const processRawRecord = async (isSelf: boolean, encrypted_data: string, signature: string, encDek: string, patientPubBytes?: Uint8Array, patientSignPubBytes?: Uint8Array) => {
     const rawBytes = base64ToBytes(encrypted_data)
@@ -315,6 +468,27 @@ console.log(`Doctor-side shared hash for patient ${patientId}: ${sharedHash}`);
     }
   }
 
+
+
+  /**
+ * FUNCTION: decryptDEK
+ *
+ * PURPOSE:
+ *      Unwraps (decrypts) an encrypted DEK using AES-GCM with a provided key
+ *      (either masterKEK for self-access or ECDH shared secret for doctor access).
+ *
+ * INPUT:
+ *  - encDekStr: base64 string encoding (iv | ciphertext | tag)
+ *  - key: 32-byte symmetric key to decrypt the DEK wrapper
+ *
+ * VALIDATION:
+ *  - Enforces expected wrapped length: 60 bytes = 12 IV + 32 ciphertext + 16 tag
+ *    (because DEK is exactly 32 bytes).
+ *
+ * OUTPUT:
+ *  - plaintext DEK (32 bytes)
+ */
+
   const decryptDEK = async (encDekStr: string, key: Uint8Array): Promise<Uint8Array> => {
     const dekBytes = base64ToBytes(encDekStr)
     console.log('Encrypted DEK length:', dekBytes.length);  // Should be 60 (12 IV + 32 ciphertext + 16 tag)
@@ -327,6 +501,31 @@ console.log(`Doctor-side shared hash for patient ${patientId}: ${sharedHash}`);
     console.log('DEK ciphertext length:', ciphertext.length);  // Should be 32
     return await decryptAES(ciphertext, key, iv, tag)
   }
+
+
+
+/**
+ * FUNCTION: handlePrivInput
+ *
+ * PURPOSE:
+ *      Allows manual import of the X25519 private key (password manager fallback),
+ *      verifies it against server public key, and optionally re-encrypts it using PRF KEK.
+ *
+ * FLOW:
+ *  1) Decode base64 → newPriv.
+ *  2) Store to window.__MY_PRIV__ and sessionStorage for the session.
+ *  3) Verify consistency:
+ *      - derivedPub(newPriv) must equal server public_key for this user.
+ *      - If mismatch, reject and instruct user to input correct key or rotate.
+ *  4) If window.__KEK__ is available (PRF-supported login), encrypt and upload encrypted_priv
+ *     to server so future logins can decrypt automatically.
+ *  5) Reload record using correct role path (self or doctor patient view).
+ *
+ * SECURITY NOTES:
+ *  - Verification step prevents accidental usage of wrong key (would break decrypt + signatures).
+ *  - Storing private keys in sessionStorage is a tradeoff; acceptable for prototype/demo,
+ *    but should be minimized in production.
+ */
 
 const handlePrivInput = async () => {
 try {
@@ -383,6 +582,28 @@ try {
   setError((err as Error).message)  // Now shows the mismatch error
 }
 }
+
+/**
+ * FUNCTION: fetchAppointedDoctors
+ *
+ * PURPOSE:
+ *      Retrieves the list of doctors currently appointed by the authenticated patient.
+ *      This list is used for:
+ *        - Displaying "Appointed Doctors" in the UI
+ *        - Computing DEK wrapping targets during updateRecord() (sharing DEK with each doctor)
+ *
+ * FLOW:
+ *  1) GET /api/appoint/doctors/ with session cookies.
+ *  2) Expect JSON: { doctors: [...] }.
+ *  3) Store doctors in appointedDoctors state.
+ *
+ * SECURITY / AUTHZ NOTES:
+ *  - Endpoint must enforce that only the patient can read their own appointment list.
+ *  - updateRecord() relies on this list to decide who receives encrypted DEKs.
+ *    If this list is stale, DEK sharing may be incomplete (doctor can lose access) or overly broad
+ *    (revoked doctor might still be included until next refresh + re-encrypt).
+ */
+
   const fetchAppointedDoctors = async () => {
     try {
       const r = await fetch('/api/appoint/doctors/')
@@ -395,6 +616,25 @@ try {
     }
   }
 
+
+/**
+ * FUNCTION: fetchAppointedPatients
+ *
+ * PURPOSE:
+ *      Retrieves the list of patients that have appointed the authenticated doctor.
+ *      Used in the doctor portal to populate the "Appointed Patients" table and allow
+ *      navigation to a specific patient record view.
+ *
+ * FLOW:
+ *  1) GET /api/appoint/patients/ with session cookies.
+ *  2) Expect JSON: { patients: [...] }.
+ *  3) Store patients in appointedPatients state.
+ *
+ * SECURITY / AUTHZ NOTES:
+ *  - Endpoint must enforce that only doctors see their own appointed patients.
+ *  - This list represents an access-control boundary: a doctor should only be able to fetch
+ *    /api/record/patient/{id}/ for patients returned by this endpoint (or otherwise authorized).
+ */
   const fetchAppointedPatients = async () => {
     try {
       const r = await fetch('/api/appoint/patients/')
@@ -407,6 +647,43 @@ try {
     }
   }
 
+
+/**
+ * FUNCTION: updateRecord
+ *
+ * PURPOSE:
+ *      Encrypts and signs the current record tree, wraps the DEK for all authorized readers,
+ *      and uploads only ciphertext + wrapped keys to the server.
+ *
+ * INPUT:
+ *  - rotate (default false):
+ *      - false: reuse current identity key (X25519 priv) and current DEK (if available)
+ *      - true: generate a new X25519 keypair AND a new DEK, then re-encrypt and re-share
+ *
+ * FLOW:
+ *  1) Refresh appointedDoctors to ensure sharing list is current.
+ *  2) Select DEK:
+ *      - rotate: randomBytes(32)
+ *      - else: reuse window.__CURRENT_DEK__ if present, otherwise generate random
+ *  3) (Optional rotate) Generate new X25519 identity keypair and derived Ed25519 signing key.
+ *  4) Encrypt record JSON with AES-GCM under DEK → concatenated = (iv|ciphertext|tag).
+ *  5) Sign concatenated blob using Ed25519 derived from current/rotated X25519 private key.
+ *  6) Build DEK wrappers (encrypted_deks):
+ *      - self wrapper: encryptAES(DEK, masterKEK = SHA256(patient_priv))
+ *      - doctor wrappers: for each appointed doctor:
+ *          shared = X25519(patient_priv, doctor_pub)
+ *          encryptAES(DEK, shared)
+ *  7) POST encrypted_data + encrypted_deks + signature + metadata to /api/record/update/.
+ *  8) If rotate:
+ *      - update server public keys (/api/user/keys/update/)
+ *      - optionally store encrypted_priv if window.__KEK__ exists
+ *      - update local window.__MY_PRIV__ and sessionStorage
+ *
+ * SECURITY NOTES:
+ *  - The server never receives the plaintext record or plaintext DEK.
+ *  - Rotation re-keys both identity and content, invalidating access for any party
+ *    not included in the newly wrapped encrypted_deks map.
+ */
 const updateRecord = async (rotate = false) => {
   if (!record) return alert('No record to update.')
   if (!window.__MY_PRIV__) {
@@ -493,6 +770,18 @@ const updateRecord = async (rotate = false) => {
   }
 }
   
+
+/**
+ * FUNCTION: handleRotate
+ *
+ * PURPOSE:
+ *      UI wrapper for key rotation. Confirms user intent then calls updateRecord(true).
+ *
+ * SECURITY NOTE:
+ *  - Rotation is disruptive: user must update password manager with new private key
+ *    if PRF is not available.
+ */
+
   const handleRotate = () => {
     if (confirm('Rotate encryption keys? This will generate a new identity key and DEK.')) {
       updateRecord(true)
@@ -506,11 +795,33 @@ const updateRecord = async (rotate = false) => {
     }
   };
 
-  
+
+  /**
+ * FUNCTION: calculateMaxDepth
+ *
+ * PURPOSE:
+ *      Computes maximum tree depth of the record structure.
+ *
+ * USE:
+ *  - Included as metadata to help demonstrate structural constraints and for auditing/debug.
+ */
+
   const calculateMaxDepth = (node: RecordNode, current = 0): number => {
     if (node.type !== 'folder' || !node.children) return current
     return Math.max(...node.children.map((child) => calculateMaxDepth(child, current + 1)), current)
   }
+
+
+  /**
+ * FUNCTION: removeDoctor
+ *
+ * PURPOSE:
+ *      Revokes doctor appointment from the patient side (server-side authorization).
+ *
+ * SECURITY NOTE:
+ *  - Revocation removes the appointment relation, but effective cryptographic revocation
+ *    requires a subsequent updateRecord() / rotation to stop sharing future DEKs with that doctor.
+ */
 
   const removeDoctor = async (doctorId: string) => {
     try {
@@ -539,6 +850,25 @@ const updateRecord = async (rotate = false) => {
       setError(err.message)
     }
   }
+
+  /**
+ * FUNCTION: appointDoctor
+ *
+ * PURPOSE:
+ *      Grants a doctor access to decrypt the record by sharing the DEK encrypted under
+ *      the patient-doctor ECDH shared secret.
+ *
+ * FLOW:
+ *  1) Fetch doctor encryption public key from server.
+ *  2) Derive shared secret = X25519(patient_priv, doctor_pub).
+ *  3) Ensure a DEK exists (if not, updateRecord() to create one).
+ *  4) Wrap DEK using encryptAES(DEK, shared_secret).
+ *  5) Send encrypted_dek to backend appointment endpoint.
+ *
+ * SECURITY NOTES:
+ *  - This implements the “capability” model: doctor can decrypt only if they can derive shared_secret.
+ *  - No plaintext DEK is ever sent.
+ */
 
   const appointDoctor = async (doctorId: string) => {
     if (!window.__MY_PRIV__) {
@@ -600,6 +930,19 @@ console.log(`Patient-side shared hash for doctor ${doctorId}: ${sharedHash}`);
   }
 
   const cloneRecord = () => JSON.parse(JSON.stringify(record)) as RecordNode
+
+  
+  /**
+ * FUNCTION: handleAdd
+ *
+ * PURPOSE:
+ *      Adds a new folder or file node into the local record tree (client-side only).
+ *      Marks state as dirty; encryption/upload happens only when user clicks Save Record.
+ *
+ * NOTES:
+ *  - For text files, content is stored base64-encoded in the tree.
+ *  - For binary files, raw base64 is stored along with mime type and size metadata.
+ */
 
   const handleAdd = async (type: 'folder' | 'text' | 'binary', name: string, content?: string, mime?: string) => {
     if (!record || !name) return
