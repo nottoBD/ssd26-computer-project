@@ -1,4 +1,23 @@
 "use client";
+/**
+ * Login route (WebAuthn + PRF + E2EE bootstrap).
+ *
+ * Purpose:
+ * - Perform passwordless authentication using WebAuthn discoverable credentials.
+ * - If available, use the WebAuthn PRF extension to derive a KEK used to encrypt/decrypt the
+ *   user's X25519 private key (client-side E2EE bootstrap).
+ * - Fallback path: allow manual import of an X25519 private key from a password manager when
+ *   PRF is not available on the current authenticator/device.
+ * - Support enrollment of a secondary device via an "add device" code issued by a primary device.
+ *
+ * Notes:
+ * - The PRF evaluation inputs (extensions.prf.eval.{first,second}) must be ArrayBuffer/TypedArray
+ *   when passed to navigator.credentials.get(); this file normalizes base64url inputs accordingly.
+ * - The derived KEK and decrypted private key are held in memory for the session; the PRF byte array
+ *   is explicitly zeroed to reduce data remanence.
+ * - After login/bootstrap, the client verifies the private key corresponds to the server-stored public
+ *   key to detect mismatches (wrong key import, stale server state, etc.).
+ */
 
 import { useState } from "react";
 import { createFileRoute, useNavigate } from "@tanstack/react-router";
@@ -45,6 +64,27 @@ function LoginPage() {
   const [privInput, setPrivInput] = useState('');
   const [privInputResolve, setPrivInputResolve] = useState<((value: Uint8Array | null) => void) | null>(null);
   const [privInputError, setPrivInputError] = useState<string | null>(null);
+
+
+  /**
+   * FUNCTION: handleWebAuthnLogin
+   * 
+   *  PURPOSE:
+   *      Authenticates the user using WebAuthn (discoverable credentials).
+   *
+   * FLOW:
+   * 1) Fetch authentication options from the backend.
+   * 2) Normalize PRF extension inputs into ArrayBuffer (browser requirement).
+   * 3) Trigger the platform authenticator prompt and send assertion to backend.
+   * 4) If backend returns PRF output, derive a KEK and decrypt (or generate+encrypt) the user's
+   *    X25519 private key used for end-to-end encryption, then derive an Ed25519 signing key.
+   * 5) If PRF is unavailable, prompt user to import the X25519 private key manually.
+   * 6) Verify private key matches server public key before proceeding.
+   *
+   * SIDE EFFECTS:
+   * - Writes last_login_time in localStorage for settings/anomaly UI.
+   * - Stores session keys in window globals (debug/prototype; should be treated as sensitive).
+   */
 
   const handleWebAuthnLogin = async () => {
     setLoading(true);
@@ -211,6 +251,23 @@ function LoginPage() {
     }
   };
 
+
+  /**
+   * FUNCTION: promptForPrivateKey
+   *
+   * PURPOSE:
+   *      Prompts the user to manually provide an X25519 private key when the
+   *      PRF extension is unavailable on the current authenticator/device.
+   *
+   * FLOW:
+   *  1) Open a modal dialog requesting a base64-encoded private key.
+   *  2) Validate the user input format before resolving.
+   *  3) Resolve with the decoded key bytes or null if cancelled.
+   *
+   * SIDE EFFECTS:
+   *  - Temporarily stores user input in component state until resolved.
+   */
+
   const promptForPrivateKey = async (): Promise<Uint8Array | null> => {
     return new Promise((resolve) => {
       setPrivInputResolve(() => resolve);
@@ -218,6 +275,27 @@ function LoginPage() {
       setPrivInputModalOpen(true);
     });
   };
+
+
+
+
+
+  /**
+   * FUNCTION: handleAddDevice
+   *
+   * PURPOSE:
+   *      Registers the current device as a secondary WebAuthn authenticator
+   *      for an existing user account.
+   *
+   * FLOW:
+   *  1) Send the user's email, add-code, and device name to the backend.
+   *  2) Receive WebAuthn registration options bound to the add-code.
+   *  3) Trigger credential creation on the current device.
+   *  4) Submit the attestation response to the backend to persist the credential.
+   *
+   * SIDE EFFECTS:
+   *  - Creates a new WebAuthn credential associated with the user account.
+   */
 
   const handleAddDevice = async () => {
     setLoading(true);
@@ -251,6 +329,24 @@ function LoginPage() {
       setLoading(false);
     }
   };
+
+    /**
+   * FUNCTION: validatePrivInput
+   *
+   * PURPOSE:
+   *      Validates the format of a base64-encoded X25519 private key provided
+   *      manually by the user.
+   *
+   * FLOW:
+   *  1) Trim user input and check expected length.
+   *  2) Validate base64 character set.
+   *  3) Set validation error state on failure.
+   *
+   * RETURNS:
+   *  - true if the input is valid.
+   *  - false otherwise.
+   */
+
 
   const validatePrivInput = (input: string): boolean => {
     const trimmed = input.trim();
