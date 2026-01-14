@@ -560,7 +560,7 @@ function UserPortal() {
           ) : (
             <User className="w-8 h-8 mr-2 text-blue-600" />
           )}
-          {user.type === "doctor" ? "Doctor Portal" : "Patient Portal"}
+          {user.type === "doctor" ? "Doctor Portal" : "Doctor Requests"}
         </h1>
       </div>
 

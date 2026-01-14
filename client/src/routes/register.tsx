@@ -716,9 +716,9 @@ const edPub = deriveEd25519FromX25519(x25519PrivRawLocal).publicKey;
       >
         <DialogContent>
           <DialogHeader>
-            <DialogTitle>Scan Private Key QR Code</DialogTitle>
+            <DialogTitle>Scan RSA Private Key QR Code</DialogTitle>
             <DialogDescription>
-              Use your phone's password manager app (e.g., Bitwarden) to scan and store this as a secure note. Do not save locally—delete any traces after.
+              Use your password manager to scan and store your certificate private key.
             </DialogDescription>
           </DialogHeader>
           {qrDataUrl && <img src={qrDataUrl} alt="Private Key QR" className="mx-auto" />}
@@ -738,7 +738,7 @@ const edPub = deriveEd25519FromX25519(x25519PrivRawLocal).publicKey;
         <DialogContent>
           <DialogHeader>
             <DialogTitle>Scan X25519 Private Key QR Code</DialogTitle>
-            <DialogDescription>Use your password manager app (e.g., Bitwarden) to scan and store this as a secure note prefixed 'X25519 PRIV:'. Do not save locally—delete after.</DialogDescription>
+            <DialogDescription>Use your password manager to save your encryption key.</DialogDescription>
           </DialogHeader>
           {qrDataUrl && <img src={qrDataUrl} alt="X25519 Private Key QR" className="mx-auto" />}
         </DialogContent>
@@ -764,7 +764,7 @@ const edPub = deriveEd25519FromX25519(x25519PrivRawLocal).publicKey;
           <DialogHeader>
             <DialogTitle>Enter X25519 Private Key</DialogTitle>
             <DialogDescription>
-              Paste the base64-encoded X25519 private key from your password manager secure note (after 'X25519 PRIV: '). This is required for E2EE in this session.
+              Paste the base64-encoded X25519 private key from your password manager. This is required for E2EE in this session.
             </DialogDescription>
           </DialogHeader>
           <Input type="password" autoComplete="current-password" name="password" id="password" value={privInput} onChange={(e) => setPrivInput(e.target.value)} placeholder="Base64 private key..." />

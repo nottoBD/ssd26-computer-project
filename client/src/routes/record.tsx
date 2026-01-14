@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react'
+import { useState, useEffect, useMemo } from 'react'
 import { createFileRoute, Link, useNavigate, useSearch } from '@tanstack/react-router'
 import { Input } from '@/components/ui/input'
 import { Button } from '@/components/ui/button'
@@ -7,7 +7,7 @@ import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@
 import { Textarea } from '@/components/ui/textarea'
 import { redirect } from '@tanstack/react-router'
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogTrigger, DialogFooter, DialogDescription } from '@/components/ui/dialog'
-import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuTrigger, DropdownMenuSeparator, DropdownMenuSub, DropdownMenuSubContent, DropdownMenuSubTrigger, DropdownMenuPortal } from '@/components/ui/dropdown-menu'
+import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuTrigger, DropdownMenuSeparator, DropdownMenuSub, DropdownMenuSubContent, DropdownMenuSubTrigger, DropdownMenuPortal, DropdownMenuLabel } from '@/components/ui/dropdown-menu'
 import { ChevronDown, ChevronRight, Folder, FileText, MoreVertical, Plus, Upload, Edit, Trash, User, Calendar, Shield, Key } from 'lucide-react'
 import { encryptAES, decryptAES, signEd25519, verifyEd25519, ecdhSharedSecret, deriveEd25519FromX25519, randomBytes, bytesToHex, hexToBytes, generateX25519Keypair, getX25519PublicFromPrivate } from '../components/CryptoUtils'
 import { useAuth } from './__root'
@@ -21,6 +21,7 @@ interface RecordNode {
   content?: string // base64 encoded
   mime?: string
   metadata: { created: string; size: number }
+  addedBy?: string // 'self' or doctorId
 }
 
 interface User {
@@ -97,6 +98,7 @@ function RecordPage() {
   const [record, setRecord] = useState<RecordNode | null>(null)
   const [isDirty, setIsDirty] = useState(false)
   const [numPages, setNumPages] = useState<number | null>(null)
+  const [currentPage, setCurrentPage] = useState(1)
   const [selectedPath, setSelectedPath] = useState<string[]>([])
   const [appointedDoctors, setAppointedDoctors] = useState<AppointedDoctor[]>([])
   const [appointedPatients, setAppointedPatients] = useState<Patient[]>([])
@@ -124,6 +126,13 @@ function RecordPage() {
   const [rawRecordData, setRawRecordData] = useState<{ encrypted_data: string; signature: string; encrypted_deks: Record<string, string>; encrypted_dek?: string } | null>(null)
   const [refreshKey, setRefreshKey] = useState(0);
 
+  const doctorNames = useMemo(() => {
+    return appointedDoctors.reduce((acc: Record<string, string>, d) => {
+      acc[d.id] = d.name;
+      return acc;
+    }, {});
+  }, [appointedDoctors]);
+
   useEffect(() => {
     pdfjs.GlobalWorkerOptions.workerSrc = new URL(
       'pdfjs-dist/build/pdf.worker.min.mjs',
@@ -140,6 +149,7 @@ function RecordPage() {
 
   useEffect(() => {
     setNumPages(null);
+    setCurrentPage(1);
   }, [selectedPath]);
 
   useEffect(() => {
@@ -214,7 +224,7 @@ useEffect(() => {
       }
     }
   })();
-}, [user, patientId])
+}, [user, patientId, refreshKey])
 
   const fetchRecord = async (url: string, isSelf: boolean, patientPubBytes?: Uint8Array, patientSignPubBytes?: Uint8Array) => {
     try {
@@ -352,14 +362,23 @@ try {
     if (!r.ok) console.error('Failed to update encrypted priv')
   }
 
-  // Retry processing record
-  if (rawRecordData && user) {
-    const isSelf = user.type === 'patient'
-    await processRawRecord(isSelf, rawRecordData.encrypted_data, rawRecordData.signature, isSelf ? rawRecordData.encrypted_deks['self'] : rawRecordData.encrypted_dek!, patientPub, patientSignPub)
-  }
-
   setInputPrivOpen(false)
   setInputPriv('')
+
+  // Trigger fetch after setting priv
+  const isSelf = user!.type === 'patient'
+  if (isSelf) {
+    await fetchRecord('/api/record/my/', true)
+  } else if (patientId) {
+    const rPub = await fetch(`/api/user/public_key/${patientId}`);
+    if (!rPub.ok) throw new Error('Failed to fetch patient public key');
+    const pubData = await rPub.json();
+    const pubBytes = hexToBytes(pubData.public_key);
+    const signPubBytes = hexToBytes(pubData.signing_public_key);
+    setPatientPub(pubBytes);
+    setPatientSignPub(signPubBytes);
+    await fetchRecord(`/api/record/patient/${patientId}/`, false, pubBytes, signPubBytes);
+  }
 } catch (err) {
   setError((err as Error).message)  // Now shows the mismatch error
 }
@@ -603,6 +622,7 @@ console.log(`Patient-side shared hash for doctor ${doctorId}: ${sharedHash}`);
       content,
       mime,
       metadata: { created: new Date().toISOString(), size },
+      addedBy: 'self',
     }
     parent.children.push(newNode)
     setRecord(newRecord)
@@ -671,10 +691,12 @@ console.log(`Patient-side shared hash for doctor ${doctorId}: ${sharedHash}`);
     const pathKey = path.join('/')
     const isOpen = openFolders.has(pathKey)
     const isSelected = JSON.stringify(path) === JSON.stringify(selectedPath)
+    const isRoot = path.length === 0
+    const indentClass = level > 0 ? `ml-${level * 4}` : ''
     return (
-      <div className={`ml-${level * 4}`}>
+      <div className={indentClass}>
         <div
-          className={`flex items-center cursor-pointer py-1 px-2 rounded ${isSelected ? 'bg-blue-100' : 'hover:bg-gray-100'}`}
+        className={`flex items-center cursor-pointer py-1 px-2 rounded ${isSelected ? 'bg-blue-100' : 'hover:bg-gray-100'} ${node.addedBy && node.addedBy !== 'self' ? 'text-gray-500' : ''}`}
           onClick={() => {
             setSelectedPath(path)
             if (isFolder) toggleFolder(pathKey)
@@ -692,61 +714,95 @@ console.log(`Patient-side shared hash for doctor ${doctorId}: ${sharedHash}`);
               </DropdownMenuTrigger>
               {user?.type === 'patient' ? (
                 <DropdownMenuContent className="w-56">
-                  <DropdownMenuSub>
-                    <DropdownMenuSubTrigger>
-                      <Plus className="mr-2 h-4 w-4" /> Add
-                    </DropdownMenuSubTrigger>
-                    <DropdownMenuPortal>
-                      <DropdownMenuSubContent>
-                        <DropdownMenuItem onClick={() => { setAddType('folder'); setAddRecordOpen(true) }}>
-                          <Folder className="mr-2 h-4 w-4" /> Folder
-                        </DropdownMenuItem>
-                        <DropdownMenuItem onClick={() => { setAddType('text'); setAddRecordOpen(true) }}>
-                          <FileText className="mr-2 h-4 w-4" /> Text File
-                        </DropdownMenuItem>
-                        <DropdownMenuItem onClick={() => { setAddType('binary'); setAddRecordOpen(true) }}>
-                          <Upload className="mr-2 h-4 w-4" /> File
-                        </DropdownMenuItem>
-                      </DropdownMenuSubContent>
-                    </DropdownMenuPortal>
-                  </DropdownMenuSub>
-                  <DropdownMenuSeparator />
-                  <DropdownMenuItem onClick={() => handleDelete(path)}>
-                    <Trash className="mr-2 h-4 w-4" /> Delete
-                  </DropdownMenuItem>
+                  {node.addedBy && node.addedBy !== 'self' && (
+                    <>
+                      <DropdownMenuLabel className="font-bold">
+                        Dr. {doctorNames[node.addedBy] || 'Unknown'}
+                      </DropdownMenuLabel>
+                      <DropdownMenuSeparator />
+                    </>
+                  )}
+                  {isFolder && (
+                    <>
+                      <DropdownMenuSub>
+                        <DropdownMenuSubTrigger>
+                          <Plus className="mr-2 h-4 w-4" /> Add
+                        </DropdownMenuSubTrigger>
+                        <DropdownMenuPortal>
+                          <DropdownMenuSubContent>
+                            <DropdownMenuItem onClick={() => { setAddType('folder'); setAddRecordOpen(true) }}>
+                              <Folder className="mr-2 h-4 w-4" /> Folder
+                            </DropdownMenuItem>
+                            <DropdownMenuItem onClick={() => { setAddType('text'); setAddRecordOpen(true) }}>
+                              <FileText className="mr-2 h-4 w-4" /> Text File
+                            </DropdownMenuItem>
+                            <DropdownMenuItem onClick={() => { setAddType('binary'); setAddRecordOpen(true) }}>
+                              <Upload className="mr-2 h-4 w-4" /> File
+                            </DropdownMenuItem>
+                          </DropdownMenuSubContent>
+                        </DropdownMenuPortal>
+                      </DropdownMenuSub>
+                      <DropdownMenuSeparator />
+                    </>
+                  )}
+                  {!isRoot && (
+                    <DropdownMenuItem onClick={() => handleDelete(path)}>
+                      <Trash className="mr-2 h-4 w-4" /> Delete
+                    </DropdownMenuItem>
+                  )}
+                  {node.addedBy && node.addedBy !== 'self' && !isRoot && (
+                    <>
+                      <DropdownMenuSeparator />
+                      <DropdownMenuItem disabled>
+                        Approve
+                      </DropdownMenuItem>
+                      <DropdownMenuItem disabled>
+                        Revoke
+                      </DropdownMenuItem>
+                    </>
+                  )}
                 </DropdownMenuContent>
               ) : (
                 <DropdownMenuContent className="w-56">
-                  <DropdownMenuSub>
-                    <DropdownMenuSubTrigger>
-                      <Plus className="mr-2 h-4 w-4" /> Request Add
-                    </DropdownMenuSubTrigger>
-                    <DropdownMenuPortal>
-                      <DropdownMenuSubContent>
-                        <DropdownMenuItem onClick={() => { setRequestType('add_folder'); setRequestDialogOpen(true) }}>
-                          <Folder className="mr-2 h-4 w-4" /> Folder
-                        </DropdownMenuItem>
-                        <DropdownMenuItem onClick={() => { setRequestType('add_text'); setRequestDialogOpen(true) }}>
-                          <FileText className="mr-2 h-4 w-4" /> Text File
-                        </DropdownMenuItem>
-                        <DropdownMenuItem onClick={() => { setRequestType('add_binary'); setRequestDialogOpen(true) }}>
-                          <Upload className="mr-2 h-4 w-4" /> File
-                        </DropdownMenuItem>
-                      </DropdownMenuSubContent>
-                    </DropdownMenuPortal>
-                  </DropdownMenuSub>
+                  {isFolder && (
+                    <>
+                      <DropdownMenuSub>
+                        <DropdownMenuSubTrigger>
+                          <Plus className="mr-2 h-4 w-4" /> Request Add
+                        </DropdownMenuSubTrigger>
+                        <DropdownMenuPortal>
+                          <DropdownMenuSubContent>
+                            <DropdownMenuItem onClick={() => { setRequestType('add_folder'); setRequestDialogOpen(true) }}>
+                              <Folder className="mr-2 h-4 w-4" /> Folder
+                            </DropdownMenuItem>
+                            <DropdownMenuItem onClick={() => { setRequestType('add_text'); setRequestDialogOpen(true) }}>
+                              <FileText className="mr-2 h-4 w-4" /> Text File
+                            </DropdownMenuItem>
+                            <DropdownMenuItem onClick={() => { setRequestType('add_binary'); setRequestDialogOpen(true) }}>
+                              <Upload className="mr-2 h-4 w-4" /> File
+                            </DropdownMenuItem>
+                          </DropdownMenuSubContent>
+                        </DropdownMenuPortal>
+                      </DropdownMenuSub>
+                    </>
+                  )}
                   {node.type === 'file' && (
                     <>
-                      <DropdownMenuSeparator />
+                      {!isFolder && <DropdownMenuSeparator />}
                       <DropdownMenuItem onClick={() => { setRequestType(node.mime?.startsWith('text/') ? 'edit_text' : 'edit_binary'); setRequestDialogOpen(true) }}>
                         <Edit className="mr-2 h-4 w-4" /> Request {node.mime?.startsWith('text/') ? 'Edit' : 'Replace'}
                       </DropdownMenuItem>
                     </>
                   )}
-                  <DropdownMenuSeparator />
-                  <DropdownMenuItem onClick={() => { setRequestType('delete'); setRequestDialogOpen(true) }}>
-                    <Trash className="mr-2 h-4 w-4" /> Request Delete
-                  </DropdownMenuItem>
+
+                  {!isRoot && (
+                    <>
+                      <DropdownMenuSeparator />
+                      <DropdownMenuItem onClick={() => { setRequestType('delete'); setRequestDialogOpen(true) }}>
+                        <Trash className="mr-2 h-4 w-4" /> Request Delete
+                      </DropdownMenuItem>
+                    </>
+                  )}
                 </DropdownMenuContent>
               )}
             </DropdownMenu>
@@ -829,7 +885,7 @@ console.log(`Patient-side shared hash for doctor ${doctorId}: ${sharedHash}`);
   if (!user) return <div>Loading...</div>
 
   const isPatient = user.type === 'patient'
-  const header = isPatient ? 'My Medical Record' : patientId ? `Patient Record: ${patientInfo?.name || ''} (DOB: ${patientInfo?.dob || ''})` : 'My Appointed Patients'
+  const header = isPatient ? `Medical Record ${patientInfo?.name || ''}` : patientId ? `Patient Record: ${patientInfo?.name || ''} (DOB: ${patientInfo?.dob || ''})` : 'My Appointed Patients'
   const selectedNode = record ? findNode(record, selectedPath) : null
   
 
@@ -903,14 +959,41 @@ console.log(`Patient-side shared hash for doctor ${doctorId}: ${sharedHash}`);
                       ) : selectedNode.mime?.startsWith('image/') ? (
                         <img src={`data:${selectedNode.mime};base64,${selectedNode.content}`} alt={selectedNode.name} className="max-w-full" />
                       ) : selectedNode.mime === 'application/pdf' ? (
-                        <Document
-                          file={`data:application/pdf;base64,${selectedNode.content}`}
-                          onLoadSuccess={({ numPages: np }) => setNumPages(np)}
-                        >
-                          {Array.from(new Array(numPages || 0), (_, index) => (
-                            <Page key={index} pageNumber={index + 1} />
-                          ))}
-                        </Document>
+                        <div className="flex flex-col items-center">
+{numPages && (
+                            <div className="flex items-center space-x-2 mt-2">
+                              <Button 
+                                variant="outline" 
+                                size="sm" 
+                                disabled={currentPage <= 1} 
+                                onClick={() => setCurrentPage(prev => prev - 1)}
+                              >
+                                Prev
+                              </Button>
+                              <span>{currentPage} / {numPages}</span>
+                              <Button 
+                                variant="outline" 
+                                size="sm" 
+                                disabled={currentPage >= numPages} 
+                                onClick={() => setCurrentPage(prev => prev + 1)}
+                              >
+                                Next
+                              </Button>
+                            </div>
+                          )}
+
+                          <Document
+                            file={`data:application/pdf;base64,${selectedNode.content}`}
+                            onLoadSuccess={({ numPages: np }) => {
+                              setNumPages(np)
+                              setCurrentPage(1)
+                            }}
+                          >
+                            <div className="mb-0 pb-0"> {/* Remove bottom margin */}
+                              <Page pageNumber={currentPage} renderTextLayer={false} renderAnnotationLayer={false} className="m-0 p-0" />
+                            </div>
+                          </Document>
+                                                  </div>
                       ) : (
                         <p>Unsupported file type</p>
                       )}
@@ -974,7 +1057,7 @@ console.log(`Patient-side shared hash for doctor ${doctorId}: ${sharedHash}`);
                       <TableCell>{doc.name}</TableCell>
                       <TableCell>{doc.org}</TableCell>
                       <TableCell>
-                        <Button variant="destructive" onClick={() => removeDoctor(doc.id)}>Remove</Button>
+                        <Button variant="destructive" onClick={() => removeDoctor(doc.id)}>Revoke</Button>
                       </TableCell>
                     </TableRow>
                   ))}
@@ -1114,3 +1197,4 @@ console.log(`Patient-side shared hash for doctor ${doctorId}: ${sharedHash}`);
     </div>
   )
 }
+
