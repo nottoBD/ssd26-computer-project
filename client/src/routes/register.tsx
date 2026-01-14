@@ -1,3 +1,45 @@
+/**
+ * FILE: register.tsx
+ *
+ * PURPOSE:
+ *      Implements secure account registration flow,
+ *      Includes WebAuthn credential creation, optional doctor PKI
+ *      enrollment, and client-side bootstrapping of end-to-end encryption
+ *      keys.
+ *
+ * USE:
+ *  - Collect user identity data (patient or doctor).
+ *  - Enforce reCAPTCHA verification to mitigate automated abuse.
+ *  - Start WebAuthn registration with the backend and trigger authenticator
+ *    credential creation on the client.
+ *  - For doctor accounts:
+ *      * Generate an RSA keypair and CSR bound to the user's email.
+ *      * Request CA signature and attach the resulting certificate.
+ *      * Securely wrap the RSA private key using a PRF-derived KEK when available.
+ *  - For all users:
+ *      * Generate an X25519 keypair for end-to-end encryption.
+ *      * Derive an Ed25519 signing key from the X25519 private key.
+ *      * Encrypt private material using a PRF-derived KEK, with QR/manual
+ *        fallback when PRF is unavailable.
+ *
+ *  NOTES:
+ *  - WebAuthn PRF extension is used to derive a device-bound KEK without
+ *    exposing secrets to the server.
+ *  - Private keys are encrypted client-side before transmission; the server
+ *    never receives plaintext private material.
+ *  - Fallback mechanisms (QR code, manual input) are provided for devices
+ *    that do not support PRF and must be handled carefully to avoid leakage.
+ *  - Sensitive key material is temporarily held in memory during registration
+ *    and must be cleared on error or completion.
+ *
+ * ASSUMPTIONS / CONSTRAINTS:
+ *  - Registration requires a secure context (HTTPS) and a compatible
+ *    WebAuthn-capable browser.
+ *  - Doctor registration assumes a trusted local CA reachable via the backend.
+ *  - In-memory key handling and window globals are acceptable for a prototype
+ *    but would require hardening in production.
+ */
+
 import { useState, useRef } from "react";
 import { createFileRoute, useNavigate } from "@tanstack/react-router";
 import { Button } from "@/components/ui/button";
@@ -51,6 +93,34 @@ function RegisterPage() {
   const [privInput, setPrivInput] = useState('');
   const [privInputResolve, setPrivInputResolve] = useState<((value: Uint8Array | null) => void) | null>(null);
   const [privInputError, setPrivInputError] = useState<string | null>(null);
+
+
+  /**
+   * FUNCTION: handleGenerateCertificate
+   *
+   * PURPOSE:
+   *      Generates a doctor certificate enrollment bundle on the client side:
+   *      - Creates an RSA keypair (extractable for controlled export).
+   *      - Builds a CSR where CN and SAN are bound to the doctor email.
+   *      - Requests the backend CA to sign the CSR.
+   *      - Prepares the resulting certificate as an uploadable file and stores
+   *        the private key temporarily for secure storage during WebAuthn registration.
+   *
+   * FLOW:
+   *  1) Validate mandatory form fields (first name, last name, email).
+   *  2) Generate RSA keypair (RSASSA-PKCS1-v1_5, 2048 bits).
+   *  3) Build CSR subject (CN=email) and add SAN (rfc822Name=email).
+   *  4) Sign CSR and encode to PEM.
+   *  5) POST CSR to /api/ca/sign/ and receive signed certificate.
+   *  6) Export RSA private key (PKCS#8 PEM) and keep it in memory temporarily
+   *     for secure storage (PRF/largeBlob-style strategy or fallback).
+   *  7) Create a certificate file object for later submission in registration payload.
+   *
+   * SIDE EFFECTS:
+   *  - Updates component state: certFile and privPem.
+   *  - Generates long-lived credentials; sensitive material must not remain in memory
+   *    longer than necessary (privPem cleared later in the registration flow).
+   */
 
   const handleGenerateCertificate = async () => {
     try {
@@ -161,6 +231,52 @@ function RegisterPage() {
       setLoading(false);
     }
   };
+
+    /**
+   * FUNCTION: handleSubmit
+   *
+   * PURPOSE:
+   *       full account registration:
+   *      - Validates inputs + reCAPTCHA.
+   *      - Starts WebAuthn registration with the backend.
+   *      - Bootstraps end-to-end encryption keys (X25519 + Ed25519).
+   *      - Optionally handles doctor PKI enrollment (certificate + encrypted RSA private key).
+   *      - Uses PRF (if available) to derive a KEK and wrap private material.
+   *      - Falls back to QR/manual import when PRF is not supported.
+   *
+   * FLOW:
+   *  1) Prevent default form submit; abort if already loading.
+   *  2) Execute reCAPTCHA v3 and include token in registration payload.
+   *  3) Build payload:
+   *      - common fields: email, names, device name, user type
+   *      - patient fields: date of birth
+   *      - doctor fields: organization + certificate (PEM)
+   *  4) Abort if a session is already authenticated (registration requires logout).
+   *  5) POST payload to /api/webauthn/register/start/ to obtain WebAuthn options.
+   *  6) If doctor:
+   *      - prefer platform authenticator when available
+   *      - enforce discoverable credential policy (residentKey required)
+   *      - attach PRF salts (two-domain separation salts) to options.extensions.prf.eval
+   *  7) Generate X25519 keypair for E2EE and attach public key to credential finish payload.
+   *  8) Trigger WebAuthn credential creation via startRegistration(optionsJSON).
+   *  9) If doctor:
+   *      - attempt PRF KEK derivation from clientExtensionResults.prf.results
+   *      - encrypt RSA private key (privPem) with KEK and attach to finish payload
+   *      - fallback: show QR code for manual password manager storage
+   * 10) For all users:
+   *      - attempt PRF KEK derivation and encrypt X25519 private key
+   *      - fallback: show QR code + prompt manual import for the current session
+   * 11) POST credential + encrypted key material to /api/webauthn/register/finish/
+   * 12) Refresh auth state, verify that the encryption public key is saved server-side,
+   *     and retry /api/user/keys/update/ if needed.
+   * 13) Navigate to "/" on success.
+   *
+   * SIDE EFFECTS:
+   *  - Creates a new WebAuthn credential on the authenticator.
+   *  - Generates and stores E2EE keys; sensitive material is temporarily held in memory
+   *    (window globals + component state) and should be cleared on error or after use.
+   *  - Displays QR codes / dialogs for manual key transfer when PRF is unavailable.
+   */
 
   const handleSubmit = async (e: React.FormEvent<HTMLFormElement>) => {
     e.preventDefault();
