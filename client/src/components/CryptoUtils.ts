@@ -1,3 +1,34 @@
+/**
+ * FILE: CryptoUtils.ts
+ *
+ * PURPOSE:
+ *      Centralizes all client-side cryptographic primitives used by the
+ *      frontend. The module implements key derivation,
+ *      asymmetric key generation, symmetric encryption, and digital
+ *      signatures required for end-to-end encrypted medical data and
+ *      authenticated actions.
+ *
+ * UTILITIES:
+ *  - Derive symmetric Key Encryption Keys (KEKs) from WebAuthn PRF output.
+ *  - Generate X25519 key pairs for end-to-end encryption (E2EE).
+ *  - Derive Ed25519 signing keys from X25519 private keys.
+ *  - Encrypt and decrypt sensitive material using AES-GCM.
+ *  - Perform ECDH shared secret derivation.
+ *  - Sign and verify data using Ed25519.
+ *  - Provide encoding helpers for hex and base64 conversions.
+ *
+ * SECURITY NOTES:
+ *  - All cryptographic operations are performed client-side.
+ *  - The server never receives plaintext private keys or derived secrets.
+ *  - AES-GCM is used with random IVs to ensure confidentiality and integrity.
+ *  - Key derivation uses HKDF-SHA256 with explicit context separation.
+ *
+ * LIMITATIONS:
+ *  - Keys are handled as raw Uint8Array values in memory; memory zeroization
+ *    is the responsibility of the calling code.
+ *  - This module assumes correct randomness from the underlying platform.
+ */
+
 import { ed25519, x25519 } from "@noble/curves/ed25519.js";
 import { GCM } from "@stablelib/gcm";
 import { randomBytes } from "@stablelib/random";
@@ -5,7 +36,23 @@ import { hkdf } from "@noble/hashes/hkdf.js";
 import { sha256, sha512 } from "@noble/hashes/sha2.js";
 import { AES } from "@stablelib/aes";
 
-// Manual clamping for Ed25519 private key (per spec: clear low 3 bits, clear bit 255, set bit 254)
+/**
+ * FUNCTION: clampEd25519PrivateKey
+ *
+ * PURPOSE:
+ *      Applies Ed25519 private key clamping as defined in RFC 8032.
+ *  Manual clamping for Ed25519 private key (per spec: clear low 3 bits, clear bit 255, set bit 254)
+ *
+ * DETAILS:
+ *  - Clears the lowest 3 bits.
+ *  - Clears the highest bit.
+ *  - Sets the second highest bit.
+ *
+ * WHY:
+ *      Clamping ensures the private scalar lies in the correct subgroup
+ *      and prevents small-subgroup and related-key attacks.
+ */
+
 function clampEd25519PrivateKey(bytes: Uint8Array): Uint8Array {
   const clamped = new Uint8Array(bytes);
   clamped[0] &= 248; // Clear lowest 3 bits
@@ -13,6 +60,21 @@ function clampEd25519PrivateKey(bytes: Uint8Array): Uint8Array {
   clamped[31] |= 64; // Set bit 254
   return clamped;
 }
+
+
+/**
+ * FUNCTION: deriveKEK
+ *
+ * PURPOSE:
+ *      Derives a symmetric Key Encryption Key (KEK) from WebAuthn PRF output.
+ *
+ * CRYPTO:
+ *  - HKDF with SHA-256
+ *  - Output length: 32 bytes (AES-256 compatible)
+ *
+ * CONTEXT:
+ *      Used to encrypt private keys before storage or transmission.
+ */
 
 export async function deriveKEK(prfBytes: Uint8Array): Promise<Uint8Array> {
   return hkdf(
@@ -24,6 +86,18 @@ export async function deriveKEK(prfBytes: Uint8Array): Promise<Uint8Array> {
   );
 }
 
+
+/**
+ * FUNCTION: generateX25519Keypair
+ *
+ * PURPOSE:
+ *      Generates an X25519 key pair for end-to-end encryption.
+ *
+ * USAGE:
+ *  - Public key is stored on the server.
+ *  - Private key remains client-side and is encrypted using a KEK.
+ */
+
 export function generateX25519Keypair(): {
   publicKey: Uint8Array;
   privateKey: Uint8Array;
@@ -32,6 +106,22 @@ export function generateX25519Keypair(): {
   const pub = x25519.getPublicKey(priv);
   return { publicKey: pub, privateKey: priv };
 }
+
+/**
+ * FUNCTION: deriveEd25519FromX25519
+ *
+ * PURPOSE:
+ *      Deterministically derives an Ed25519 signing key pair from an
+ *      X25519 private key.
+ *
+ * METHOD:
+ *  - Hash X25519 private key using SHA-512.
+ *  - Clamp derived scalar per Ed25519 specification.
+ *
+ * BENEFIT:
+ *      Avoids managing multiple unrelated private keys while maintaining
+ *      cryptographic separation between encryption and signing.
+ */
 
 export function deriveEd25519FromX25519(priv: Uint8Array): {
   publicKey: Uint8Array;
@@ -43,6 +133,22 @@ export function deriveEd25519FromX25519(priv: Uint8Array): {
   const publicKey = ed25519.getPublicKey(scalar);
   return { privateKey: scalar, publicKey };
 }
+
+/**
+ * FUNCTION: encryptAES
+ *
+ * PURPOSE:
+ *      Encrypts sensitive data using AES-GCM.
+ *
+ * SECURITY:
+ *  - Random 96-bit IV generated per encryption.
+ *  - Authentication tag ensures integrity and authenticity.
+ *
+ * RETURNS:
+ *  - Ciphertext
+ *  - IV
+ *  - Authentication tag
+ */
 
 export function encryptAES(
   data: Uint8Array,
@@ -56,6 +162,16 @@ export function encryptAES(
   const tag = sealed.slice(-16);
   return { ciphertext, iv, tag };
 }
+
+/**
+ * FUNCTION: decryptAES
+ *
+ * PURPOSE:
+ *      Decrypts AES-GCM encrypted data and verifies integrity.
+ *
+ * FAILURE MODE:
+ *  - Throws an error if authentication tag verification fails.
+ */
 
 export function decryptAES(
   ciphertext: Uint8Array,
@@ -73,6 +189,16 @@ export function decryptAES(
   return decrypted;
 }
 
+/**
+ * FUNCTION: ecdhSharedSecret
+ *
+ * PURPOSE:
+ *      Computes a shared secret using X25519 Diffie–Hellman.
+ *
+ * USAGE:
+ *      Used to derive symmetric keys for secure communication between users.
+ */
+
 export function ecdhSharedSecret(
   myPriv: Uint8Array,
   theirPub: Uint8Array,
@@ -80,9 +206,30 @@ export function ecdhSharedSecret(
   return x25519.getSharedSecret(myPriv, theirPub);
 }
 
+
+/**
+ * FUNCTION: signEd25519
+ *
+ * PURPOSE:
+ *      Signs data using Ed25519.
+ *
+ * CONTEXT:
+ *      Used for authenticating requests and verifying data integrity
+ *      in end-to-end encrypted workflows.
+ */
+
 export function signEd25519(data: Uint8Array, priv: Uint8Array): Uint8Array {
   return ed25519.sign(data, priv);
 }
+
+
+
+/**
+ * FUNCTION: verifyEd25519
+ *
+ * PURPOSE:
+ *      Verifies an Ed25519 signature against the given data and public key.
+ */
 
 export function verifyEd25519(
   sig: Uint8Array,
@@ -91,6 +238,18 @@ export function verifyEd25519(
 ): boolean {
   return ed25519.verify(sig, data, pub);
 }
+
+
+/**
+ * FUNCTION GROUP: Encoding Helpers
+ *
+ * PURPOSE:
+ *      Convert between binary formats and textual representations
+ *      (hex and base64) for safe transport and storage.
+ *
+ * NOTE:
+ *      These helpers do not perform validation beyond basic parsing.
+ */
 
 export { randomBytes } from "@stablelib/random";
 
@@ -123,6 +282,18 @@ export function bytesToBase64(bytes: Uint8Array): string {
   );
   return btoa(binString);
 }
+
+
+/**
+ * FUNCTION: getX25519PublicFromPrivate
+ *
+ * PURPOSE:
+ *      Computes the X25519 public key corresponding to a given private key.
+ *
+ * USAGE:
+ *      Used to verify that decrypted or imported private keys match
+ *      the public key stored on the server.
+ */
 
 export function getX25519PublicFromPrivate(priv: Uint8Array): Uint8Array {
   return x25519.getPublicKey(priv);
