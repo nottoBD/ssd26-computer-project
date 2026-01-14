@@ -1,5 +1,30 @@
-"use client";
+/**
+ * FILE: settings.tsx
+ *
+ * PURPOSE:
+ *      Implements the Security Settings page 
+ *      This page allows authenticated users (PRIMARY device only) to:
+ *        - View registered WebAuthn credentials (devices)
+ *        - Generate approval codes to add secondary devices
+ *        - Revoke (delete) secondary devices
+ *        - Inspect recent authentication activity for anomaly detection
+ *
+ * SECURITY MODEL:
+ *  - All sensitive operations (listing credentials, activity logs, add/delete approvals)
+ *    require authentication AND confirmation using the PRIMARY WebAuthn credential.
+ *  - Secondary devices cannot approve destructive or enrollment operations.
+ *
+ * DESIGN RATIONALE:
+ *  - Primary device confirmation prevents malicious secondary-device takeover.
+ *  - Activity logs provide transparency and post-incident investigation capability.
+ *  - Client-side anomaly checks are informational only; server remains authoritative.
+ *
+ * TRUST BOUNDARY:
+ *  - This UI is informational and approval-triggering only.
+ *  - The backend enforces all authorization, role checks, and cryptographic validation.
+ */
 
+"use client";
 import { useState, useEffect } from "react";
 import { createFileRoute } from "@tanstack/react-router";
 import { Button } from "@/components/ui/button";
@@ -36,6 +61,28 @@ function SettingsPage() {
   useEffect(() => {
     fetchData();
   }, []);
+
+
+/**
+ * FUNCTION: fetchData
+ *
+ * PURPOSE:
+ *      Fetches security-sensitive account data for the settings page.
+ *
+ * FLOW:
+ *  1) Fetch registered WebAuthn credentials (PRIMARY device required).
+ *  2) Fetch recent authentication activity logs (PRIMARY device required).
+ *  3) Optionally compare server logs with locally stored last_login_time
+ *     to highlight suspicious failed attempts.
+ *
+ * FAILURE MODE:
+ *  - 401 → session expired → refreshAuth()
+ *  - 403 → non-primary device attempting restricted operation
+ *
+ * SECURITY NOTES:
+ *  - This function does NOT perform authorization itself.
+ *  - Server endpoints enforce primary-device restrictions.
+ */
 
   const fetchData = async () => {
     setLoading(true);
@@ -91,6 +138,29 @@ function SettingsPage() {
       setLoading(false);
     }
   };
+
+
+/**
+ * FUNCTION: handleGenerateAddCode
+ *
+ * PURPOSE:
+ *      Generates a short-lived add-code that allows enrollment of a
+ *      secondary WebAuthn device.
+ *
+ * FLOW:
+ *  1) Request approval challenge from backend (PRIMARY device only).
+ *  2) Convert PRF salts from base64url to ArrayBuffer (WebAuthn requirement).
+ *  3) Prompt user to authenticate using PRIMARY WebAuthn credential.
+ *  4) Send assertion to backend for verification.
+ *  5) Receive a time-limited add_code usable on the secondary device.
+ *
+ * SECURITY PROPERTIES:
+ *  - Prevents unauthorized device enrollment.
+ *  - Protects against cloned authenticators via server-side checks.
+ *
+ * FAILURE MODE:
+ *  - Clone detection or verification failure aborts code generation.
+ */
 
   const handleGenerateAddCode = async () => {
     if (
@@ -160,6 +230,26 @@ function SettingsPage() {
     }
   };
 
+
+/**
+ * FUNCTION: handleRemove
+ *
+ * PURPOSE:
+ *      Revokes (deletes) a registered secondary WebAuthn credential.
+ *
+ * FLOW:
+ *  1) Request delete-approval challenge from backend (PRIMARY only).
+ *  2) Normalize PRF inputs for browser compatibility.
+ *  3) Prompt PRIMARY authenticator for confirmation.
+ *  4) Send assertion to backend; backend performs deletion.
+ *  5) Refresh local credential list on success.
+ *
+ * SECURITY NOTES:
+ *  - Primary credentials cannot delete themselves.
+ *  - Secondary devices cannot delete any credentials.
+ *  - Actual deletion occurs server-side only after cryptographic verification.
+ */
+
   const handleRemove = async (credId: string) => {
   if (!confirm("Remove this device? You will be prompted to confirm with your primary passkey.")) return;
 
@@ -216,6 +306,22 @@ function SettingsPage() {
 
 
   // Optional test flow: approve + add in one UI (if your backend supports /add/start + /add/finish)
+  /**
+ * FUNCTION: handleAddSecondary
+ *
+ * PURPOSE:
+ *      Optional test helper that performs approval and secondary-device
+ *      registration in a single UI flow (if supported by backend).
+ *
+ * FLOW:
+ *  1) PRIMARY device approves secondary enrollment.
+ *  2) Backend returns registration options.
+ *  3) New device completes WebAuthn registration.
+ *
+ * NOTES:
+ *  - Not used in normal UX (add-code flow preferred).
+ *  - Useful for development and demonstration purposes.
+ */
   const handleAddSecondary = async (deviceName: string = "New Device") => {
     setError(null);
 
