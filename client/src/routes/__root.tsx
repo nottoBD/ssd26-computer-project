@@ -1,3 +1,32 @@
+/**
+ * FILE: __root.tsx
+ *
+ * PURPOSE:
+ *      Defines the root route and application shell for the client.
+ *      The file centralizes session discovery, exposes authentication state via
+ *      a React context, and implements global navigation (including logout).
+ *
+ * RESPONSIBILITIES:
+ *  - Provide an AuthContext with:
+ *      * isAuthenticated: client view of session state
+ *      * refreshAuth(): re-fetch session state from backend
+ *  - Query backend session status using HttpOnly cookies (sessionid) and determine
+ *    whether a user is currently authenticated.
+ *  - Fetch the current user's profile to infer role (patient/doctor) for UI rendering.
+ *  - Perform logout request and local cookie cleanup, then reset local auth state.
+ *
+ *  NOTES:
+ *  - Authentication state is derived from backend session cookies (credentials: include).
+ *    The client is not a source of truth for authorization; server-side checks remain mandatory.
+ *  - Logout uses CSRF protection (csrftoken) for POST requests.
+ *  - Cookie deletion performed in JS is best-effort; actual session invalidation must occur
+ *    server-side via /api/webauthn/logout/.
+ *
+ * LIMITATIONS:
+ *  - Role-based navigation styling is cosmetic; it must not be relied upon for access control.
+ *  - Error handling intentionally fails closed (sets isAuthenticated=false on exceptions).
+ */
+
 import { createRootRoute, Link, Outlet, useNavigate } from '@tanstack/react-router'
 import { Button } from '@/components/ui/button'
 import { Shield, User, Stethoscope, Settings as SettingsIcon, LogOut as LogOutIcon } from 'lucide-react'
@@ -9,6 +38,17 @@ interface AuthContextType {
 }
 
 const AuthContext = createContext<AuthContextType | null>(null)
+
+/**
+ * FUNCTION: useAuth
+ *
+ * PURPOSE:
+ *      Typed helper hook to access AuthContext safely throughout the client.
+ *
+ * BEHAVIOR:
+ *  - Throws a hard error if used outside of AuthContext.Provider to prevent
+ *    silent null usage and inconsistent authentication logic.
+ */
 
 export const useAuth = () => {
   const context = useContext(AuthContext)
@@ -29,10 +69,44 @@ export const Route = createRootRoute({
       checkAuth()
     }, [])
 
+
+    /**
+ * FUNCTION: getCsrfToken
+ *
+ * PURPOSE:
+ *      Extracts the Django CSRF token from document cookies for state-changing
+ *      requests (e.g., logout).
+ *
+ * SECURITY:
+ *      Used to satisfy Django's CSRF middleware when issuing POST requests with
+ *      session cookies included.
+ */
+
     const getCsrfToken = () => {
       const match = document.cookie.match(new RegExp('(^| )csrftoken=([^;]+)'))
       return match ? match[2] : ''
     }
+
+
+
+
+/**
+ * FUNCTION: checkAuth
+ *
+ * PURPOSE:
+ *      Refreshes client-side session state by querying the backend.
+ *
+ * FLOW:
+ *  1) GET /api/webauthn/auth/status/ with credentials included.
+ *  2) If authenticated, GET /api/user/me/ to obtain user role (patient/doctor).
+ *  3) Update local state: isAuthenticated, userType.
+ *
+ * FAILURE MODE:
+ *  - On any network or parsing error, fail closed by setting isAuthenticated=false.
+ *
+ * SIDE EFFECTS:
+ *  - Updates local UI gating (settings button visibility, role highlighting).
+ */
 
     const checkAuth = async () => {
       try {
@@ -63,6 +137,27 @@ export const Route = createRootRoute({
       }
     }
 
+
+  
+/**
+ * FUNCTION: handleLogout
+ *
+ * PURPOSE:
+ *      Logs the user out of the backend session and clears client-visible state.
+ *
+ * FLOW:
+ *  1) Read CSRF token from cookies.
+ *  2) POST /api/webauthn/logout/ with credentials included.
+ *  3) Regardless of backend response:
+ *      - Clear session cookies locally (best-effort).
+ *      - Reset isAuthenticated/userType.
+ *      - Redirect to "/" to return to a safe default route.
+ *
+ * SECURITY NOTES:
+ *  - Actual session invalidation must be performed server-side; JS cookie deletion
+ *    is only a local cleanup step.
+ */
+
     const handleLogout = async () => {
       try {
         const csrfToken = getCsrfToken()
@@ -82,6 +177,17 @@ export const Route = createRootRoute({
       }
     }
 
+/**
+ * FUNCTION: handleAuthAction
+ *
+ * PURPOSE:
+ *      Provides a single UI handler that toggles between login and logout
+ *      based on the current authentication state.
+ *
+ * BEHAVIOR:
+ *  - If authenticated: triggers logout sequence.
+ *  - If unauthenticated: redirects to /login.
+ */
     const handleAuthAction = () => {
       if (isAuthenticated) {
         handleLogout()
