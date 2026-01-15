@@ -36,7 +36,7 @@ services:
   server:
     build: ./server
     container_name: server
-    command: sh -c "mkdir -p /tls && step ca certificate server.healthsecure.local /tls/server.crt /tls/server.key --provisioner healthsecure-provisioner --provisioner-password-file /ca/secrets/password --ca-url https://step-ca:9000 --root /ca/certs/root_ca.crt --san server --san server.healthsecure.local --san localhost --san 127.0.0.1 --san ::1 --not-after 8760h && cat /tls/server.crt /ca/certs/intermediate_ca.crt > /tls/fullchain.crt && uv run python manage.py migrate && uv run gunicorn --bind 0.0.0.0:8000 --certfile /tls/fullchain.crt --keyfile /tls/server.key --timeout 90 wsgi:application"
+    command: sh -c "mkdir -p /app/logs && touch /app/logs/app.log && mkdir -p /tls && step ca certificate server.healthsecure.local /tls/server.crt /tls/server.key --provisioner healthsecure-provisioner --provisioner-password-file /ca/secrets/password --ca-url https://step-ca:9000 --root /ca/certs/root_ca.crt --san server --san server.healthsecure.local --san localhost --san 127.0.0.1 --san ::1 --not-after 8760h && cat /tls/server.crt /ca/certs/intermediate_ca.crt > /tls/fullchain.crt && uv run python manage.py migrate && uv run gunicorn --bind 0.0.0.0:8000 --certfile /tls/fullchain.crt --keyfile /tls/server.key --timeout 90 wsgi:application"
     volumes:
       - ./server:/app
       - stepca-data:/ca:ro

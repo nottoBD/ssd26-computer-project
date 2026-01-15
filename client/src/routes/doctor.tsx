@@ -219,6 +219,8 @@ function UserPortal() {
   const [loading, setLoading] = useState(true);
   const [inputPrivOpen, setInputPrivOpen] = useState(false);
   const [inputPriv, setInputPriv] = useState("");
+  const [inputCertPrivOpen, setInputCertPrivOpen] = useState(false);
+  const [inputCertPriv, setInputCertPriv] = useState("");
 
 
 
@@ -375,6 +377,34 @@ function UserPortal() {
   };
 
 /**
+ * FUNCTION: handleCertPrivInput
+ *
+ * PURPOSE:
+ *      Imports the user-provided certificate private key (base64) into memory for signing operations.
+ *
+ * FLOW:
+ *  1) Decode base64 → Uint8Array and set window.__MY_CERT_PRIV__.
+ *  2) Persist base64 string in sessionStorage for this browser session.
+ *
+ * SECURITY NOTES:
+ *  - Storing secrets in sessionStorage is a trade-off (usability vs. exposure).
+ *  - Assuming the cert privkey is in a format that can be imported for signing (e.g., RSA).
+ *  - You may need to adjust the import based on the key type (RSA/ECDSA).
+ */
+
+  const handleCertPrivInput = async () => {
+    try {
+      const newCertPriv = base64ToBytes(inputCertPriv);
+      window.__MY_CERT_PRIV__ = newCertPriv;
+      sessionStorage.setItem("cert_priv_b64", inputCertPriv);
+      setInputCertPrivOpen(false);
+      setInputCertPriv("");
+    } catch (err) {
+      setError("Invalid certificate private key");
+    }
+  };
+
+/**
  * FUNCTION: fetchAppointedPatients
  *
  * PURPOSE:
@@ -505,51 +535,75 @@ function UserPortal() {
  *  - Timestamp should be checked server-side to reduce replay window.
  */
 
-  const requestAppointment = async (patientId: string) => {
-    if (!window.__MY_PRIV__) {
-      setInputPrivOpen(true);
-      return;
-    }
-    if (!certChain) {
-      setError("PKI chain missing");
-      return;
-    }
+const requestAppointment = async (patientId: string) => {
+  if (!window.__MY_PRIV__) {
+    setInputPrivOpen(true);
+    return;
+  }
+  if (!window.__MY_CERT_PRIV__) {
+    setInputCertPrivOpen(true);
+    return;
+  }
+  if (!certChain) {
+    setError("PKI chain missing");
+    return;
+  }
 
-    try {
-      const edPriv = deriveEd25519FromX25519(window.__MY_PRIV__).privateKey;
-      const requestMsg = new TextEncoder().encode(
-        JSON.stringify({
-          type: "appointment_request",
-          patient_id: patientId,
-          timestamp: new Date().toISOString(),
-        }),
-      );
-      const signature = bytesToBase64(signEd25519(requestMsg, edPriv));
-
-      const body = {
-        signature,
-        cert_chain: certChain,
+  try {
+    const timestamp = new Date().toISOString();
+    const requestMsg = new TextEncoder().encode(
+      JSON.stringify({
+        type: "appointment_request",
         patient_id: patientId,
-      };
+        timestamp: timestamp,
+      }),
+    );
 
-      const res = await fetch("/api/appoint/request/", {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          "X-CSRFToken": getCookie("csrftoken") || "",
-        },
-        credentials: "include",
-        body: JSON.stringify(body),
-      });
-      if (!res.ok) throw new Error(await res.text());
-      alert("Appointment request sent. Awaiting patient approval.");
-      fetchPendingRequests();
-      setAddPatientDialogOpen(false);
-    } catch (err) {
-      console.error("Appointment request failed:", err);
-      setError(err.message);
-    }
-  };
+    // Import RSA private key (matches generation in register.tsx)
+    const certPrivKey = await crypto.subtle.importKey(
+      "pkcs8",
+      window.__MY_CERT_PRIV__,
+      {
+        name: "RSASSA-PKCS1-v1_5",
+        hash: "SHA-256",
+      },
+      false,
+      ["sign"],
+    );
+
+    // Sign using RSASSA-PKCS1-v1_5 (standard for your key)
+    const signature = await crypto.subtle.sign(
+      "RSASSA-PKCS1-v1_5",  // No extra params needed for PKCS#1 v1.5
+      certPrivKey,
+      requestMsg,
+    );
+    const signatureB64 = bytesToBase64(new Uint8Array(signature));
+
+    const body = {
+      signature: signatureB64,
+      cert: certChain.doctor,  // Leaf cert PEM (backend can trust via its CA config)
+      patient_id: patientId,
+      timestamp: timestamp,
+    };
+
+    const res = await fetch("/api/appoint/request/", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "X-CSRFToken": getCookie("csrftoken") || "",
+      },
+      credentials: "include",
+      body: JSON.stringify(body),
+    });
+    if (!res.ok) throw new Error(await res.text());
+    alert("Appointment request sent. Awaiting patient approval.");
+    fetchPendingRequests();
+    setAddPatientDialogOpen(false);
+  } catch (err) {
+    console.error("Appointment request failed:", err);
+    setError((err as Error).message || "Failed to send appointment request");
+  }
+};
 
   /**
  * FUNCTION: requestFileChange
@@ -585,6 +639,10 @@ function UserPortal() {
     }
     if (!window.__MY_PRIV__) {
       setInputPrivOpen(true);
+      return;
+    }
+    if (!window.__MY_CERT_PRIV__) {
+      setInputCertPrivOpen(true);
       return;
     }
     if (!certChain) {
@@ -637,7 +695,6 @@ function UserPortal() {
         }
       }
 
-      const edPriv = deriveEd25519FromX25519(window.__MY_PRIV__).privateKey;
       const requestMsg = new TextEncoder().encode(
         JSON.stringify({
           type: requestType,
@@ -646,17 +703,39 @@ function UserPortal() {
           timestamp: new Date().toISOString(),
         }),
       );
-      const signature = bytesToBase64(signEd25519(requestMsg, edPriv));
+
+      const certPrivKey = await crypto.subtle.importKey(
+        "pkcs8",
+        window.__MY_CERT_PRIV__,
+        {
+          name: "RSA-PSS",
+          hash: "SHA-256",
+        },
+        false,
+        ["sign"],
+      );
+
+      // Sign with cert privkey
+      const signature = await crypto.subtle.sign(
+        {
+          name: "RSA-PSS",
+          saltLength: 32,
+        },
+        certPrivKey,
+        requestMsg,
+      );
+      const signatureB64 = bytesToBase64(new Uint8Array(signature));
 
       const body = {
-        signature,
-        cert_chain: certChain,
+        signature: signatureB64,
+        cert: certChain.doctor,
         type: requestType,
         patient: selectedPatientId,
+        timestamp: timestamp,
         details,
       };
 
-      const res = await fetch("/api/pending/", {
+      const res = await fetch("/api/pending/create/", {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
@@ -704,7 +783,6 @@ function UserPortal() {
 
   
   
-  // New: Patient functions
 /**
  * FUNCTION: fetchPendingAppointments
  *
@@ -1135,6 +1213,28 @@ function UserPortal() {
           />
           <DialogFooter>
             <Button onClick={handlePrivInput}>Submit</Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      {/* Input Cert Priv Dialog */}
+      <Dialog open={inputCertPrivOpen} onOpenChange={setInputCertPrivOpen}>
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>Enter Certificate Private Key</DialogTitle>
+            <DialogDescription>
+              Paste the base64-encoded certificate private key (e.g., PKCS8 format) from your password
+              manager. This is required for signing file change requests.
+            </DialogDescription>
+          </DialogHeader>
+          <Input
+            type="password"
+            value={inputCertPriv}
+            onChange={(e) => setInputCertPriv(e.target.value)}
+            placeholder="Base64 certificate private key..."
+          />
+          <DialogFooter>
+            <Button onClick={handleCertPrivInput}>Submit</Button>
           </DialogFooter>
         </DialogContent>
       </Dialog>

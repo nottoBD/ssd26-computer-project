@@ -197,7 +197,6 @@ class StartRegistration(View):
 
         return JsonResponse(to_serializable(pk_options))
 
-
 @method_decorator(csrf_exempt, name="dispatch")
 class FinishRegistration(View):
     def post(self, request):
@@ -247,7 +246,7 @@ class FinishRegistration(View):
                     logger.error(f"Invalid public key during registration for {user.email}")
                     return JsonResponse({'error': 'Invalid public key'}, status=400)
 
-            # New: Handle signing_public_key
+            # Handle signing_public_key
             if 'signing_public_key' in response:
                 try:
                     signing_pub_bytes = bytes.fromhex(response['signing_public_key'])
@@ -259,6 +258,13 @@ class FinishRegistration(View):
                     logger.error(f"Invalid signing public key during registration for {user.email}: {str(e)}")
                     return JsonResponse({'error': 'Invalid signing public key'}, status=400)
 
+            # Save doctor's certificate if provided
+            if user.type == User.Type.DOCTOR:
+                certificate = response.get('certificate')
+                if certificate:
+                    user.certificate_pem = certificate
+                    logger.info(f"Certificate PEM saved for doctor {user.email}")
+
             user.save()
             login(request, user)
             # Mark which credential was used for this session
@@ -269,7 +275,7 @@ class FinishRegistration(View):
             del request.session["reg_user_id"]
             del request.session["reg_device_name"]
 
-            # New: Handle encrypted private key if provided (from frontend)
+            # Handle encrypted private key if provided (from frontend)
             encrypted_priv = response.get('encrypted_priv')  # Parse from JSON body
             iv_b64 = response.get('iv_b64')
             if user.type == User.Type.DOCTOR and encrypted_priv and iv_b64:

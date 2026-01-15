@@ -37,7 +37,6 @@ class User(AbstractBaseUser, PermissionsMixin):
     # Doctor-only
     medical_organization = models.CharField(max_length=255, blank=True)
     certificate = models.TextField(blank=True, null=True)  # Store PEM cert for doctors
-
     is_active = models.BooleanField(default=True)
     is_staff = models.BooleanField(default=False)  # for admin access
     date_joined = models.DateTimeField(default=timezone.now)

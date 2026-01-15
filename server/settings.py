@@ -13,6 +13,10 @@ ALLOWED_HOSTS = os.getenv("ALLOWED_HOSTS", "localhost,127.0.0.1,healthsecure.loc
 
 AUTH_USER_MODEL = "accounts.User"
 
+STEP_ROOT = os.getenv("STEP_ROOT", "/ca/certs/root_ca.crt")
+
+STEP_INTERMEDIATE = os.getenv("STEP_INTERMEDIATE", "/ca/certs/intermediate_ca.crt")
+
 # webauthn = our own custom implementation (PRF support, sign-count, anomaly detection, multi-device mngmt)
 
 INSTALLED_APPS = [
@@ -105,17 +109,31 @@ STATIC_URL = "static/"
 
 LOGGING = {
     'version': 1,
-    'loggers': {
-        'metadata': {
-            'handlers': ['file'],
+    'disable_existing_loggers': False,
+    'handlers': {
+        'console': {
+            'class': 'logging.StreamHandler',
+            'level': 'DEBUG',
+        },
+        'file': {
+            'class': 'logging.FileHandler',
+            'filename': '/app/logs/app.log',
             'level': 'INFO',
         },
     },
-    'handlers': {
-        'file': {
+    'loggers': {
+        'django': {
+            'handlers': ['console', 'file'],
             'level': 'INFO',
-            'class': 'logging.FileHandler',
-            'filename': 'metadata.log',
+        },
+        'metadata': {
+            'handlers': ['console', 'file'],
+            'level': 'INFO',
+            'propagate': False,
+        },
+        '__name__': { 
+            'handlers': ['console', 'file'],
+            'level': 'DEBUG',
         },
     },
 }

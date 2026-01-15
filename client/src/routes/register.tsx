@@ -40,7 +40,7 @@
  *    but would require hardening in production.
  */
 
-import { useState, useRef } from "react";
+import { useState, useRef, useEffect } from "react";
 import { createFileRoute, useNavigate } from "@tanstack/react-router";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -63,8 +63,7 @@ import * as pkijs from "pkijs";
 import * as asn1js from "asn1js";
 import QRCode from 'qrcode';
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogDescription } from "@/components/ui/dialog";
-import { encryptAES, bytesToHex, hexToBytes, generateX25519Keypair, deriveEd25519FromX25519, base64ToBytes } from '../components/CryptoUtils'  // Import encryptAES for X25519 priv encryption
-
+import { encryptAES, bytesToHex, hexToBytes, generateX25519Keypair, deriveEd25519FromX25519, base64ToBytes, base64ToArrayBuffer } from '../components/CryptoUtils'
 
 export const Route = createFileRoute("/register")({
   component: () => (
@@ -83,7 +82,6 @@ function RegisterPage() {
   const [error, setError] = useState<string | null>(null);
   const [webauthnStarted, setWebauthnStarted] = useState(false);
   const [certFile, setCertFile] = useState<File | null>(null);
-  const [privPem, setPrivPem] = useState<string | null>(null); // Store RSA priv key temporarily for largeBlob or fallback
   const formRef = useRef<HTMLFormElement>(null);
   const [xQrModalOpen, setXQrModalOpen] = useState(false);
   const [qrModalOpen, setQrModalOpen] = useState(false);
@@ -93,7 +91,9 @@ function RegisterPage() {
   const [privInput, setPrivInput] = useState('');
   const [privInputResolve, setPrivInputResolve] = useState<((value: Uint8Array | null) => void) | null>(null);
   const [privInputError, setPrivInputError] = useState<string | null>(null);
-
+  const [doctorCert, setDoctorCert] = useState<string | null>(null); // Store full certificate PEM
+  const [doctorCertPubkey, setDoctorCertPubkey] = useState<string | null>(null); // Store extracted public key
+  const [doctorRsaPrivB64, setDoctorRsaPrivB64] = useState<string | null>(null); // Base64 PKCS#8 DER for RSA priv
 
   /**
    * FUNCTION: handleGenerateCertificate
@@ -112,127 +112,185 @@ function RegisterPage() {
    *  3) Build CSR subject (CN=email) and add SAN (rfc822Name=email).
    *  4) Sign CSR and encode to PEM.
    *  5) POST CSR to /api/ca/sign/ and receive signed certificate.
-   *  6) Export RSA private key (PKCS#8 PEM) and keep it in memory temporarily
+   *  6) Export RSA private key (PKCS#8 DER base64) and keep it in memory temporarily
    *     for secure storage (PRF/largeBlob-style strategy or fallback).
    *  7) Create a certificate file object for later submission in registration payload.
    *
    * SIDE EFFECTS:
-   *  - Updates component state: certFile and privPem.
+   *  - Updates component state: certFile, doctorRsaPrivB64.
    *  - Generates long-lived credentials; sensitive material must not remain in memory
-   *    longer than necessary (privPem cleared later in the registration flow).
+   *    longer than necessary (doctorRsaPrivB64 cleared later in the registration flow).
    */
-
-  const handleGenerateCertificate = async () => {
-    try {
-      if (!formRef.current) {
-        throw new Error("Form not available");
-      }
-      const formData = new FormData(formRef.current);
-      const firstName = formData.get("firstName") as string;
-      const lastName = formData.get("lastName") as string;
-      const email = (formData.get("email") as string).trim().toLowerCase();
-      const medicalOrganization = formData.get("medicalOrganization") as string;
-
-      if (!firstName.trim() || !lastName.trim() || !email.trim()) {
-        throw new Error("Please fill in first name, last name, and email before generating certificate");
-      }
-
-      setLoading(true);
-      const crypto = pkijs.getCrypto();
-
-      const keyPair = await crypto.subtle.generateKey(
-        {
-          name: "RSASSA-PKCS1-v1_5",
-          modulusLength: 2048,
-          publicExponent: new Uint8Array([1, 0, 1]),
-          hash: "SHA-256",
-        },
-        true, // Must be extractable to export for largeBlob or fallback
-        ["sign", "verify"]
-      );
-
-      const csr = new pkijs.CertificationRequest();
-
-      // Problem patch : 
-      // Order of DN in CSR
-      // CN is now email and not surname name
-      
-      const cnAttr = new pkijs.AttributeTypeAndValue({
-        type: "2.5.4.3", // CN = email address
-        value: new asn1js.Utf8String({ value: email })
-      });
-
-      csr.subject.typesAndValues.push(cnAttr);
-
-      await csr.subjectPublicKeyInfo.importKey(keyPair.publicKey);
-
-      // Add Subject Alternative Name extension for email
-      const generalNames = new pkijs.GeneralNames({
-        names: [
-          new pkijs.GeneralName({
-            type: 1, // rfc822Name (email)
-            value: email
-          })
-        ]
-      });
-
-      const subjectAltName = new pkijs.Extension({
-        extnID: "2.5.29.17",
-        critical: false,
-        extnValue: generalNames.toSchema().toBER(false)
-      });
-
-      const extensions = new pkijs.Extensions({
-        extensions: [subjectAltName]
-      });
-
-      csr.attributes = [
-        new pkijs.Attribute({
-          type: "1.2.840.113549.1.9.14", // extensionRequest
-          values: [extensions.toSchema()]
-        })
-      ];
-
-      await csr.sign(keyPair.privateKey, "SHA-256");
-
-      const csrDer = csr.toSchema().toBER(false);
-      const csrPem = `-----BEGIN CERTIFICATE REQUEST-----\n${btoa(String.fromCharCode(...new Uint8Array(csrDer))).match(/.{1,64}/g)?.join("\n")}\n-----END CERTIFICATE REQUEST-----`;
-
-      console.log("Generated CSR:", csrPem);
-
-      const signResp = await fetch("/api/ca/sign/", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ csr: csrPem }),
-      });
-
-      if (!signResp.ok) {
-        const err = await signResp.json();
-        throw new Error(err.message || "Signing failed");
-      }
-
-      const { certificate } = await signResp.json();
-
-      // Export PrivKey for storage (in largeBlob or fallback)
-      const privRaw = await crypto.subtle.exportKey("pkcs8", keyPair.privateKey);
-      const privPemLocal = `-----BEGIN PRIVATE KEY-----\n${btoa(String.fromCharCode(...new Uint8Array(privRaw))).match(/.{1,64}/g)?.join("\n")}\n-----END PRIVATE KEY-----`;
-      setPrivPem(privPemLocal); // Store temporarily for WebAuthn largeBlob
-
-      // certificate as file
-      const certBlob = new Blob([certificate], { type: "text/plain" });
-      setCertFile(new File([certBlob], "doctor_cert.pem"));
-
-      alert("Certificate generated! Private key will be stored securely during registration (e.g., in TouchID/Windows Hello if supported). If not, you'll be prompted to save it in a password manager.\nNote: Organization info included in CN field.");
-
-    } catch (err) {
-      console.error("Certificate generation error:", err);
-      setError((err as Error).message);
-    } finally {
-      setLoading(false);
+   
+const handleGenerateCertificate = async () => {
+  try {
+    if (!formRef.current) {
+      throw new Error("Form not available");
     }
-  };
+    const formData = new FormData(formRef.current);
+    const firstName = formData.get("firstName") as string;
+    const lastName = formData.get("lastName") as string;
+    const email = (formData.get("email") as string).trim().toLowerCase();
+    const medicalOrganization = formData.get("medicalOrganization") as string;
 
-    /**
+    if (!firstName.trim() || !lastName.trim() || !email.trim()) {
+      throw new Error("Please fill in first name, last name, and email before generating certificate");
+    }
+
+    setLoading(true);
+    const crypto = pkijs.getCrypto();
+
+    const keyPair = await crypto.subtle.generateKey(
+      {
+        name: "RSASSA-PKCS1-v1_5",
+        modulusLength: 2048,
+        publicExponent: new Uint8Array([1, 0, 1]),
+        hash: "SHA-256",
+      },
+      true, // Must be extractable to export for largeBlob or fallback
+      ["sign", "verify"]
+    );
+
+    const csr = new pkijs.CertificationRequest();
+
+    const cnAttr = new pkijs.AttributeTypeAndValue({
+      type: "2.5.4.3", // CN = email address
+      value: new asn1js.Utf8String({ value: email })
+    });
+
+    csr.subject.typesAndValues.push(cnAttr);
+
+    await csr.subjectPublicKeyInfo.importKey(keyPair.publicKey);
+
+    // Subject Alternative Name extension for email
+    const generalNames = new pkijs.GeneralNames({
+      names: [
+        new pkijs.GeneralName({
+          type: 1, // rfc822Name (email)
+          value: email
+        })
+      ]
+    });
+
+    const subjectAltName = new pkijs.Extension({
+      extnID: "2.5.29.17",
+      critical: false,
+      extnValue: generalNames.toSchema().toBER(false)
+    });
+
+    const extensions = new pkijs.Extensions({
+      extensions: [subjectAltName]
+    });
+
+    csr.attributes = [
+      new pkijs.Attribute({
+        type: "1.2.840.113549.1.9.14", // extensionRequest
+        values: [extensions.toSchema()]
+      })
+    ];
+
+    await csr.sign(keyPair.privateKey, "SHA-256");
+
+    const csrDer = csr.toSchema().toBER(false);
+    const csrPem = `-----BEGIN CERTIFICATE REQUEST-----\n${btoa(String.fromCharCode(...new Uint8Array(csrDer))).match(/.{1,64}/g)?.join("\n")}\n-----END CERTIFICATE REQUEST-----`;
+
+    console.log("Generated CSR:", csrPem);
+
+    const signResp = await fetch("/api/ca/sign/", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ csr: csrPem }),
+    });
+
+    if (!signResp.ok) {
+      const err = await signResp.json();
+      throw new Error(err.message || "Signing failed");
+    }
+
+    const { certificate } = await signResp.json();
+
+
+    function pemToDer(pem: string): ArrayBuffer {
+      const lines = pem.split('\n');
+      let base64 = '';
+      let inCert = false;
+      for (let line of lines) {
+        line = line.trim();
+        if (line === '-----BEGIN CERTIFICATE-----') {
+          inCert = true;
+          continue;
+        }
+        if (line === '-----END CERTIFICATE-----') {
+          inCert = false;
+          break;
+        }
+        if (inCert) {
+          base64 += line;
+        }
+      }
+      // url-safe base64
+      base64 = base64.replace(/-/g, '+').replace(/_/g, '/');
+      // padding
+      while (base64.length % 4 !== 0) {
+        base64 += '=';
+      }
+      // binary string
+      let binary;
+      try {
+        binary = atob(base64);
+      } catch (e) {
+        console.error("atob failed on:", base64);
+        throw e;
+      }
+      // conv to ArrayBuffer
+      const bytes = new Uint8Array(binary.length);
+      for (let i = 0; i < binary.length; i++) {
+        bytes[i] = binary.charCodeAt(i);
+      }
+      return bytes.buffer;
+    }
+
+    
+    const certDer = pemToDer(certificate);
+    const asn1 = asn1js.fromBER(certDer);
+    if (asn1.offset === -1) {
+      throw new Error("Failed to parse certificate ASN.1");
+    }
+    const cert = new pkijs.Certificate({ schema: asn1.result });
+    const pubKeyCrypto = await cert.getPublicKey();
+    const pubKeyRaw = await crypto.subtle.exportKey("spki", pubKeyCrypto);
+    const pubKeyHex = bytesToHex(new Uint8Array(pubKeyRaw));
+    console.log("Doctor's certificate public key (hex):", pubKeyHex); // LOG
+
+    setDoctorCert(certificate);
+    setDoctorCertPubkey(pubKeyHex);
+    localStorage.setItem('doctor_cert', certificate);
+    localStorage.setItem('doctor_cert_pubkey', pubKeyHex);
+    (window as any).__DOCTOR_CERT__ = certificate;
+    (window as any).__DOCTOR_CERT_PUBKEY__ = pubKeyHex;
+
+    const privPkcs8Der = await crypto.subtle.exportKey("pkcs8", keyPair.privateKey);
+    const privPkcs8Bytes = new Uint8Array(privPkcs8Der);
+    const privPkcs8B64 = btoa(String.fromCharCode(...privPkcs8Bytes));
+    setDoctorRsaPrivB64(privPkcs8B64);
+
+    // certificate as file
+    const certBlob = new Blob([certificate], { type: "text/plain" });
+    setCertFile(new File([certBlob], "doctor_cert.pem"));
+    setDoctorCert(certificate);
+
+    alert("Certificate generated! Private key will be stored securely using Windows Hello or a password manager.");
+
+  } catch (err) {
+    console.error("Certificate generation error:", err);
+    setError((err as Error).message);
+  } finally {
+    setLoading(false);
+  }
+};
+
+
+  /**
    * FUNCTION: handleSubmit
    *
    * PURPOSE:
@@ -261,7 +319,7 @@ function RegisterPage() {
    *  8) Trigger WebAuthn credential creation via startRegistration(optionsJSON).
    *  9) If doctor:
    *      - attempt PRF KEK derivation from clientExtensionResults.prf.results
-   *      - encrypt RSA private key (privPem) with KEK and attach to finish payload
+   *      - encrypt RSA private key (doctorRsaPrivB64 DER) with KEK and attach to finish payload
    *      - fallback: show QR code for manual password manager storage
    * 10) For all users:
    *      - attempt PRF KEK derivation and encrypt X25519 private key
@@ -286,315 +344,369 @@ function RegisterPage() {
     setError(null);
 
     const formData = new FormData(e.currentTarget);
-try {
-  if (!executeRecaptcha) {
-    throw new Error("reCAPTCHA not yet available - please try again");
-  }
-  const recaptcha_token = await executeRecaptcha("register");
-
-  const payload: any = {
-    email: (formData.get("email") as string).trim().toLowerCase(),
-    first_name: (formData.get("firstName") as string),
-    last_name: (formData.get("lastName") as string),
-    type: userType,
-    date_of_birth:
-      userType === "patient" ? (formData.get("dateOfBirth") as string) : null,
-    medical_organization:
-      userType === "doctor"
-        ? (formData.get("medicalOrganization") as string) : "",
-
-    device_name: (formData.get("deviceName") as string) || "",
-    recaptcha_token,
-  };
-
-  if (userType === "doctor") {
-    if (!certFile) {
-      throw new Error("Certificate required for doctor registration");
-    }
-    if (!privPem) {
-      throw new Error("Private key not generated - please generate certificate first");
-    }
-    payload.certificate = await certFile.text();
-  }
-
-  // Check already authenticated
-  const authCheck = await fetch("/api/webauthn/auth/status/", { credentials: 'include' });
-  
-  if (authCheck.ok) {
-    const { authenticated } = await authCheck.json();
-    if (authenticated) {
-      setError("Already logged in - logout first to register new account");
-      setLoading(false);
-      return;
-    }
-  } 
-        
-  const startResp = await fetch("/api/webauthn/register/start/", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(payload),
-  });
-
-  if (!startResp.ok) {
-    const err = await startResp.json();
-    throw new Error(err.error || "Server error during registration start");
-  }
-
-  let options = await startResp.json();
-      // Cascading secure storage for doctor priv key
-      if (userType === "doctor") {
-        // Prefer platform authenticator (TouchID/Hello/Chrome built-in)
-        const isPlatformAvailable = await PublicKeyCredential.isUserVerifyingPlatformAuthenticatorAvailable();
-        options.authenticatorSelection = {
-          ...options.authenticatorSelection,
-          authenticatorAttachment: isPlatformAvailable ? 'platform' : 'cross-platform',
-          residentKey: 'required', // Ensure discoverable for multi-device
-          userVerification: 'preferred',
-        };
-
-        // Compute salts for PRF
-        const prfSaltFirst = await window.crypto.subtle.digest(
-          "SHA-256",
-          new TextEncoder().encode("HealthSecure Project - PRF salt v1 - first")
-        );
-        const prfSaltSecond = await window.crypto.subtle.digest(
-          "SHA-256",
-          new TextEncoder().encode("HealthSecure Project - PRF salt v1 - second")
-        );
-
-        options.extensions = {
-          ...options.extensions,
-          prf: {
-            eval: {
-              first: new Uint8Array(prfSaltFirst),
-              second: new Uint8Array(prfSaltSecond),
-            },
-          },
-        };
+    try {
+      if (!executeRecaptcha) {
+        throw new Error("reCAPTCHA not yet available - please try again");
       }
+      const recaptcha_token = await executeRecaptcha("register");
 
-      // Generate X25519 key pair for all users (E2EE) using noble for compatibility
-      const x25519KeyPair = generateX25519Keypair();
+      const payload: any = {
+        email: (formData.get("email") as string).trim().toLowerCase(),
+        first_name: (formData.get("firstName") as string),
+        last_name: (formData.get("lastName") as string),
+        type: userType,
+        date_of_birth:
+          userType === "patient" ? (formData.get("dateOfBirth") as string) : null,
+        medical_organization:
+          userType === "doctor"
+            ? (formData.get("medicalOrganization") as string) : "",
 
-      // Public key is already raw Uint8Array (32 bytes)
-      payload.x25519_public = bytesToHex(x25519KeyPair.publicKey);
-
-      // Private key is raw Uint8Array – store temporarily
-      const x25519PrivRawLocal = x25519KeyPair.privateKey;
-
-const edPub = deriveEd25519FromX25519(x25519PrivRawLocal).publicKey;
-  // 2. Show WebAuthn prompt
-      setWebauthnStarted(true);
-
-      // 2. Trigger device prompt - Wrap in { optionsJSON } to fix call structure
-      const credential = await startRegistration({ optionsJSON: options });
+        device_name: (formData.get("deviceName") as string) || "",
+        recaptcha_token,
+      };
 
       if (userType === "doctor") {
-        const extResults: any = credential.clientExtensionResults;
-        const prfResults = extResults?.prf?.results ?? {};
-        let prfFirst = prfResults.first ? new Uint8Array(prfResults.first) : null;
-        let prfSecond = prfResults.second ? new Uint8Array(prfResults.second) : null;
-        let prfBytes: Uint8Array | null = null;
-
-        if (prfFirst && prfSecond) {
-          prfBytes = new Uint8Array(prfFirst.length);
-          for (let i = 0; i < prfFirst.length; i++) {
-            prfBytes[i] = prfFirst[i] ^ prfSecond[i];
-          }
-        } else if (prfFirst) {
-          prfBytes = prfFirst;
-        } else if (prfSecond) {
-          prfBytes = prfSecond;
+        if (!certFile) {
+          throw new Error("Certificate required for doctor registration");
         }
-
-        if (prfBytes) {
-          // Derive KEK from PRF (AES-256 key)
-          const kek = await window.crypto.subtle.importKey(
-            "raw",
-            prfBytes.slice(0, 32),
-            { name: "AES-GCM" },
-            false,
-            window.__KEK__ = new Uint8Array(prfBytes.slice(0, 32)),
-            ["encrypt", "decrypt"]
-          );
-
-          // Encrypt privPem
-          const iv = window.crypto.getRandomValues(new Uint8Array(12));  // 96-bit IV
-          const encryptedPriv = await window.crypto.subtle.encrypt(
-            { name: "AES-GCM", iv },
-            kek,
-            new TextEncoder().encode(privPem)
-          );
-          const encryptedB64 = btoa(String.fromCharCode(...new Uint8Array(encryptedPriv)));
-          const ivB64 = btoa(String.fromCharCode(...iv));
-
-          // Include in finish body
-          credential.encrypted_priv = encryptedB64;
-          credential.iv_b64 = ivB64;
-
-          alert("Private key encrypted with PRF-derived KEK and stored securely on server. Accessible across synced devices!");
-        } else {
-          // Fallback: QR code
-          alert("PRF not supported. Generating QR code for secure transfer to password manager (e.g., Bitwarden). Scan and store as a secure note.");
-          const qrData = await QRCode.toDataURL(privPem, { errorCorrectionLevel: 'M', scale: 8 });  // High EC for scan reliability
-
-          setQrDataUrl(qrData);
-          setPrivPem(null); // Clear immediately after QR generation
-          const modalPromise = new Promise<void>(resolve => {
-            setModalCloseResolve(() => resolve);
-          });
-          setQrModalOpen(true);
-          await modalPromise;
-
-          // Proceed to finish after user closes modal
+        if (!doctorCert || !doctorCertPubkey) {
+          throw new Error("Doctor certificate or pubkey not available - regenerate certificate");
         }
-        // Clear temp privPem after handling (prevent remanence)
-        setPrivPem(null);
+        if (!doctorRsaPrivB64) {
+          throw new Error("Private key not generated - please generate certificate first");
+        }
+        payload.certificate = await certFile.text();
       }
 
-      // Handle X25519 private key encryption for all users (using same PRF logic)
-      const extResults: any = credential.clientExtensionResults;
-      const prfResults = extResults?.prf?.results ?? {};
-      let prfFirst = prfResults.first ? new Uint8Array(prfResults.first) : null;
-      let prfSecond = prfResults.second ? new Uint8Array(prfResults.second) : null;
-      let prfBytes: Uint8Array | null = null;
-
-      if (prfFirst && prfSecond) {
-        prfBytes = new Uint8Array(prfFirst.length);
-        for (let i = 0; i < prfFirst.length; i++) {
-          prfBytes[i] = prfFirst[i] ^ prfSecond[i];
+      // check already authen
+      const authCheck = await fetch("/api/webauthn/auth/status/", { credentials: 'include' });
+      
+      if (authCheck.ok) {
+        const { authenticated } = await authCheck.json();
+        if (authenticated) {
+          setError("Already logged in - logout first to register new account");
+          setLoading(false);
+          return;
         }
-      } else if (prfFirst) {
-        prfBytes = prfFirst;
-      } else if (prfSecond) {
-        prfBytes = prfSecond;
-      }
-
-      if (prfBytes) {
-        // Derive KEK from PRF (AES-256 key)
-        const kek = await window.crypto.subtle.importKey(
-          "raw",
-          prfBytes.slice(0, 32),
-          { name: "AES-GCM" },
-          false,
-          ["encrypt", "decrypt"]
-        );
-
-        // Encrypt X25519 privRaw
-        const iv = window.crypto.getRandomValues(new Uint8Array(12));  // 96-bit IV
-        const encryptedXPriv = await window.crypto.subtle.encrypt(
-          { name: "AES-GCM", iv },
-          kek,
-          x25519PrivRawLocal
-        );
-        const encryptedXB64 = btoa(String.fromCharCode(...new Uint8Array(encryptedXPriv)));
-        const ivB64 = btoa(String.fromCharCode(...iv));
-
-        // Include in finish body
-        credential.encrypted_xpriv = encryptedXB64;
-        credential.xiv_b64 = ivB64;
-
-        // Set private key in memory for the session
-        window.__MY_PRIV__ = x25519PrivRawLocal;
-        window.__SIGN_PRIV__ = deriveEd25519FromX25519(window.__MY_PRIV__).privateKey;
-      } else {
-        // Fallback for X25519: QR code
-        alert("PRF not supported for X25519 key storage. Generating QR code for secure transfer to password manager.");
-        const xPrivB64 = btoa(String.fromCharCode(...x25519PrivRawLocal));
-        const qrText = `${xPrivB64}`;
-        const qrData = await QRCode.toDataURL(qrText, { errorCorrectionLevel: 'M', scale: 8 });
-
-        setQrDataUrl(qrData);
-        const modalPromise = new Promise<void>(resolve => {
-          setModalCloseResolve(() => resolve);
-        });
-        setXQrModalOpen(true);
-        await modalPromise;
-
-        // After QR modal closes, prompt for immediate input
-        const privPromise = new Promise<Uint8Array | null>(resolve => {
-          setPrivInputResolve(() => resolve);
-          // Validation function
-          const validatePrivInput = (input: string): boolean => {
-            const trimmed = input.trim();
-            if (trimmed.length !== 44 || !/^[A-Za-z0-9+/=]+$/.test(trimmed)) {
-              setPrivInputError('Invalid base64 key. Must be exactly 44 characters.');
-              return false;
-            }
-            setPrivInputError(null);
-            return true;
-          };
-          setPrivInput('');
-        });
-        setPrivInputModalOpen(true);
-        const privBytes = await privPromise;
-        setPrivInputModalOpen(false);
-        if (!privBytes) {
-          throw new Error("Private key input cancelled or invalid");
-        }
-        window.__MY_PRIV__ = privBytes;
-        window.__SIGN_PRIV__ = deriveEd25519FromX25519(window.__MY_PRIV__).privateKey;
-      }
-
-      credential.public_key = bytesToHex(x25519KeyPair.publicKey);
-  credential.signing_public_key = bytesToHex(edPub);
-      // 3. Finish registration
-      const finishResp = await fetch("/api/webauthn/register/finish/", {
+      } 
+            
+      const startResp = await fetch("/api/webauthn/register/start/", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(credential),
+        body: JSON.stringify(payload),
       });
 
-        if (!finishResp.ok) {
-            const text = await finishResp.text();
-            console.log('Finish response text:', text);
-            const err = JSON.parse(text); // or try/catch
-            throw new Error(err.error || "Registration failed on server");
-        }
-      const finishData = await finishResp.json();  // Assume backend returns {status: 'OK', user_id: str} on success
-      const userId = finishData.user_id;  // Get from response; if not, fetch /api/user/me/ below
-      console.log(`Registration finished for user ID: ${userId}`);
-
-      await refreshAuth();  // This sets session/cookies
-
-      // Fetch own pubkey to verify
-      const meResp = await fetch('/api/user/me/');
-      if (!meResp.ok) throw new Error('Failed to fetch user ID post-reg');
-      const meData = await meResp.json();
-      const userIdFromMe = meData.id;  // Use this if finish doesn't provide
-
-      const verifyKeys = await fetch(`/api/user/public_key/${userIdFromMe}`);
-      if (!verifyKeys.ok || !(await verifyKeys.json()).public_key) {
-        // Retry sending keys if not included (e.g., due to PRF failure)
-        console.warn("Public key not saved - retrying update");
-        const retryResp = await fetch("/api/user/keys/update/", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            public_key: bytesToHex(x25519KeyPair.publicKey),
-          }),
-        });
-        if (!retryResp.ok) {
-          const retryErr = await retryResp.json();
-          console.error(`Retry failed: ${retryErr.error}`);
-          setError('Failed to save encryption keys. Please try logging in and updating in settings.');
-          return;  // Don't navigate; let user retry
-        }
-        console.log("Public key retry successful");
-      } else {
-        console.log("Public key verified as saved");
+      if (!startResp.ok) {
+        const err = await startResp.json();
+        throw new Error(err.error || "Server error during registration start");
       }
-      navigate({ to: "/" });
-    } catch (err) {
-      console.error(err);
-      console.error("Registration error:", err);
-      setError(err instanceof Error ? err.message : "Registration failed");
-      setWebauthnStarted(false);
-      // Clear privPem on error
-      setPrivPem(null);
-    } finally {
-      setLoading(false);
+
+      let options = await startResp.json();
+          if (userType === "doctor") {
+            // Prefer platform authenticator (TouchID/Hello/Chrome built-in)
+            const isPlatformAvailable = await PublicKeyCredential.isUserVerifyingPlatformAuthenticatorAvailable();
+            options.authenticatorSelection = {
+              ...options.authenticatorSelection,
+              authenticatorAttachment: isPlatformAvailable ? 'platform' : 'cross-platform',
+              residentKey: 'required', // Ensure discoverable for multi-device
+              userVerification: 'preferred',
+            };
+
+            // Compute salts for PRF
+            const prfSaltFirst = await window.crypto.subtle.digest(
+              "SHA-256",
+              new TextEncoder().encode("HealthSecure Project - PRF salt v1 - first")
+            );
+            const prfSaltSecond = await window.crypto.subtle.digest(
+              "SHA-256",
+              new TextEncoder().encode("HealthSecure Project - PRF salt v1 - second")
+            );
+
+            options.extensions = {
+              ...options.extensions,
+              prf: {
+                eval: {
+                  first: new Uint8Array(prfSaltFirst),
+                  second: new Uint8Array(prfSaltSecond),
+                },
+              },
+            };
+          }
+
+          // Generate X25519 key pair for all users (E2EE)
+          const x25519KeyPair = generateX25519Keypair();
+
+          payload.x25519_public = bytesToHex(x25519KeyPair.publicKey);
+          const x25519PrivRawLocal = x25519KeyPair.privateKey;
+
+          const edPub = deriveEd25519FromX25519(x25519PrivRawLocal).publicKey;
+
+          setWebauthnStarted(true);
+
+          const credential = await startRegistration({ optionsJSON: options });
+
+          if (userType === "doctor") {
+            const extResults: any = credential.clientExtensionResults;
+            const prfResults = extResults?.prf?.results ?? {};
+            let prfFirst = prfResults.first ? new Uint8Array(prfResults.first) : null;
+            let prfSecond = prfResults.second ? new Uint8Array(prfResults.second) : null;
+            let prfBytes: Uint8Array | null = null;
+
+            if (prfFirst && prfSecond) {
+              prfBytes = new Uint8Array(prfFirst.length);
+              for (let i = 0; i < prfFirst.length; i++) {
+                prfBytes[i] = prfFirst[i] ^ prfSecond[i];
+              }
+            } else if (prfFirst) {
+              prfBytes = prfFirst;
+            } else if (prfSecond) {
+              prfBytes = prfSecond;
+            }
+
+            if (prfBytes) {
+              // Derive KEK from PRF (AES-256 key)
+              const kek = await window.crypto.subtle.importKey(
+                "raw",
+                prfBytes.slice(0, 32),
+                { name: "AES-GCM" },
+                false,
+                ["encrypt", "decrypt"]
+              );
+
+              // doctorRsaPrivB64 to ArrayBuffer for enc
+              const privPkcs8Der = base64ToArrayBuffer(doctorRsaPrivB64!);
+
+              // Encrypt priv DER
+              const iv = window.crypto.getRandomValues(new Uint8Array(12));  // 96-bit IV
+              const encryptedPriv = await window.crypto.subtle.encrypt(
+                { name: "AES-GCM", iv },
+                kek,
+                privPkcs8Der
+              );
+              const encryptedB64 = btoa(String.fromCharCode(...new Uint8Array(encryptedPriv)));
+              const ivB64 = btoa(String.fromCharCode(...iv));
+
+              // Include in finish body
+              credential.encrypted_priv = encryptedB64;
+              credential.iv_b64 = ivB64;
+
+              alert("Private key encrypted with PRF-derived KEK and stored securely on server. Accessible across synced devices!");
+            } else {
+
+              // Fallback: QR code with pure base64 PKCS#8 DER
+              alert("PRF not supported. Generating QR code for secure transfer to password manager (e.g., Bitwarden). Scan and store as a secure note.");
+              const qrData = await QRCode.toDataURL(doctorRsaPrivB64!, { errorCorrectionLevel: 'M', scale: 8 });  // High EC for scan reliability
+
+              setQrDataUrl(qrData);
+              setQrModalOpen(true);
+              const modalPromise = new Promise<void>(resolve => {
+                setModalCloseResolve(() => resolve);
+              });
+              await modalPromise;
+
+            }
+            setDoctorRsaPrivB64(null);
+          }
+
+
+          // Handle X25519 private key encryption for all users (same PRF logic)
+          const extResults: any = credential.clientExtensionResults;
+          const prfResults = extResults?.prf?.results ?? {};
+          let prfFirst = prfResults.first ? new Uint8Array(prfResults.first) : null;
+          let prfSecond = prfResults.second ? new Uint8Array(prfResults.second) : null;
+          let prfBytes: Uint8Array | null = null;
+
+          if (prfFirst && prfSecond) {
+            prfBytes = new Uint8Array(prfFirst.length);
+            for (let i = 0; i < prfFirst.length; i++) {
+              prfBytes[i] = prfFirst[i] ^ prfSecond[i];
+            }
+          } else if (prfFirst) {
+            prfBytes = prfFirst;
+          } else if (prfSecond) {
+            prfBytes = prfSecond;
+          }
+
+          if (prfBytes) {
+            // Derive KEK from PRF (AES-256 key)
+            const kek = await window.crypto.subtle.importKey(
+              "raw",
+              prfBytes.slice(0, 32),
+              { name: "AES-GCM" },
+              false,
+              ["encrypt", "decrypt"]
+            );
+
+            // Encrypt X25519 privRaw
+            const iv = window.crypto.getRandomValues(new Uint8Array(12));  // 96-bit IV
+            const encryptedXPriv = await window.crypto.subtle.encrypt(
+              { name: "AES-GCM", iv },
+              kek,
+              x25519PrivRawLocal
+            );
+            const encryptedXB64 = btoa(String.fromCharCode(...new Uint8Array(encryptedXPriv)));
+            const ivB64 = btoa(String.fromCharCode(...iv));
+
+            // Include in finish body
+            credential.encrypted_xpriv = encryptedXB64;
+            credential.xiv_b64 = ivB64;
+
+            window.__MY_PRIV__ = x25519PrivRawLocal;
+            window.__SIGN_PRIV__ = deriveEd25519FromX25519(window.__MY_PRIV__).privateKey;
+
+          } else {
+            // Fallback for X25519: QR code
+            alert("PRF not supported for X25519 key storage. Generating QR code for secure transfer to password manager.");
+            const xPrivB64 = btoa(String.fromCharCode(...x25519PrivRawLocal));
+            const qrText = `${xPrivB64}`;
+            const qrData = await QRCode.toDataURL(qrText, { errorCorrectionLevel: 'M', scale: 8 });
+
+            setQrDataUrl(qrData);
+            const modalPromise = new Promise<void>(resolve => {
+              setModalCloseResolve(() => resolve);
+            });
+            setXQrModalOpen(true);
+            await modalPromise;
+
+            // After QR modal closes, prompt for immediate input
+            const privPromise = new Promise<Uint8Array | null>(resolve => {
+              setPrivInputResolve(() => resolve);
+              // Validation function
+              const validatePrivInput = (input: string): boolean => {
+                const trimmed = input.trim();
+                if (trimmed.length !== 44 || !/^[A-Za-z0-9+/=]+$/.test(trimmed)) {
+                  setPrivInputError('Invalid base64 key. Must be exactly 44 characters.');
+                  return false;
+                }
+                setPrivInputError(null);
+                return true;
+              };
+              setPrivInput('');
+            });
+            setPrivInputModalOpen(true);
+            const privBytes = await privPromise;
+            setPrivInputModalOpen(false);
+            if (!privBytes) {
+              throw new Error("Private key input cancelled or invalid");
+            }
+            window.__MY_PRIV__ = privBytes;
+            window.__SIGN_PRIV__ = deriveEd25519FromX25519(window.__MY_PRIV__).privateKey;
+          }
+
+          credential.public_key = bytesToHex(x25519KeyPair.publicKey);
+      credential.signing_public_key = bytesToHex(edPub);
+          if (userType === "doctor") {
+            credential.certificate = doctorCert;
+          }
+          // 3. Finish registration
+          const finishResp = await fetch("/api/webauthn/register/finish/", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(credential),
+          });
+
+            if (!finishResp.ok) {
+                const text = await finishResp.text();
+                console.log('Finish response text:', text);
+                const err = JSON.parse(text);
+                throw new Error(err.error || "Registration failed on server");
+            }
+        const finishData = await finishResp.json();
+        const userId = finishData.user_id; 
+        console.log(`Registration finished for user ID: ${userId}`);
+
+        await refreshAuth();
+
+        // Fetch own pubkey to verify
+        const meResp = await fetch('/api/user/me/');
+        if (!meResp.ok) throw new Error('Failed to fetch user ID post-reg');
+        const meData = await meResp.json();
+        const userIdFromMe = meData.id;
+
+        const verifyKeys = await fetch(`/api/user/public_key/${userIdFromMe}`);
+        if (!verifyKeys.ok || !(await verifyKeys.json()).public_key) {
+
+          console.warn("Public key not saved - retrying update");
+          const retryResp = await fetch("/api/user/keys/update/", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              public_key: bytesToHex(x25519KeyPair.publicKey),
+            }),
+          });
+          if (!retryResp.ok) {
+            const retryErr = await retryResp.json();
+            console.error(`Retry failed: ${retryErr.error}`);
+            setError('Failed to save encryption keys. Please try logging in and updating in settings.');
+            return;
+          }
+          console.log("Public key retry successful");
+        } else {
+          console.log("Public key verified as saved");
+        }
+        navigate({ to: "/" });
+      } catch (err) {
+        console.error(err);
+        console.error("Registration error:", err);
+        setError(err instanceof Error ? err.message : "Registration failed");
+        setWebauthnStarted(false);
+
+        // Clear sensitive data on error
+        setDoctorRsaPrivB64(null);
+        setDoctorCert(null);
+        setDoctorCertPubkey(null);
+        localStorage.removeItem('doctor_cert');
+        localStorage.removeItem('doctor_cert_pubkey');
+        delete (window as any).__DOCTOR_CERT__;
+        delete (window as any).__DOCTOR_CERT_PUBKEY__;
+      } finally {
+        setLoading(false);
+      }
+    };
+
+  const handleQrModalClose = () => {
+    setQrModalOpen(false);
+    setQrDataUrl(null);
+    if (modalCloseResolve) {
+      modalCloseResolve();
+      setModalCloseResolve(null);
     }
+  };
+
+  const handleXQrModalClose = () => {
+    setXQrModalOpen(false);
+    setQrDataUrl(null);
+    if (modalCloseResolve) {
+      modalCloseResolve();
+      setModalCloseResolve(null);
+    }
+  };
+
+  const handlePrivInputSubmit = () => {
+    try {
+      const privBytes = base64ToBytes(privInput.trim());
+      if (privBytes.length !== 32) {
+        setPrivInputError('Invalid key length - must be 32 bytes');
+        return;
+      }
+      if (privInputResolve) {
+        privInputResolve(privBytes);
+        setPrivInputResolve(null);
+      }
+      setPrivInput('');
+      setPrivInputError(null);
+    } catch {
+      setPrivInputError('Invalid base64 encoding');
+    }
+  };
+
+  const handlePrivInputCancel = () => {
+    if (privInputResolve) {
+      privInputResolve(null);
+      setPrivInputResolve(null);
+    }
+    setPrivInput('');
+    setPrivInputError(null);
   };
 
   return (

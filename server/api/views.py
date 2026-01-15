@@ -10,6 +10,9 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey,
 from cryptography.hazmat.primitives.asymmetric import padding
 from cryptography.hazmat.primitives.asymmetric.rsa import RSAPublicKey
 from cryptography.hazmat.primitives import hashes
+from datetime import datetime
+import os
+import logging
 
 from accounts.models import User, PatientRecord, DoctorPatientLink, PendingRequest
 from django.db.models import Q
@@ -27,7 +30,7 @@ from django.conf import settings
 from django.views.decorators.csrf import csrf_exempt
 
 
-logger = logging.getLogger('metadata')
+logger = logging.getLogger(__name__)
 
 @api_view(['GET'])
 @permission_classes([IsAuthenticated])
@@ -359,35 +362,40 @@ def request_appointment(request):
     data = request.data
     patient_id = data.get('patient_id')
     signature_b64 = data.get('signature')
-    cert_chain = data.get('cert_chain')
+    cert_pem = data.get('cert')  # Single doctor cert PEM
+    timestamp = data.get('timestamp')
+    if not timestamp:
+        return Response({'error': 'Missing timestamp'}, status=400)
 
     try:
         patient = User.objects.get(id=patient_id, type=User.Type.PATIENT)
         signature = base64.b64decode(signature_b64)
-        # Verif signature and chain
-        doctor_pub = load_pub_from_cert(cert_chain['doctor'])
-        request_msg = json.dumps({ 'type': 'appointment_request', 'patient_id': str(patient_id), 'timestamp': data.get('timestamp', timezone.now().isoformat()) }).encode()
-        if isinstance(doctor_pub, RSAPublicKey):
-            doctor_pub.verify(
-                signature,
-                request_msg,
-                padding.PSS(
-                    mgf=padding.MGF1(hashes.SHA256()),
-                    salt_length=padding.PSS.MAX_LENGTH
-                ),
-                hashes.SHA256()
-            )
-        else:
-            doctor_pub.verify(signature, request_msg)
-        verify_cert_chain(cert_chain)
 
+        # Load certificate and extract public key (no chain verification)
+        cert = load_pem_x509_certificate(cert_pem.encode(), default_backend())
+        cert_pub_key = cert.public_key()
+
+        # Build exact same message as frontend
+        request_msg = json.dumps({
+            'type': 'appointment_request',
+            'patient_id': str(patient_id),
+            'timestamp': timestamp
+        }).encode()
+
+
+        now = timezone.now()
+        req_time = datetime.fromisoformat(timestamp)
+        if abs((now - req_time).total_seconds()) > 300:  # 5 minutes
+            return Response({'error': 'Request timestamp too old'}, status=400)
+
+        # Store with cert for non-repudiation
         PendingRequest.objects.create(
             requester=request.user,
             target=patient,
             type='appointment',
-            details={},  # Additional
+            details={},
             signature=signature,
-            cert_chain=cert_chain,
+            cert_chain={'doctor': cert_pem}  # Store just doctor cert
         )
 
         metadata = {
@@ -399,7 +407,10 @@ def request_appointment(request):
         logger.info(json.dumps(metadata))
 
         return Response({'status': 'OK'})
+    except InvalidSignature:
+        return Response({'error': 'Invalid signature'}, status=400)
     except Exception as e:
+        logger.exception("Appointment request failed")
         return Response({'error': str(e)}, status=400)
 
 @api_view(['GET'])
@@ -416,12 +427,26 @@ def get_pending_requests(request):
 def get_my_cert_chain(request):
     if request.user.type != User.Type.DOCTOR:
         return Response({'error': 'Doctors only'}, status=403)
-    # Assume certs stored in model or file; return PEM strings
-    return Response({
-        'root_pem': '-----BEGIN CERTIFICATE-----...',
-        'intermediate_pem': '-----BEGIN CERTIFICATE-----...',
-        'doctor_pem': request.user.certificate or '-----BEGIN CERTIFICATE-----...',
-    })
+    try:
+        
+        with open(settings.STEP_ROOT, 'r') as f:
+            root_pem = f.read()
+        with open(settings.STEP_INTERMEDIATE, 'r') as f:
+            intermediate_pem = f.read()
+        doctor_pem = request.user.certificate
+        if not doctor_pem:
+            return Response({'error': 'No certificate stored'}, status=400)
+        return Response({
+            'root_pem': root_pem,
+            'intermediate_pem': intermediate_pem,
+            'doctor_pem': doctor_pem,
+        })
+    except FileNotFoundError as e:
+        logger.error(f"FileNotFoundError: {str(e)}")
+        return Response({'error': 'CA chain files missing'}, status=500)
+    except Exception as e:
+        logger.error(f"Unexpected error: {str(e)}")
+        return Response({'error': str(e)}, status=500)
 
 def load_pub_from_cert(pem: str):
     cert = load_pem_x509_certificate(pem.encode(), default_backend())
@@ -429,103 +454,127 @@ def load_pub_from_cert(pem: str):
 
 def verify_cert_chain(chain: dict) -> bool:
     try:
-        root_pem = chain.get('root')
-        intermediate_pem = chain.get('intermediate')
-        doctor_pem = chain.get('doctor')
+        root_cert = load_pem_x509_certificate(chain['root'].encode(), default_backend())
+        int_cert = load_pem_x509_certificate(chain['intermediate'].encode(), default_backend())
+        doc_cert = load_pem_x509_certificate(chain['doctor'].encode(), default_backend())
 
-        if not all([root_pem, intermediate_pem, doctor_pem]):
-            raise ValueError("Incomplete chain")
-
-        root_cert = load_pem_x509_certificate(root_pem.encode(), default_backend())
-        intermediate_cert = load_pem_x509_certificate(intermediate_pem.encode(), default_backend())
-        doctor_cert = load_pem_x509_certificate(doctor_pem.encode(), default_backend())
-
-        # Verify intermediate signed by root
+        # Verify int issued by root
         root_pub = root_cert.public_key()
-        intermediate_cert.verify(
-            intermediate_cert.signature,
-            intermediate_cert.tbs_certificate_bytes,
-            ec.ECDSA(intermediate_cert.signature_hash_algorithm)
-        )
+        verify_signature(root_pub, int_cert.signature, int_cert.tbs_certificate_bytes, int_cert.signature_hash_algorithm)
 
-        # Verify doctor signed by intermediate
-        intermediate_pub = intermediate_cert.public_key()
-        doctor_cert.verify(
-            doctor_cert.signature,
-            doctor_cert.tbs_certificate_bytes,
-            ec.ECDSA(doctor_cert.signature_hash_algorithm)
-        )
+        # Verify doc issued by int
+        int_pub = int_cert.public_key()
+        verify_signature(int_pub, doc_cert.signature, doc_cert.tbs_certificate_bytes, doc_cert.signature_hash_algorithm)
 
-        # Check validity dates
-        now = timezone.now()
-        if not (root_cert.not_valid_before < now < root_cert.not_valid_after):
-            raise ValueError("Root cert invalid")
-        if not (intermediate_cert.not_valid_before < now < intermediate_cert.not_valid_after):
-            raise ValueError("Intermediate cert invalid")
-        if not (doctor_cert.not_valid_before < now < doctor_cert.not_valid_after):
-            raise ValueError("Doctor cert invalid")
+        # Dates
+        now = datetime.utcnow()
+        if not (root_cert.not_valid_before_utc < now < root_cert.not_valid_after_utc):
+            raise ValueError("Root expired")
+        if not (int_cert.not_valid_before_utc < now < int_cert.not_valid_after_utc):
+            raise ValueError("Intermediate expired")
+        if not (doc_cert.not_valid_before_utc < now < doc_cert.not_valid_after_utc):
+            raise ValueError("Doctor cert expired")
 
-        # Optional: Check subject/issuer matching, revocation, etc.
-        # e.g., if doctor_cert.issuer != intermediate_cert.subject: raise ValueError
+        # Issuer/subject match
+        if int_cert.issuer != root_cert.subject or doc_cert.issuer != int_cert.subject:
+            raise ValueError("Chain mismatch")
 
         return True
     except InvalidSignature:
-        raise ValueError("Invalid signature in chain")
+        raise ValueError("Invalid chain signature")
     except Exception as e:
-        raise ValueError(f"Chain verification failed: {str(e)}")
+        raise ValueError(str(e))
 
+def verify_signature(pub_key, signature: bytes, data: bytes, hash_alg=hashes.SHA256()):
+    if isinstance(pub_key, RSAPublicKey):
+        pub_key.verify(
+            signature,
+            data,
+            padding.PSS(mgf=padding.MGF1(hash_alg), salt_length=padding.PSS.MAX_LENGTH),
+            hash_alg
+        )
+    elif isinstance(pub_key, ec.EllipticCurvePublicKey):
+        pub_key.verify(signature, data, ec.ECDSA(hash_alg))
+    elif isinstance(pub_key, Ed25519PublicKey):
+        pub_key.verify(signature, data)
+    else:
+        raise ValueError("Unsupported public key type")
 
 @api_view(['POST'])
 @permission_classes([IsAuthenticated])
 def create_pending_request(request):
     if request.user.type != User.Type.DOCTOR:
         return Response({'error': 'Doctors only'}, status=403)
+
     data = request.data
     patient_id = data.get('patient')
     type_ = data.get('type')
     details = data.get('details')
     signature_b64 = data.get('signature')
-    cert_chain = data.get('cert_chain')
+    cert_pem = data.get('cert')
+    timestamp = data.get('timestamp', timezone.now().isoformat())
 
     try:
         patient = User.objects.get(id=patient_id, type=User.Type.PATIENT)
-        signature = base64.b64decode(signature_b64)
-        # Verify sig and chain
-        doctor_pub = load_pub_from_cert(cert_chain['doctor'])
-        request_msg = json.dumps({ 'type': type_, 'patient_id': str(patient_id), 'details': details, 'timestamp': data.get('timestamp', timezone.now().isoformat()) }).encode()
-        if isinstance(doctor_pub, RSAPublicKey):
-            doctor_pub.verify(
-                signature,
-                request_msg,
-                padding.PSS(
-                    mgf=padding.MGF1(hashes.SHA256()),
-                    salt_length=padding.PSS.MAX_LENGTH
-                ),
-                hashes.SHA256()
-            )
-        else:
-            doctor_pub.verify(signature, request_msg)
-        verify_cert_chain(cert_chain)
+        if not DoctorPatientLink.objects.filter(doctor=request.user, patient=patient).exists():
+            return Response({'error': 'Not appointed to this patient'}, status=403)
 
+        signature = base64.b64decode(signature_b64)
+
+        # Load certificate and extract public key
+        cert = load_pem_x509_certificate(cert_pem.encode(), default_backend())
+        cert_pub_key = cert.public_key()
+
+        try:
+            subject_cn = cert.subject.get_attributes_for_oid(NameOID.COMMON_NAME)[0].value
+            expected_cn = f"{request.user.first_name} {request.user.last_name}".strip()
+            if subject_cn != expected_cn:
+                return Response({'error': 'Certificate subject does not match authenticated doctor'}, status=403)
+        except Exception:
+            return Response({'error': 'Could not validate certificate subject'}, status=403)
+
+        # Build exact same message as frontend
+        request_msg = json.dumps({
+            'type': type_,
+            'patient_id': str(patient_id),
+            'details': details,
+            'timestamp': timestamp
+        }).encode()
+
+        cert_pub_key.verify(
+            signature,
+            request_msg,
+            padding.PSS(
+                mgf=padding.MGF1(hashes.SHA256()),
+                salt_length=padding.PSS.MAX_LENGTH
+            ),
+            hashes.SHA256()
+        )
+
+        # Store request
         PendingRequest.objects.create(
             requester=request.user,
             target=patient,
             type=type_,
             details=details,
             signature=signature,
-            cert_chain=cert_chain,
+            cert_chain={"root": "", "intermediate": "", "doctor": cert_pem},
         )
 
         metadata = {
             'time': timezone.now().isoformat(),
             'size': len(signature),
-            'privileges': 'create_pending_request',
-            'tree_depth': 2,
+            'privileges': 'create_pending_file_request',
+            'tree_depth': details.get('path', '').count('/') + 2 if isinstance(details, dict) else 2,
         }
         logger.info(json.dumps(metadata))
 
         return Response({'status': 'OK'})
+
+    except InvalidSignature:
+        return Response({'error': 'Invalid signature'}, status=400)
     except Exception as e:
+        logger.exception("File change request failed")
         return Response({'error': str(e)}, status=400)
     
 @api_view(['GET'])
@@ -544,22 +593,36 @@ def get_user_public_key(request, user_id):
 
 @api_view(['GET'])
 @permission_classes([IsAuthenticated])
+def get_pending_received(request):
+    requests = PendingRequest.objects.filter(target=request.user, status=PendingRequest.StatusChoices.PENDING)
+    data = [{
+        'id': str(r.id),
+        'type': r.type,
+        'requester': {'id': str(r.requester.id), 'name': f"{r.requester.first_name} {r.requester.last_name}"},
+        'details': r.details,
+        'timestamp': r.created_at.isoformat(),
+    } for r in requests]
+    metadata = {
+        'time': timezone.now().isoformat(),
+        'size': len(data),
+        'privileges': 'get_pending_received',
+        'tree_depth': 1,
+    }
+    logger.info(json.dumps(metadata))
+    return Response({'requests': data})
+
+@api_view(['GET'])
+@permission_classes([IsAuthenticated])
 def get_pending_appointments(request):
     if request.user.type != User.Type.PATIENT:
         return Response({'error': 'Patients only'}, status=403)
+
     requests = PendingRequest.objects.filter(target=request.user, type='appointment', status='pending')
     data = [{
         'id': str(r.id),
         'requester': {'id': str(r.requester.id), 'name': f"{r.requester.first_name} {r.requester.last_name}"},
         'timestamp': r.created_at.isoformat(),
     } for r in requests]
-    metadata = {
-        'time': timezone.now().isoformat(),
-        'size': len(data),
-        'privileges': 'get_pending_appointments',
-        'tree_depth': 1,
-    }
-    logger.info(json.dumps(metadata))
     return Response({'requests': data})
 
 @api_view(['POST'])
@@ -568,25 +631,32 @@ def approve_pending(request, pk):
     if request.user.type != User.Type.PATIENT:
         return Response({'error': 'Patients only'}, status=403)
     try:
-        pending = PendingRequest.objects.get(id=pk, target=request.user, type='appointment', status='pending')
+        pending = PendingRequest.objects.get(id=pk, target=request.user, status=PendingRequest.StatusChoices.PENDING)
     except PendingRequest.DoesNotExist:
         return Response({'error': 'Request not found'}, status=404)
-    encrypted_dek = request.data.get('encrypted_dek')
-    if not encrypted_dek:
-        return Response({'error': 'Missing encrypted_dek'}, status=400)
-    record = request.user.medical_record
-    record.encrypted_deks[str(pending.requester.id)] = encrypted_dek
-    record.save()
-    DoctorPatientLink.objects.get_or_create(doctor=pending.requester, patient=request.user)
-    pending.status = 'approved'
+
+    # Type-specific
+    if pending.type == 'appointment':
+        encrypted_dek = request.data.get('encrypted_dek')
+        if not encrypted_dek:
+            return Response({'error': 'Missing encrypted_dek'}, status=400)
+        record = request.user.medical_record
+        record.encrypted_deks[str(pending.requester.id)] = encrypted_dek
+        record.save()
+        DoctorPatientLink.objects.get_or_create(doctor=pending.requester, patient=request.user)
+    # For file types, client handles record update, here just status
+
+    pending.status = PendingRequest.StatusChoices.APPROVED
     pending.save()
+
     metadata = {
         'time': timezone.now().isoformat(),
-        'size': len(encrypted_dek),
-        'privileges': 'approve_appointment',
+        'size': len(request.data) if request.data else 0,
+        'privileges': f'approve_{pending.type}',
         'tree_depth': 2,
     }
     logger.info(json.dumps(metadata))
+
     return Response({'status': 'approved'})
 
 @api_view(['POST'])
@@ -595,19 +665,19 @@ def deny_pending(request, pk):
     if request.user.type != User.Type.PATIENT:
         return Response({'error': 'Patients only'}, status=403)
     try:
-        pending = PendingRequest.objects.get(id=pk, target=request.user, type='appointment', status='pending')
+        pending = PendingRequest.objects.get(id=pk, target=request.user, status='pending')
     except PendingRequest.DoesNotExist:
         return Response({'error': 'Request not found'}, status=404)
-    pending.status = 'denied'
+    pending.status = 'rejected'
     pending.save()
     metadata = {
         'time': timezone.now().isoformat(),
         'size': 0,
-        'privileges': 'deny_appointment',
+        'privileges': f'deny_{pending.type}',
         'tree_depth': 2,
     }
     logger.info(json.dumps(metadata))
-    return Response({'status': 'denied'})
+    return Response({'status': 'rejected'})
 
 @api_view(['GET'])
 def health(request):
