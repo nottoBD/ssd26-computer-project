@@ -41,6 +41,7 @@
  */
 
 import { useState, useRef, useEffect } from "react";
+import { saveKey } from '../lib/key-store';
 import { createFileRoute, useNavigate } from "@tanstack/react-router";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -552,6 +553,10 @@ const handleGenerateCertificate = async () => {
             credential.xiv_b64 = ivB64;
 
             window.__MY_PRIV__ = x25519PrivRawLocal;
+            //Save key to indexDB
+            try {
+              await saveKey('master_priv_key', (window as any).__MY_PRIV__);
+            } catch (e) { console.error("Erreur sauvegarde register", e); }
             window.__SIGN_PRIV__ = deriveEd25519FromX25519(window.__MY_PRIV__).privateKey;
 
           } else {
@@ -571,16 +576,6 @@ const handleGenerateCertificate = async () => {
             // After QR modal closes, prompt for immediate input
             const privPromise = new Promise<Uint8Array | null>(resolve => {
               setPrivInputResolve(() => resolve);
-              // Validation function
-              const validatePrivInput = (input: string): boolean => {
-                const trimmed = input.trim();
-                if (trimmed.length !== 44 || !/^[A-Za-z0-9+/=]+$/.test(trimmed)) {
-                  setPrivInputError('Invalid base64 key. Must be exactly 44 characters.');
-                  return false;
-                }
-                setPrivInputError(null);
-                return true;
-              };
               setPrivInput('');
             });
             setPrivInputModalOpen(true);
@@ -590,11 +585,15 @@ const handleGenerateCertificate = async () => {
               throw new Error("Private key input cancelled or invalid");
             }
             window.__MY_PRIV__ = privBytes;
+            //Save key to indexDB
+            try {
+              await saveKey('master_priv_key', (window as any).__MY_PRIV__);
+            } catch (e) { console.error("Erreur sauvegarde register", e); }
             window.__SIGN_PRIV__ = deriveEd25519FromX25519(window.__MY_PRIV__).privateKey;
           }
 
           credential.public_key = bytesToHex(x25519KeyPair.publicKey);
-      credential.signing_public_key = bytesToHex(edPub);
+          credential.signing_public_key = bytesToHex(edPub);
           if (userType === "doctor") {
             credential.certificate = doctorCert;
           }
@@ -699,7 +698,16 @@ const handleGenerateCertificate = async () => {
       setPrivInputError('Invalid base64 encoding');
     }
   };
-
+              // Validation function
+  const validatePrivInput = (input: string): boolean => {
+    const trimmed = input.trim();
+    if (trimmed.length !== 44 || !/^[A-Za-z0-9+/=]+$/.test(trimmed)) {
+      setPrivInputError('Invalid base64 key. Must be exactly 44 characters.');
+      return false;
+    }
+    setPrivInputError(null);
+    return true;
+  };
   const handlePrivInputCancel = () => {
     if (privInputResolve) {
       privInputResolve(null);

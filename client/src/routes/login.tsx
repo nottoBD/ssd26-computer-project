@@ -19,9 +19,10 @@
  *   key to detect mismatches (wrong key import, stale server state, etc.).
  */
 
-import { useState } from "react";
+import { useState,useEffect } from "react";
 import { createFileRoute, useNavigate } from "@tanstack/react-router";
 import { Button } from "@/components/ui/button";
+import { saveKey, getKey } from '../lib/key-store';
 import {
   Card,
   CardContent,
@@ -65,6 +66,30 @@ function LoginPage() {
   const [privInputResolve, setPrivInputResolve] = useState<((value: Uint8Array | null) => void) | null>(null);
   const [privInputError, setPrivInputError] = useState<string | null>(null);
 
+
+
+  useEffect(() => {
+    const tryAutoLogin = async () => {
+      try {
+        const storedKey = await getKey('master_priv_key');
+        if (storedKey) {
+          console.log("📂 Key find in IndexDB !");
+          // save in RAM
+          const rawKey = await crypto.subtle.exportKey("raw", storedKey);
+          (window as any).__MY_PRIV__ = new Uint8Array(rawKey);
+          
+          // signature key derived
+          (window as any).__SIGN_PRIV__ = deriveEd25519FromX25519((window as any).__MY_PRIV__).privateKey;
+          
+          // redirection to home
+          navigate({ to: "/" });
+        }
+      } catch (e) {
+        console.error("Auto-login failed", e);
+      }
+    };
+    tryAutoLogin();
+  }, []);
 
   /**
    * FUNCTION: handleWebAuthnLogin
@@ -177,6 +202,11 @@ function LoginPage() {
             new Uint8Array(encrypted_priv.tag),
           );
           window.__MY_PRIV__ = priv;
+          //Saving key into IndexDB
+          try {
+              await saveKey('master_priv_key', priv);
+              console.log("Key save");
+            } catch (e) { console.error("Error during key save", e); }
         }
 
         // Derive Ed25519 for signatures
@@ -193,7 +223,10 @@ function LoginPage() {
           throw new Error("Private key input cancelled");
         }
         window.__MY_PRIV__ = priv;
-
+        try {
+          await saveKey('master_priv_key', priv);
+          console.log("Key save (manual login)");
+        } catch (e) { console.error("Error during saving key", e); }
         // Derive Ed25519 for signatures
         window.__SIGN_PRIV__ = deriveEd25519FromX25519(
           window.__MY_PRIV__,
@@ -226,6 +259,11 @@ function LoginPage() {
           const priv = await promptForPrivateKey();
           if (!priv) throw new Error('Private key input cancelled');
           window.__MY_PRIV__ = priv;
+          //Save key to IndexDB
+          try {
+            await saveKey('master_priv_key', priv);
+            console.log("💾 Clé sauvegardée (Login Manuel)");
+          } catch (e) { console.error("Erreur sauvegarde", e); }
           window.__SIGN_PRIV__ = deriveEd25519FromX25519(window.__MY_PRIV__).privateKey;
         } else {
           // Fallback case, re-prompt

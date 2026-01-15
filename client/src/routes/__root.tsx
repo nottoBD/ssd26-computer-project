@@ -28,6 +28,8 @@
  */
 
 import { createRootRoute, Link, Outlet, useNavigate } from '@tanstack/react-router'
+import { getKey, deleteKey } from '../lib/key-store';
+import { deriveEd25519FromX25519 } from '../components/CryptoUtils';
 import { Button } from '@/components/ui/button'
 import { Shield, User, Stethoscope, Settings as SettingsIcon, LogOut as LogOutIcon } from 'lucide-react'
 import { useState, useEffect, createContext, useContext } from 'react'
@@ -129,6 +131,24 @@ export const Route = createRootRoute({
             const userData = await userRes.json()
             setUserType(userData.type)
           }
+
+        if (!(window as any).__MY_PRIV__) {
+            try {
+              const storedKey = await getKey('master_priv_key');
+              if (storedKey) {
+                  console.log("Restore key from IndexDB");
+                  
+                  if (storedKey instanceof Uint8Array) {
+                    (window as any).__MY_PRIV__ = storedKey;
+                  } else {
+                    const raw = await crypto.subtle.exportKey("raw", storedKey as CryptoKey);
+                    (window as any).__MY_PRIV__ = new Uint8Array(raw);
+                  }
+
+                  (window as any).__SIGN_PRIV__ = deriveEd25519FromX25519((window as any).__MY_PRIV__).privateKey;
+              }
+            } catch (e) { console.error("Error during key restore", e); }
+        }
         }
       } catch (error) {
         setIsAuthenticated(false)
@@ -169,6 +189,9 @@ export const Route = createRootRoute({
       } catch (error) {
         console.error('Logout request failed', error)
       } finally {
+        await deleteKey('master_priv_key'); // delete from indexDB
+        delete (window as any).__MY_PRIV__; // delete from ram
+        delete (window as any).__SIGN_PRIV__;
         document.cookie = 'sessionid=; expires=Thu, 01 Jan 1970 00:00:00 UTC; path=/; secure; samesite=lax';
         document.cookie = 'csrftoken=; expires=Thu, 01 Jan 1970 00:00:00 UTC; path=/; secure; samesite=lax';
         setIsAuthenticated(false);
