@@ -48,6 +48,12 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { RadioGroup, RadioGroupItem } from "@/components/ui/radio-group";
 import {
+  validateEmail,
+  validateName,
+  validateDeviceName,
+  validateOrg,
+} from "../lib/inputValidation";
+import {
   Card,
   CardContent,
   CardDescription,
@@ -351,20 +357,25 @@ const handleGenerateCertificate = async () => {
       }
       const recaptcha_token = await executeRecaptcha("register");
 
-      const payload: any = {
-        email: (formData.get("email") as string).trim().toLowerCase(),
-        first_name: (formData.get("firstName") as string),
-        last_name: (formData.get("lastName") as string),
-        type: userType,
-        date_of_birth:
-          userType === "patient" ? (formData.get("dateOfBirth") as string) : null,
-        medical_organization:
-          userType === "doctor"
-            ? (formData.get("medicalOrganization") as string) : "",
+      // 1) inputs validés / normalisés
+	const email = validateEmail(formData.get("email"));
+	const first = validateName(formData.get("firstName"), "First name");
+	const last = validateName(formData.get("lastName"), "Last name");
+	const deviceName = validateDeviceName(formData.get("deviceName"));
+	const org = validateOrg(formData.get("medicalOrganization"));
 
-        device_name: (formData.get("deviceName") as string) || "",
-        recaptcha_token,
-      };
+// 2) payload final (identique fonctionnellement, mais clean)
+	const payload: any = {
+  	email,
+  	first_name: first,
+  	last_name: last,
+  	type: userType,
+  	date_of_birth: userType === "patient" ? ((formData.get("dateOfBirth") as string) || "").trim() : null,
+  	medical_organization: userType === "doctor" ? org : "",
+  	device_name: deviceName,
+  	recaptcha_token,
+	};
+
 
       if (userType === "doctor") {
         if (!certFile) {
@@ -376,7 +387,11 @@ const handleGenerateCertificate = async () => {
         if (!doctorRsaPrivB64) {
           throw new Error("Private key not generated - please generate certificate first");
         }
-        payload.certificate = await certFile.text();
+        const certText = await certFile.text();
+	if (certText.length > 20000 || !certText.includes("BEGIN CERTIFICATE") || !certText.includes("END CERTIFICATE")) {
+  	throw new Error("Invalid certificate file");
+}
+payload.certificate = certText;
       }
 
       // check already authen
