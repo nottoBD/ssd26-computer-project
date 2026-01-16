@@ -177,6 +177,11 @@ def remove_doctor(request, doctor_id):
             del record.encrypted_deks[str(doctor_id)]
             record.save()
 
+        pending = PendingRequest.objects.filter(requester=doctor, target=request.user, type='appointment', status='approved').first()
+        if pending:
+            pending.status = 'revoked'
+            pending.save()
+
         metadata = {
             'time': timezone.now().isoformat(),
             'size': 0,  # No data size for removal
@@ -388,6 +393,9 @@ def request_appointment(request):
         if abs((now - req_time).total_seconds()) > 300:  # 5 minutes
             return Response({'error': 'Request timestamp too old'}, status=400)
 
+        if PendingRequest.objects.filter(requester=request.user, target=patient, type='appointment', status='pending').exists():
+            return Response({'error': 'Pending request already exists'}, status=400)
+
         # Store with cert for non-repudiation
         PendingRequest.objects.create(
             requester=request.user,
@@ -395,7 +403,7 @@ def request_appointment(request):
             type='appointment',
             details={},
             signature=signature,
-            cert_chain={'doctor': cert_pem}  # Store just doctor cert
+            cert_chain={'doctor': cert_pem}  # doctor cert
         )
 
         metadata = {
@@ -419,7 +427,7 @@ def get_pending_requests(request):
     if request.user.type != User.Type.DOCTOR:
         return Response({'error': 'Doctors only'}, status=403)
     requests = PendingRequest.objects.filter(requester=request.user)
-    data = [{'id': str(r.id), 'type': r.type, 'status': r.status, 'details': r.details, 'patient_name': f"{r.target.first_name} {r.target.last_name}"} for r in requests]
+    data = [{'id': str(r.id), 'type': r.type, 'status': r.status, 'patient_id': str(r.target.id), 'patient_name': f"{r.target.first_name} {r.target.last_name}", 'timestamp': r.created_at.isoformat(), 'details': r.details} for r in requests]
     return Response({'requests': data})
 
 @api_view(['GET'])
@@ -678,6 +686,38 @@ def deny_pending(request, pk):
     }
     logger.info(json.dumps(metadata))
     return Response({'status': 'rejected'})
+
+@api_view(['POST'])
+@permission_classes([IsAuthenticated])
+def init_dek(request):
+    if request.user.type != User.Type.PATIENT:
+        return Response({'error': 'Patients only'}, status=403)
+
+    encrypted_dek_self = request.data.get('encrypted_dek_self')
+    if not encrypted_dek_self:
+        return Response({'error': 'Missing encrypted_dek_self'}, status=400)
+
+    try:
+        record, created = PatientRecord.objects.get_or_create(patient=request.user)
+    except Exception as e:
+        logger.exception("Failed to get or create PatientRecord")
+        return Response({'error': 'Record access failed'}, status=500)
+
+    if "self" in record.encrypted_deks:
+        return Response({'error': 'DEK already initialized'}, status=400)
+
+    record.encrypted_deks["self"] = encrypted_dek_self
+    record.save()
+
+    metadata = {
+        'time': timezone.now().isoformat(),
+        'size': len(encrypted_dek_self),
+        'privileges': 'init_dek',
+        'tree_depth': 1,
+    }
+    logger.info(json.dumps(metadata))
+
+    return Response({'status': 'DEK initialized'})
 
 @api_view(['GET'])
 def health(request):
