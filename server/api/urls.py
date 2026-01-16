@@ -1,5 +1,5 @@
 from django.urls import path
-from .views import health, get_my_record, update_my_record, appoint_doctor, get_patient_record, get_user_public_key, remove_doctor, get_my_doctors, get_current_user, search_doctors, get_my_patients, update_user_keys, get_my_cert_chain, request_appointment, search_patients, get_pending_requests, get_pending_appointments,  approve_pending, deny_pending, get_pending_received, create_pending_request, init_dek
+from .views import health, get_my_record, update_my_record, appoint_doctor, get_patient_record, get_user_public_key, remove_doctor, get_my_doctors, get_current_user, search_doctors, get_my_patients, update_user_keys, get_my_cert_chain, request_appointment, search_patients, get_pending_requests, get_pending_appointments,  approve_pending, deny_pending, get_pending_received, create_pending_request, init_dek, get_pending_file_requests
 from .ca import ca_root, ca_sign, ca_verify
 
 urlpatterns = [
@@ -26,6 +26,7 @@ urlpatterns = [
     path('pending/received/', get_pending_received),  # GET for patient's received pendings
     path('pending/<int:pk>/deny/', deny_pending),
     path('pending/create/', create_pending_request),
+    path('pending/file_requests/', get_pending_file_requests),
 
     path('record/my/', get_my_record),
     path('record/patient/<uuid:patient_id>/', get_patient_record),

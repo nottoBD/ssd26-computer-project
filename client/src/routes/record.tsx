@@ -34,10 +34,8 @@
  *      - Can list appointed patients and view a selected patient record (read-only).
  *      - Cannot directly modify record; instead submits encrypted "pending requests" to patient.
  */
-
-
 import { useState, useEffect, useMemo } from 'react'
-import { createFileRoute, Link, useNavigate, useSearch } from '@tanstack/react-router'
+import { createFileRoute, Link, useNavigate, useSearch, Outlet } from '@tanstack/react-router'
 import { Input } from '@/components/ui/input'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent, CardFooter, CardHeader, CardTitle } from '@/components/ui/card'
@@ -46,10 +44,11 @@ import { Textarea } from '@/components/ui/textarea'
 import { redirect } from '@tanstack/react-router'
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogTrigger, DialogFooter, DialogDescription } from '@/components/ui/dialog'
 import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuTrigger, DropdownMenuSeparator, DropdownMenuSub, DropdownMenuSubContent, DropdownMenuSubTrigger, DropdownMenuPortal, DropdownMenuLabel } from '@/components/ui/dropdown-menu'
-import { ChevronDown, ChevronRight, Folder, FileText, MoreVertical, Plus, Upload, Edit, Trash, User, Calendar, Shield, Key } from 'lucide-react'
-import { encryptAES, decryptAES, signEd25519, verifyEd25519, ecdhSharedSecret, deriveEd25519FromX25519, randomBytes, bytesToHex, hexToBytes, generateX25519Keypair, getX25519PublicFromPrivate } from '../components/CryptoUtils'
+import { ChevronDown, ChevronRight, Folder, FileText, MoreVertical, Plus, Upload, Edit, Trash, User, Calendar, Shield, Key, Stethoscope } from 'lucide-react'
+import { encryptAES, decryptAES, signEd25519, verifyEd25519, ecdhSharedSecret, deriveEd25519FromX25519, randomBytes, bytesToHex, hexToBytes, generateX25519Keypair, getX25519PublicFromPrivate, bytesToBase64, base64ToBytes } from '../components/CryptoUtils'
 import { useAuth } from './__root'
 import { Document, Page, pdfjs } from 'react-pdf';
+import { saveKey, getKey } from "../lib/key-store";
 
 
 interface RecordNode {
@@ -82,6 +81,13 @@ interface AppointedDoctor {
   name: string
   org: string
 }
+
+interface CertChain {
+  root: string;
+  intermediate: string;
+  doctor: string;
+}
+
 /**
  * ROUTE GUARD: beforeLoad
  *
@@ -133,21 +139,11 @@ export const Route = createFileRoute('/record')({
  * SECURITY RATIONALE:
  *  - Enables the patient to decrypt their own DEK without involving any doctor keys.
  *  - Note: hashing a private key into a KEK is a pragmatic derivation; in a hardened design,
- *    HKDF with context info would be preferable to avoid key reuse across domains.
+ *    HKDF with context info would be preferable to avoid key reuse across domains across domains.
  */
 async function deriveMasterKEK(priv: Uint8Array): Promise<Uint8Array> {
   const digest = await crypto.subtle.digest('SHA-256', priv);
   return new Uint8Array(digest);
-}
-
-function bytesToBase64(bytes: Uint8Array): string {
-  const binString = Array.from(bytes, (byte) => String.fromCharCode(byte)).join('');
-  return btoa(binString);
-}
-
-function base64ToBytes(base64: string): Uint8Array {
-  const binString = atob(base64);
-  return new Uint8Array(binString.length).map((_, i) => binString.charCodeAt(i));
 }
 
 
@@ -204,6 +200,9 @@ function RecordPage() {
   const [rotateOpen, setRotateOpen] = useState(false)
   const [inputPrivOpen, setInputPrivOpen] = useState(false)
   const [inputPriv, setInputPriv] = useState('')
+  const [certChain, setCertChain] = useState<CertChain | null>(null);
+  const [inputCertPrivOpen, setInputCertPrivOpen] = useState(false);
+  const [inputCertPriv, setInputCertPriv] = useState("");
   const [rawRecordData, setRawRecordData] = useState<{ encrypted_data: string; signature: string; encrypted_deks: Record<string, string>; encrypted_dek?: string } | null>(null)
   const [refreshKey, setRefreshKey] = useState(0);
 
@@ -214,6 +213,18 @@ function RecordPage() {
     }, {});
   }, [appointedDoctors]);
 
+const fixTree = (node: RecordNode): RecordNode => {
+      if (!node.name) {
+        node.name = 'untitled';
+      }
+      if (node.children && Array.isArray(node.children)) {
+        node.children = node.children
+          .filter(child => child != null && typeof child === 'object')
+          .map(fixTree);
+      }
+      return node;
+    }
+
   useEffect(() => {
     pdfjs.GlobalWorkerOptions.workerSrc = new URL(
       'pdfjs-dist/build/pdf.worker.min.mjs',
@@ -222,54 +233,40 @@ function RecordPage() {
   }, []);
 
   useEffect(() => {
-    const stored = sessionStorage.getItem('x25519_priv_b64');
-    if (stored) {
-      window.__MY_PRIV__ = base64ToBytes(stored);
-    }
-  }, []);
-
-  useEffect(() => {
     setNumPages(null);
     setCurrentPage(1);
   }, [selectedPath]);
 
   useEffect(() => {
-    // Fetch user info
-    /**
-    * EFFECT: initialize record context after user load
-    *
-    * PURPOSE:
-    *      Loads cryptographic context (private key), verifies key consistency,
-    *      then loads the correct record depending on role (patient vs doctor).
-    *
-    * FLOW:
-    *  1) Ensure X25519 private key is available:
-    *      - Prefer window.__MY_PRIV__ (set during login), else sessionStorage fallback.
-    *      - If missing, force user to input private key (password manager fallback).
-    *  2) Verify private key matches the public key stored server-side:
-    *      - derivedPub(priv) must equal server public_key
-    *      - prevents mismatch and prevents false decrypt/sign verification attempts
-    *  3) Patient:
-    *      - Fetch own record (/api/record/my/)
-    *      - Fetch appointed doctors
-    *  4) Doctor with patientId:
-    *      - Fetch patient's encryption public key + signing public key
-    *      - Fetch patient record (/api/record/patient/{id}/) and decrypt using shared secret
-    *  5) Doctor without patientId:
-    *      - List appointed patients
- */
+    const stored = sessionStorage.getItem('x25519_priv_b64');
+    if (stored) {
+      window.__MY_PRIV__ = base64ToBytes(stored);
+    }
+    async function loadCertKey() {
+      if (user?.type === "doctor") {
+        const storedCert = await getKey('cert_priv');
+        if (storedCert) {
+          window.__MY_CERT_PRIV__ = storedCert as Uint8Array;
+        }
+      }
+    }
+    loadCertKey();
+  }, [user]);
 
-    fetch('/api/user/me/')
-      .then(async (r) => {
-        if (!r.ok) throw new Error(await r.text())
-        return r.json()
-      })
-      .then((data: User) => setUser(data))
-      .catch((err) => {
-        console.error('User fetch failed:', err)
-        setError(err.message)
-      })
-  }, [])
+  useEffect(() => {
+    const fetchUser = async () => {
+      try {
+        const r = await fetch('/api/user/me/');
+        if (!r.ok) throw new Error(await r.text());
+        const data = await r.json();
+        setUser(data);
+      } catch (err) {
+        console.error('User fetch failed:', err);
+        setError(err.message);
+      }
+    };
+    fetchUser();
+  }, []);
 
 useEffect(() => {
   if (!user) return
@@ -297,6 +294,13 @@ useEffect(() => {
     } else {
       setInputPrivOpen(true);
       return;
+    }
+
+    if (user.type === 'doctor') {
+      fetchCertChain();
+      if (!window.__MY_CERT_PRIV__) {
+        setInputCertPrivOpen(true);
+      }
     }
 
     if (user.type === 'patient') {
@@ -434,7 +438,7 @@ useEffect(() => {
       } else {
         if (!patientPubBytes) throw new Error('Patient public key required')
         const shared = await ecdhSharedSecret(window.__MY_PRIV__, patientPubBytes)
-const sharedHash = bytesToHex(new Uint8Array(await crypto.subtle.digest('SHA-256', shared)));
+        const sharedHash = bytesToHex(new Uint8Array(await crypto.subtle.digest('SHA-256', shared)));
 console.log(`Doctor-side shared hash for patient ${patientId}: ${sharedHash}`);
         
         dek = await decryptDEK(encDek, shared)
@@ -582,6 +586,34 @@ try {
   setError((err as Error).message)  // Now shows the mismatch error
 }
 }
+
+const handleCertPrivInput = async () => {
+  try {
+    const newCertPriv = base64ToBytes(inputCertPriv);
+    window.__MY_CERT_PRIV__ = newCertPriv;
+    await saveKey('cert_priv', newCertPriv);
+    setInputCertPrivOpen(false);
+    setInputCertPriv("");
+  } catch (err) {
+    setError("Invalid certificate private key");
+  }
+};
+
+const fetchCertChain = async () => {
+  try {
+    const r = await fetch("/api/ca/my_chain/");
+    if (!r.ok) throw new Error(await r.text());
+    const data = await r.json();
+    setCertChain({
+      root: data.root_pem,
+      intermediate: data.intermediate_pem,
+      doctor: data.doctor_pem,
+    });
+  } catch (err) {
+    console.error("Cert chain fetch failed:", err);
+    setError("Failed to load PKI chain. Signing disabled.");
+  }
+};
 
 /**
  * FUNCTION: fetchAppointedDoctors
@@ -866,7 +898,7 @@ const updateRecord = async (rotate = false) => {
  *  5) Send encrypted_dek to backend appointment endpoint.
  *
  * SECURITY NOTES:
- *  - This implements the “capability” model: doctor can decrypt only if they can derive shared_secret.
+ *  - This implements the “capability” model: doctor can decrypt only if they can derive the shared_secret.
  *  - No plaintext DEK is ever sent.
  */
 
@@ -921,7 +953,7 @@ console.log(`Patient-side shared hash for doctor ${doctorId}: ${sharedHash}`);
   const findNode = (root: RecordNode, path: string[]): RecordNode | null => {
     let current = root
     for (const p of path) {
-      if (!current.children) return null
+      if (!current.children || !Array.isArray(current.children)) return null
       const child = current.children.find((c) => c.name === p)
       if (!child) return null
       current = child
@@ -983,7 +1015,8 @@ console.log(`Patient-side shared hash for doctor ${doctorId}: ${sharedHash}`);
     const parentPath = path.slice(0, -1)
     const parent = findNode(newRecord, parentPath) || newRecord
     if (parent.type !== 'folder' || !parent.children) return
-    const index = parent.children.findIndex((c) => c.name === path[path.length - 1])
+    const lastName = path[path.length - 1]
+    const index = parent.children.findIndex((c) => c.name === lastName)
     if (index > -1) parent.children.splice(index, 1)
     setRecord(newRecord)
     setIsDirty(true)
@@ -1096,12 +1129,6 @@ console.log(`Patient-side shared hash for doctor ${doctorId}: ${sharedHash}`);
                   {node.addedBy && node.addedBy !== 'self' && !isRoot && (
                     <>
                       <DropdownMenuSeparator />
-                      <DropdownMenuItem disabled>
-                        Approve
-                      </DropdownMenuItem>
-                      <DropdownMenuItem disabled>
-                        Revoke
-                      </DropdownMenuItem>
                     </>
                   )}
                 </DropdownMenuContent>
@@ -1151,76 +1178,154 @@ console.log(`Patient-side shared hash for doctor ${doctorId}: ${sharedHash}`);
             </DropdownMenu>
           </div>
         </div>
-        {isFolder && isOpen && node.children?.map((child, i) => (
+        {isFolder && isOpen && node.children?.filter(child => child && child.name && typeof child.name === 'string').map((child, i) => (
           <RenderTree key={i} node={child} path={[...path, child.name]} level={level + 1} />
         ))}
       </div>
     )
   }
 
-  const handleRequest = async () => {
-    if (!patientId || !patientPub || !requestType) return
 
-    if (!window.__MY_PRIV__) {
-      setInputPrivOpen(true)
-      return
-    }
-
-    let body: any = { type: requestType, patient: patientId }
-    if (requestType.startsWith('add')) {
-      body.path = selectedPath.join('/')
-      body.name = requestName
-    } else {
-      body.path = selectedPath.join('/')
-    }
-    let metadata = { time: new Date().toISOString(), size: 0, privileges: 'doctor', tree_depth: selectedPath.length }
-
-    if (requestType.includes('text') || requestType.includes('binary')) {
-      const dek = randomBytes(32)
-      let rawContent: string
-      if (requestType.includes('binary')) {
-        if (!requestFile) return
-        rawContent = await readFileAsBase64(requestFile)
-      } else {
-        rawContent = requestContent
-      }
-      const raw = new TextEncoder().encode(rawContent)
-      const encrypted = await encryptAES(raw, dek)
-      const concatenated = new Uint8Array([...encrypted.iv, ...encrypted.ciphertext, ...encrypted.tag])
-      const edPriv = deriveEd25519FromX25519(window.__MY_PRIV__).privateKey
-      const sig = signEd25519(concatenated, edPriv)
-      const shared = await ecdhSharedSecret(window.__MY_PRIV__, patientPub)
-      const encryptedDek = await encryptAES(dek, shared)
-      const encryptedDekStr = bytesToBase64(new Uint8Array([...encryptedDek.iv, ...encryptedDek.ciphertext, ...encryptedDek.tag]))
-
-      body.encrypted_data = bytesToBase64(concatenated)
-      body.encrypted_dek = encryptedDekStr
-      body.signature = bytesToBase64(sig)
-      body.mime = requestType.includes('text') ? 'text/plain' : (requestFile?.type || 'application/octet-stream')
-      metadata.size = concatenated.length
-    }
-
-    body.metadata = metadata
-
-    try {
-      const r = await fetch('/api/pending/', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json', 'X-CSRFToken': getCookie('csrftoken') || '' },
-        credentials: 'include',
-        body: JSON.stringify(body),
-      })
-      if (!r.ok) console.error('Request error:', await r.text())
-      else alert('Request sent')
-      setRequestDialogOpen(false)
-      setRequestType(null)
-      setRequestName('')
-      setRequestContent('')
-      setRequestFile(null)
-    } catch (err) {
-      console.error('Request failed:', err)
-    }
+const handleRequest = async () => {
+  if (!patientId || !requestType) {
+    setError("Selection missing");
+    return
+  }
+  if (!window.__MY_PRIV__) {
+    setInputPrivOpen(true);
+    return;
+  }
+  if (!window.__MY_CERT_PRIV__) {
+    setInputCertPrivOpen(true);
+    return;
+  }
+  if (!certChain) {
+    setError("PKI chain missing");
+    return
   }
 
+  if ((requestType.startsWith('add') || requestType.startsWith('edit')) && !requestName?.trim()) {
+    if (requestType.includes('binary') && requestFile && requestFile.name) {
+      setRequestName(requestFile.name);
+      } else {
+        setError("Name is required");
+        return;
+  }
+  }
+  try {
+    let details: any = {};
+    let treeDepth = requestType.startsWith('add') ? selectedPath.length + 1 : selectedPath.length;
+    if (requestType.startsWith("add")) {
+      details.path = selectedPath.join('/');
+      details.name = requestName;
+    } else {
+      details.path = selectedPath.join('/');
+    }
+
+    let encryptedDataLength = 0;
+    if (requestType.includes("text") || requestType.includes("binary")) {
+      const dek = randomBytes(32);
+      let rawContent: Uint8Array;
+      let mime: string;
+      if (requestType.includes("binary")) {
+        if (!requestFile) return setError("File required");
+        const base64 = await readFileAsBase64(requestFile);
+        rawContent = base64ToBytes(base64);
+        mime = requestFile.type;
+      } else {
+        rawContent = new TextEncoder().encode(requestContent);
+        mime = "text/plain";
+      }
+      const encrypted = await encryptAES(rawContent, dek);
+      const concatenated = new Uint8Array([
+        ...encrypted.iv,
+        ...encrypted.ciphertext,
+        ...encrypted.tag,
+      ]);
+      details.encrypted_data = bytesToBase64(concatenated);
+      encryptedDataLength = concatenated.length;
+      details.mime = mime;
+      // Encrypt DEK with patient's pub
+      const shared = await ecdhSharedSecret(
+        window.__MY_PRIV__,
+        patientPub!
+      );
+      const encryptedDek = await encryptAES(dek, shared);
+      details.encrypted_dek = bytesToBase64(
+        new Uint8Array([
+          ...encryptedDek.iv,
+          ...encryptedDek.ciphertext,
+          ...encryptedDek.tag,
+        ])
+      );
+    }
+
+    const timestamp = new Date().toISOString();
+    const metadata = {
+      time: timestamp,
+      size: encryptedDataLength,
+      privileges: 'doctor',
+      tree_depth: treeDepth,
+    };
+
+    const requestMsg = new TextEncoder().encode(
+      JSON.stringify({
+        type: requestType,
+        patient_id: patientId,
+        details,
+        timestamp: timestamp,
+      }),
+    );
+
+    const certPrivKey = await crypto.subtle.importKey(
+      "pkcs8",
+      window.__MY_CERT_PRIV__,
+      {
+        name: "RSASSA-PKCS1-v1_5",
+        hash: "SHA-256",
+      },
+      false,
+      ["sign"]
+    );
+
+    const signature = await crypto.subtle.sign(
+      "RSASSA-PKCS1-v1_5",
+      certPrivKey,
+      requestMsg
+    );
+    const signatureB64 = bytesToBase64(new Uint8Array(signature));
+
+    const body = {
+      signature: signatureB64,
+      cert: certChain.doctor,
+      type: requestType,
+      patient: patientId,
+      timestamp: timestamp,
+      details,
+      metadata,
+    };
+
+    const res = await fetch("/api/pending/create/", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "X-CSRFToken": getCookie("csrftoken") || "",
+      },
+      credentials: "include",
+      body: JSON.stringify(body),
+    });
+    if (!res.ok) throw new Error(await res.text());
+    alert("File request sent. Awaiting patient approval.");
+    setRequestDialogOpen(false);
+    setRequestType(null);
+    setRequestName("");
+    setRequestContent("");
+    setRequestFile(null);
+  } catch (err) {
+    console.error("File request failed:", err);
+    setError((err as Error).message);
+  }
+}
   if (error) {
     return <div>Error: {error}</div>
   }
@@ -1229,8 +1334,8 @@ console.log(`Patient-side shared hash for doctor ${doctorId}: ${sharedHash}`);
 
   const isPatient = user.type === 'patient'
   const header = isPatient ? `Medical Record ${patientInfo?.name || ''}` : patientId ? `Patient Record: ${patientInfo?.name || ''} (DOB: ${patientInfo?.dob || ''})` : 'My Appointed Patients'
-  const selectedNode = record ? findNode(record, selectedPath) : null
-  
+  const selectedNode = record ? findNode(record, selectedPath) : null  
+
 
   return (
     <div className="max-w-6xl mx-auto p-4 sm:p-6 lg:p-8">
@@ -1371,6 +1476,9 @@ console.log(`Patient-side shared hash for doctor ${doctorId}: ${sharedHash}`);
                     </DialogContent>
                   </Dialog>
                 </CardFooter>}
+                {!isPatient && <CardFooter>
+                  <Button variant="outline" onClick={handleRefresh}>Refresh Record</Button>
+                </CardFooter>}
               </Card>
             </div>
           )}
@@ -1408,7 +1516,7 @@ console.log(`Patient-side shared hash for doctor ${doctorId}: ${sharedHash}`);
               </Table>
             )}
           </CardContent>
-          <CardFooter>
+          <CardFooter className="flex justify-between">
             <Dialog open={addDoctorDialogOpen} onOpenChange={setAddDoctorDialogOpen}>
               <DialogTrigger asChild>
                 <Button><Plus className="w-4 h-4 mr-2" /> Add Doctor</Button>
@@ -1428,6 +1536,7 @@ console.log(`Patient-side shared hash for doctor ${doctorId}: ${sharedHash}`);
                 </div>
               </DialogContent>
             </Dialog>
+                      <Button variant="outline" onClick={() => navigate({ to: '/doctor' })}><Stethoscope className="mr-2 h-4 w-4" /> View Doctor Requests</Button>
           </CardFooter>
         </Card>
       )}
@@ -1489,32 +1598,32 @@ console.log(`Patient-side shared hash for doctor ${doctorId}: ${sharedHash}`);
         }
       }}>
         <DialogContent aria-describedby={undefined}>
-          <DialogHeader>
-            <DialogTitle>Request {requestType?.replace('_', ' ').replace('add', 'Add').replace('edit', 'Edit')}</DialogTitle>
-          </DialogHeader>
-          {requestType && (requestType.startsWith('add') || requestType.startsWith('edit')) ? (
-            <>
-              {(requestType !== 'add_folder') && <Input placeholder="Name" value={requestName} onChange={(e) => setRequestName(e.target.value)} />}
-              {(requestType === 'add_text' || requestType === 'edit_text') && (
-                <Textarea placeholder="Content" value={requestContent} onChange={(e) => setRequestContent(e.target.value)} />
-              )}
-              {(requestType === 'add_binary' || requestType === 'edit_binary') && (
-                <Input type="file" onChange={(e) => {
-                  const file = e.target.files?.[0]
-                  if (file) {
-                    setRequestName(file.name)
-                    setRequestFile(file)
-                  }
-                }} />
-              )}
-            </>
-          ) : requestType === 'delete' ? (
-            <p>Request to delete {selectedNode?.name}?</p>
-          ) : null}
-          <DialogFooter>
-            <Button onClick={handleRequest}>Submit Request</Button>
-          </DialogFooter>
-        </DialogContent>
+  <DialogHeader>
+    <DialogTitle>Request {requestType?.replace('_', ' ').replace('add', 'Add').replace('edit', 'Edit')}</DialogTitle>
+  </DialogHeader>
+  {requestType && (requestType.startsWith('add') || requestType.startsWith('edit')) ? (
+    <>
+      {requestType.startsWith('add') && <Input placeholder="Name" value={requestName} onChange={(e) => setRequestName(e.target.value)} />}
+      {(requestType === 'add_text' || requestType === 'edit_text') && (
+        <Textarea placeholder="Content" value={requestContent} onChange={(e) => setRequestContent(e.target.value)} />
+      )}
+      {(requestType === 'add_binary' || requestType === 'edit_binary') && (
+        <Input type="file" onChange={(e) => {
+          const file = e.target.files?.[0]
+          if (file) {
+            if (requestType.startsWith('add')) setRequestName(file.name)
+            setRequestFile(file)
+          }
+        }} />
+      )}
+    </>
+  ) : requestType === 'delete' ? (
+    <p>Request to delete {selectedNode?.name}?</p>
+  ) : null}
+  <DialogFooter>
+    <Button onClick={handleRequest}>Submit Request</Button>
+  </DialogFooter>
+</DialogContent>
       </Dialog>
 
       {/* Input Priv Dialog */}
@@ -1533,6 +1642,28 @@ console.log(`Patient-side shared hash for doctor ${doctorId}: ${sharedHash}`);
         </DialogContent>
       </Dialog>
 
+      {/* Input Cert Priv Dialog */}
+      <Dialog open={inputCertPrivOpen} onOpenChange={setInputCertPrivOpen}>
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>Enter Certificate Private Key</DialogTitle>
+            <DialogDescription>
+              Paste the PKI-signed Certificate Private Key from your password
+              manager. This is required for signing file change requests.
+            </DialogDescription>
+          </DialogHeader>
+          <Input
+            type="password"
+            value={inputCertPriv}
+            onChange={(e) => setInputCertPriv(e.target.value)}
+            placeholder="Base64 certificate private key..."
+          />
+          <DialogFooter>
+            <Button onClick={handleCertPrivInput}>Submit</Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
       <div className="mt-8 p-4 bg-amber-50 rounded-lg flex items-start space-x-4">
         <Shield className="w-6 h-6 text-amber-600" />
         <p className="text-amber-700">Data encrypted end-to-end. Signature verified.</p>
@@ -1540,4 +1671,3 @@ console.log(`Patient-side shared hash for doctor ${doctorId}: ${sharedHash}`);
     </div>
   )
 }
-

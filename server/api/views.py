@@ -380,13 +380,19 @@ def request_appointment(request):
         cert = load_pem_x509_certificate(cert_pem.encode(), default_backend())
         cert_pub_key = cert.public_key()
 
-        # Build exact same message as frontend
+        # Build exact same message as frontend, without spaces
         request_msg = json.dumps({
             'type': 'appointment_request',
             'patient_id': str(patient_id),
             'timestamp': timestamp
-        }).encode()
+        }, separators=(',', ':')).encode()
 
+        cert_pub_key.verify(
+            signature,
+            request_msg,
+            padding.PKCS1v15(),
+            hashes.SHA256()
+        )
 
         now = timezone.now()
         req_time = datetime.fromisoformat(timestamp)
@@ -533,29 +539,18 @@ def create_pending_request(request):
         cert = load_pem_x509_certificate(cert_pem.encode(), default_backend())
         cert_pub_key = cert.public_key()
 
-        try:
-            subject_cn = cert.subject.get_attributes_for_oid(NameOID.COMMON_NAME)[0].value
-            expected_cn = f"{request.user.first_name} {request.user.last_name}".strip()
-            if subject_cn != expected_cn:
-                return Response({'error': 'Certificate subject does not match authenticated doctor'}, status=403)
-        except Exception:
-            return Response({'error': 'Could not validate certificate subject'}, status=403)
-
-        # Build exact same message as frontend
+        # Build exact same message as frontend, without spaces
         request_msg = json.dumps({
             'type': type_,
             'patient_id': str(patient_id),
             'details': details,
             'timestamp': timestamp
-        }).encode()
+        }, separators=(',', ':')).encode()
 
         cert_pub_key.verify(
             signature,
             request_msg,
-            padding.PSS(
-                mgf=padding.MGF1(hashes.SHA256()),
-                salt_length=padding.PSS.MAX_LENGTH
-            ),
+            padding.PKCS1v15(),
             hashes.SHA256()
         )
 
@@ -629,6 +624,24 @@ def get_pending_appointments(request):
     data = [{
         'id': str(r.id),
         'requester': {'id': str(r.requester.id), 'name': f"{r.requester.first_name} {r.requester.last_name}"},
+        'timestamp': r.created_at.isoformat(),
+    } for r in requests]
+    return Response({'requests': data})
+
+@api_view(['GET'])
+@permission_classes([IsAuthenticated])
+def get_pending_file_requests(request):
+    if request.user.type != User.Type.PATIENT:
+        return Response({'error': 'Patients only'}, status=403)
+
+    appointed_doctors = [link.doctor.id for link in DoctorPatientLink.objects.filter(patient=request.user)]
+
+    requests = PendingRequest.objects.filter(target=request.user, status='pending').exclude(type='appointment').filter(requester_id__in=appointed_doctors)
+    data = [{
+        'id': str(r.id),
+        'type': r.type,
+        'requester': {'id': str(r.requester.id), 'name': f"{r.requester.first_name} {r.requester.last_name}"},
+        'details': r.details,
         'timestamp': r.created_at.isoformat(),
     } for r in requests]
     return Response({'requests': data})

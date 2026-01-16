@@ -9,9 +9,9 @@
  *  - Doctor:
  *      • View appointed patients and navigate to /record?patient=...
  *      • Search patients and submit signed appointment requests (PKI-backed)
- *      • Submit signed “pending” requests to modify a patient record (add/edit/delete)
  *  - Patient (when routed here):
  *      • Review and approve/deny incoming appointment requests from doctors
+ *      • Review and approve/deny incoming file change requests from doctors
  *
  * SECURITY:
  *  - Authentication: enforced via beforeLoad() calling /api/webauthn/auth/status/.
@@ -24,7 +24,6 @@
  * SENSITIVE STATE:
  *  - Uses IndexedDB and window.__MY_PRIV__ for E2EE functionality.
  */
-
 import { useState, useEffect } from "react";
 import {
   createFileRoute,
@@ -132,6 +131,14 @@ interface PendingRequest {
   details: any;
 }
 
+interface PendingFileRequest {
+  id: string;
+  type: string;
+  requester: { id: string; name: string };
+  details: any;
+  timestamp: string;
+}
+
 interface PendingAppointment {
   id: string;
   requester: { id: string; name: string };
@@ -234,25 +241,11 @@ function UserPortal() {
   const [pendingAppointments, setPendingAppointments] = useState<
     PendingAppointment[]
   >([]);
+  const [pendingFileRequests, setPendingFileRequests] = useState<
+    PendingFileRequest[]
+  >([]);
   const [searchQuery, setSearchQuery] = useState("");
   const [addPatientDialogOpen, setAddPatientDialogOpen] = useState(false);
-  const [fileRequestDialogOpen, setFileRequestDialogOpen] = useState(false);
-  const [selectedPatientId, setSelectedPatientId] = useState<string | null>(
-    null,
-  );
-  const [requestType, setRequestType] = useState<
-    | "add_folder"
-    | "add_text"
-    | "add_binary"
-    | "edit_text"
-    | "edit_binary"
-    | "delete"
-    | null
-  >(null);
-  const [requestName, setRequestName] = useState("");
-  const [requestContent, setRequestContent] = useState("");
-  const [requestFile, setRequestFile] = useState<File | null>(null);
-  const [requestPath, setRequestPath] = useState("");
   const [certChain, setCertChain] = useState<CertChain | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
@@ -260,6 +253,7 @@ function UserPortal() {
   const [inputPriv, setInputPriv] = useState("");
   const [inputCertPrivOpen, setInputCertPrivOpen] = useState(false);
   const [inputCertPriv, setInputCertPriv] = useState("");
+  const [refreshKey, setRefreshKey] = useState(0);
 
   useEffect(() => {
     async function loadKeys() {
@@ -284,9 +278,10 @@ function UserPortal() {
       fetchCertChain();
     } else if (user.type === "patient") {
       fetchPendingAppointments();
+      fetchPendingFileRequests();
     }
     setLoading(false);
-  }, [user]);
+  }, [user, refreshKey]);
 
   const fetchUser = async () => {
     try {
@@ -480,141 +475,6 @@ function UserPortal() {
     }
   };
 
-  const requestFileChange = async () => {
-    if (!selectedPatientId || !requestType) {
-      setError("Selection missing");
-      return;
-    }
-    if (!window.__MY_PRIV__) {
-      setInputPrivOpen(true);
-      return;
-    }
-    if (!window.__MY_CERT_PRIV__) {
-      setInputCertPrivOpen(true);
-      return;
-    }
-    if (!certChain) {
-      setError("PKI chain missing");
-      return;
-    }
-
-    try {
-      let details: any = { path: requestPath };
-      if (requestType.startsWith("add") || requestType.startsWith("edit")) {
-        details.name = requestName;
-        if (requestType.includes("text") || requestType.includes("binary")) {
-          const dek = randomBytes(32);
-          let rawContent: string;
-          if (requestType.includes("binary")) {
-            if (!requestFile) return setError("File required");
-            rawContent = await readFileAsBase64(requestFile);
-            details.mime = requestFile.type;
-          } else {
-            rawContent = requestContent;
-            details.mime = "text/plain";
-          }
-          const raw = new TextEncoder().encode(rawContent);
-          const encrypted = await encryptAES(raw, dek);
-          const concatenated = new Uint8Array([
-            ...encrypted.iv,
-            ...encrypted.ciphertext,
-            ...encrypted.tag,
-          ]);
-          details.encrypted_data = bytesToBase64(concatenated);
-          // Encrypt DEK with patient's pub (fetch if needed)
-          const patPubRes = await fetch(
-            `/api/user/public_key/${selectedPatientId}`,
-          );
-          if (!patPubRes.ok) throw new Error("Patient pub fetch failed");
-          const { public_key } = await patPubRes.json();
-          const patPubBytes = hexToBytes(public_key);
-          const shared = await ecdhSharedSecret(
-            window.__MY_PRIV__,
-            patPubBytes,
-          );
-          const encryptedDek = await encryptAES(dek, shared);
-          details.encrypted_dek = bytesToBase64(
-            new Uint8Array([
-              ...encryptedDek.iv,
-              ...encryptedDek.ciphertext,
-              ...encryptedDek.tag,
-            ]),
-          );
-        }
-      }
-
-      const timestamp = new Date().toISOString();
-      const requestMsg = new TextEncoder().encode(
-        JSON.stringify({
-          type: requestType,
-          patient_id: selectedPatientId,
-          details,
-          timestamp: timestamp,
-        }),
-      );
-
-      const certPrivKey = await crypto.subtle.importKey(
-        "pkcs8",
-        window.__MY_CERT_PRIV__,
-        {
-          name: "RSA-PSS",
-          hash: "SHA-256",
-        },
-        false,
-        ["sign"],
-      );
-
-      // Sign with cert privkey
-      const signature = await crypto.subtle.sign(
-        {
-          name: "RSA-PSS",
-          saltLength: 32,
-        },
-        certPrivKey,
-        requestMsg,
-      );
-      const signatureB64 = bytesToBase64(new Uint8Array(signature));
-
-      const body = {
-        signature: signatureB64,
-        cert: certChain.doctor,
-        type: requestType,
-        patient: selectedPatientId,
-        timestamp: timestamp,
-        details,
-      };
-
-      const res = await fetch("/api/pending/create/", {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          "X-CSRFToken": getCookie("csrftoken") || "",
-        },
-        credentials: "include",
-        body: JSON.stringify(body),
-      });
-      if (!res.ok) throw new Error(await res.text());
-      alert("File request sent. Awaiting patient approval.");
-      fetchPendingRequests();
-      setFileRequestDialogOpen(false);
-      setRequestType(null);
-      setRequestName("");
-      setRequestContent("");
-      setRequestFile(null);
-      setRequestPath("");
-    } catch (err) {
-      console.error("File request failed:", err);
-      setError(err.message);
-    }
-  };
-
-  const readFileAsBase64 = (file: File): Promise<string> =>
-    new Promise((resolve) => {
-      const reader = new FileReader();
-      reader.onload = () => resolve((reader.result as string).split(",")[1]);
-      reader.readAsDataURL(file);
-    });
-
   const viewPatientRecord = (patientId: string) => {
     navigate({ to: "/record", search: { patient: patientId } });
   };
@@ -627,6 +487,18 @@ function UserPortal() {
       setPendingAppointments(requests);
     } catch (err) {
       console.error("Pending appointments fetch failed:", err);
+      setError(err.message);
+    }
+  };
+
+  const fetchPendingFileRequests = async () => {
+    try {
+      const r = await fetch("/api/pending/file_requests/");
+      if (!r.ok) throw new Error(await r.text());
+      const { requests } = await r.json();
+      setPendingFileRequests(requests);
+    } catch (err) {
+      console.error("Pending file requests fetch failed:", err);
       setError(err.message);
     }
   };
@@ -698,6 +570,239 @@ function UserPortal() {
     }
   };
 
+
+const approveFileRequest = async (req: PendingFileRequest) => {
+  if (!window.__MY_PRIV__) {
+    setInputPrivOpen(true);
+    return;
+  }
+  try {
+    // Fetch current record
+    const recordRes = await fetch("/api/record/my/");
+    if (!recordRes.ok) throw new Error("Failed to fetch record");
+    const recordData = await recordRes.json();
+    const encDekSelf = recordData.encrypted_deks["self"];
+    if (!encDekSelf) throw new Error("No self DEK found");
+    const masterKEK = await deriveMasterKEK(window.__MY_PRIV__);
+    let recordDek = await decryptDEK(encDekSelf, masterKEK);
+    let encryptedData = base64ToBytes(recordData.encrypted_data || "");
+    const iv = encryptedData.slice(0, 12);
+    const tag = encryptedData.slice(-16);
+    const ciphertext = encryptedData.slice(12, -16);
+    let dirJson = await decryptAES(ciphertext, recordDek, iv, tag);
+    let dir = JSON.parse(new TextDecoder().decode(dirJson)) || { name: "Root", type: "folder", children: [], metadata: { created: new Date().toISOString(), size: 0 } };
+    // Normalize path
+    let pathStr = (req.details.path || '').trim();
+    if (pathStr.startsWith('/')) pathStr = pathStr.slice(1);
+    if (pathStr.startsWith('Root/')) pathStr = pathStr.slice(5);
+    else if (pathStr.startsWith('Root')) pathStr = pathStr.slice(4);
+    let pathParts = pathStr.split('/').filter(part => part.length > 0);
+    // For add_folder without name, assume last part is name
+    if (req.type === "add_folder" && !req.details.name && pathParts.length > 0) {
+      req.details.name = pathParts.pop();
+    }
+    let current = dir;
+    for (let i = 0; i < pathParts.length; i++) {
+      const part = pathParts[i];
+      if (!current.children) throw new Error(`Path not found: no children for '${part}'`);
+      const child = current.children.find((c: RecordNode) => c.name.toLowerCase() === part.toLowerCase());
+      if (!child) throw new Error(`Path not found: '${part}' missing`);
+      current = child;
+    }
+    if (req.type === "add_folder") {
+      if (req.details.name) {
+        if (!current.children) current.children = [];
+        current.children.push({
+          name: req.details.name,
+          type: "folder",
+          children: [],
+          metadata: { created: new Date().toISOString(), size: 0 },
+          addedBy: req.requester.id
+        });
+      } else {
+        throw new Error("Name required for folder");
+      }
+    } else if (req.type === "delete") {
+      if (req.details.name) {
+        if (!current.children) throw new Error("No children to delete from");
+        const index = current.children.findIndex((c: RecordNode) => c.name.toLowerCase() === req.details.name.toLowerCase());
+        if (index === -1) throw new Error("Item not found for delete");
+        current.children.splice(index, 1);
+      } else if (pathParts.length > 0) {
+        const parentPath = pathParts.slice(0, -1);
+        const parent = getParent(dir, parentPath);
+        if (!parent || !parent.children) throw new Error("Parent not found");
+        const lastName = pathParts[pathParts.length - 1];
+        const index = parent.children.findIndex((c: RecordNode) => c.name === lastName);
+        if (index === -1) throw new Error("Item not found for delete");
+        parent.children.splice(index, 1);
+      } else {
+        throw new Error("Cannot delete root");
+      }
+    } else {
+      // File types: add_text, add_binary, edit_text, edit_binary
+      // Fetch doctor's public key for shared secret
+      const pubRes = await fetch(`/api/user/public_key/${req.requester.id}`);
+      if (!pubRes.ok) throw new Error("Failed to fetch doctor public key");
+      const { public_key } = await pubRes.json();
+      const docPub = hexToBytes(public_key);
+      const shared = await ecdhSharedSecret(window.__MY_PRIV__, docPub);
+      const encDekReq = req.details.encrypted_dek;
+      const reqDekBytes = base64ToBytes(encDekReq);
+      
+      if (reqDekBytes.length !== 60) {
+        throw new Error(`Invalid encrypted DEK length: ${reqDekBytes.length} (expected 60)`);
+      }
+      
+      const reqIv = reqDekBytes.slice(0, 12);
+      const reqTag = reqDekBytes.slice(-16);
+      const reqCipher = reqDekBytes.slice(12, -16);
+      const reqDek = await decryptAES(reqCipher, shared, reqIv, reqTag);
+      const encContent = base64ToBytes(req.details.encrypted_data);
+      const contentIv = encContent.slice(0, 12);
+      const contentTag = encContent.slice(-16);
+
+      if (encContent.length < 28) {
+        throw new Error(`Invalid encrypted content length: ${encContent.length} (min 28)`);
+      }
+      
+      const contentCipher = encContent.slice(12, -16);
+      const contentBytes = await decryptAES(contentCipher, reqDek, contentIv, contentTag);
+      const content = bytesToBase64(contentBytes);
+      const fileObj = {
+        name: req.details.name || pathParts[pathParts.length - 1], // Fallback to last path part if no name
+        type: "file",
+        content: content,
+        mime: req.details.mime,
+        metadata: { created: new Date().toISOString(), size: contentBytes.length },
+        addedBy: req.requester.id
+      };
+      if (!current.children) current.children = [];
+      if (req.type.startsWith("add")) {
+        current.children.push(fileObj);
+      } else if (req.type.startsWith("edit")) {
+        let index: number;
+        if (req.details.name) {
+          index = current.children.findIndex((c: RecordNode) => c.name === req.details.name);
+        } else if (pathParts.length > 0) {
+          const parentPath = pathParts.slice(0, -1);
+          const parent = getParent(dir, parentPath);
+          if (!parent || !parent.children) throw new Error("Parent not found for edit");
+          const lastName = pathParts[pathParts.length - 1];
+          index = parent.children.findIndex((c: RecordNode) => c.name === lastName);
+          if (index === -1) throw new Error("File not found for edit");
+          parent.children[index] = { ...fileObj, name: lastName }; // Keep original name
+          current = parent; // Update current to parent for re-encryption
+        } else {
+          throw new Error("Path required for edit without name");
+        }
+        if (index === -1) throw new Error("File not found for edit");
+        current.children[index] = fileObj;
+      }
+    }
+    // Re-encrypt updated dir
+    const newJson = new TextEncoder().encode(JSON.stringify(dir));
+    const newEncrypted = await encryptAES(newJson, recordDek);
+    const newConcat = new Uint8Array([...newEncrypted.iv, ...newEncrypted.ciphertext, ...newEncrypted.tag]);
+    const newEncB64 = bytesToBase64(newConcat);
+    // Sign
+    const edPriv = deriveEd25519FromX25519(window.__MY_PRIV__).privateKey;
+    const newSig = signEd25519(newConcat, edPriv);
+    const newSigB64 = bytesToBase64(newSig);
+    const metadata = {
+      time: new Date().toISOString(),
+      size: newConcat.length,
+      privileges: 'patient',
+      tree_depth: calculateMaxDepth(dir),
+    };
+    // Update record
+    const updateRes = await fetch("/api/record/update/", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "X-CSRFToken": getCookie("csrftoken") || "",
+      },
+      credentials: "include",
+      body: JSON.stringify({
+        encrypted_data: newEncB64,
+        encrypted_deks: recordData.encrypted_deks,
+        signature: newSigB64,
+        metadata,
+      }),
+    });
+    if (!updateRes.ok) throw new Error("Failed to update record");
+    // Approve request
+    const approveRes = await fetch(`/api/pending/${req.id}/approve/`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "X-CSRFToken": getCookie("csrftoken") || "",
+      },
+      credentials: "include",
+    });
+    if (!approveRes.ok) throw new Error(await approveRes.text());
+    alert("File change approved and applied!");
+    fetchPendingFileRequests();
+    // Refresh the record view if open
+    setRefreshKey(prev => prev + 1);
+  } catch (err) {
+    console.error("File approval failed:", err);
+    setError((err as Error).message);
+  }
+};
+
+// Add this function (used in metadata and delete)
+function calculateMaxDepth(node: any, current = 0): number {
+  if (node.type !== 'folder' || !node.children || node.children.length === 0) return current;
+  return Math.max(...node.children.map((child: any) => calculateMaxDepth(child, current + 1)), current);
+}
+
+// Updated getParent (replace the existing one)
+function getParent(root: any, parts: string[]): any {
+  let current = root;
+  for (let i = 0; i < parts.length; i++) {
+    if (!current.children) return null;
+    const child = current.children.find((c: any) => c.name.toLowerCase() === parts[i].toLowerCase());
+    if (!child) return null;
+    current = child;
+  }
+  return current;
+}
+
+  function calculateMaxDepth(node: any, current = 0): number {
+    if (node.type !== 'folder' || !node.children) return current;
+    return Math.max(...node.children.map((child: any) => calculateMaxDepth(child, current + 1)), current);
+  }
+
+  const denyFileRequest = async (reqId: string) => {
+    if (!confirm("Deny this file change request?")) return;
+    try {
+      const res = await fetch(`/api/pending/${reqId}/deny/`, {
+        method: "POST",
+        headers: { "X-CSRFToken": getCookie("csrftoken") || "" },
+        credentials: "include",
+      });
+      if (!res.ok) throw new Error(await res.text());
+      alert("Request denied.");
+      fetchPendingFileRequests();
+    } catch (err) {
+      setError((err as Error).message);
+    }
+  };
+
+function getParent(root: any, parts: string[]): any {
+  if (parts.length === 0) return null;
+  let current = root;
+  for (let i = 0; i < parts.length - 1; i++) {
+    const part = parts[i];
+    if (!current.children) throw new Error("No children");
+    const child = current.children.find((c: any) => c.name === part);
+    if (!child) throw new Error("Path not found");
+    current = child;
+  }
+  return current;
+}
+
   if (error) return <div>Error: {error}</div>;
   if (!user || loading) return <div>Loading...</div>;
 
@@ -745,15 +850,6 @@ function UserPortal() {
                             onClick={() => viewPatientRecord(pat.id)}
                           >
                             View Record
-                          </Button>
-                          <Button
-                            variant="secondary"
-                            onClick={() => {
-                              setSelectedPatientId(pat.id);
-                              setFileRequestDialogOpen(true);
-                            }}
-                          >
-                            Request File Change
                           </Button>
                         </TableCell>
                       </TableRow>
@@ -880,71 +976,9 @@ function UserPortal() {
             </CardContent>
           </Card>
 
-          {/* File Request Dialog */}
-          <Dialog
-            open={fileRequestDialogOpen}
-            onOpenChange={setFileRequestDialogOpen}
-          >
-            <DialogContent>
-              <DialogHeader>
-                <DialogTitle>Request File Change for Patient</DialogTitle>
-              </DialogHeader>
-              <select
-                value={requestType || ""}
-                onChange={(e) => setRequestType(e.target.value as any)}
-                className="mb-2 p-2 border rounded"
-              >
-                <option value="">Select Action</option>
-                <option value="add_folder">Add Folder</option>
-                <option value="add_text">Add Text File</option>
-                <option value="add_binary">Add Binary File</option>
-                <option value="edit_text">Edit Text File</option>
-                <option value="edit_binary">Replace Binary File</option>
-                <option value="delete">Delete Item</option>
-              </select>
-              <Input
-                placeholder="Path (e.g., folder/subfolder)"
-                value={requestPath}
-                onChange={(e) => setRequestPath(e.target.value)}
-                className="mb-2"
-              />
-              {requestType &&
-                requestType !== "delete" &&
-                requestType !== "add_folder" && (
-                  <Input
-                    placeholder="File Name"
-                    value={requestName}
-                    onChange={(e) => setRequestName(e.target.value)}
-                    className="mb-2"
-                  />
-                )}
-              {requestType &&
-                (requestType === "add_text" || requestType === "edit_text") && (
-                  <Textarea
-                    placeholder="Content"
-                    value={requestContent}
-                    onChange={(e) => setRequestContent(e.target.value)}
-                    className="mb-2"
-                  />
-                )}
-              {requestType &&
-                (requestType === "add_binary" ||
-                  requestType === "edit_binary") && (
-                  <Input
-                    type="file"
-                    onChange={(e) =>
-                      setRequestFile(e.target.files?.[0] || null)
-                    }
-                    className="mb-2"
-                  />
-                )}
-              <DialogFooter>
-                <Button onClick={requestFileChange}>Send Signed Request</Button>
-              </DialogFooter>
-            </DialogContent>
-          </Dialog>
         </>
       ) : (
+        <>
         <Card className="mb-8">
           <CardHeader>
             <CardTitle>Pending Appointment Requests</CardTitle>
@@ -989,6 +1023,55 @@ function UserPortal() {
             )}
           </CardContent>
         </Card>
+        <Card className="mb-8">
+          <CardHeader>
+            <CardTitle>Pending File Change Requests</CardTitle>
+          </CardHeader>
+          <CardContent>
+            {pendingFileRequests.length === 0 ? (
+              <p>No pending file change requests from doctors.</p>
+            ) : (
+              <Table>
+                <TableHeader>
+                  <TableRow>
+                    <TableHead>Type</TableHead>
+                    <TableHead>Doctor</TableHead>
+                    <TableHead>Details</TableHead>
+                    <TableHead>Date</TableHead>
+                    <TableHead>Actions</TableHead>
+                  </TableRow>
+                </TableHeader>
+                <TableBody>
+                  {pendingFileRequests.map((req) => (
+                    <TableRow key={req.id}>
+                      <TableCell>{req.type.replace("_", " ").toUpperCase()}</TableCell>
+                      <TableCell>{req.requester.name}</TableCell>
+                      <TableCell>{`${req.details.path || ""}${req.details.name ? `/${req.details.name}` : ""}`}</TableCell>
+                      <TableCell>
+                        {new Date(req.timestamp).toLocaleString()}
+                      </TableCell>
+                      <TableCell className="space-x-2">
+                        <Button
+                          variant="default"
+                          onClick={() => approveFileRequest(req)}
+                        >
+                          <Check className="w-4 h-4 mr-2" /> Approve
+                        </Button>
+                        <Button
+                          variant="destructive"
+                          onClick={() => denyFileRequest(req.id)}
+                        >
+                          <X className="w-4 h-4 mr-2" /> Deny
+                        </Button>
+                      </TableCell>
+                    </TableRow>
+                  ))}
+                </TableBody>
+              </Table>
+            )}
+          </CardContent>
+        </Card>
+        </>
       )}
 
       {/* Input Priv Dialog */}
