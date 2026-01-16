@@ -61,7 +61,6 @@ function clampEd25519PrivateKey(bytes: Uint8Array): Uint8Array {
   return clamped;
 }
 
-
 /**
  * FUNCTION: deriveKEK
  *
@@ -85,7 +84,6 @@ export async function deriveKEK(prfBytes: Uint8Array): Promise<Uint8Array> {
     32,
   );
 }
-
 
 /**
  * FUNCTION: generateX25519Keypair
@@ -206,7 +204,6 @@ export function ecdhSharedSecret(
   return x25519.getSharedSecret(myPriv, theirPub);
 }
 
-
 /**
  * FUNCTION: signEd25519
  *
@@ -222,8 +219,6 @@ export function signEd25519(data: Uint8Array, priv: Uint8Array): Uint8Array {
   return ed25519.sign(data, priv);
 }
 
-
-
 /**
  * FUNCTION: verifyEd25519
  *
@@ -238,7 +233,6 @@ export function verifyEd25519(
 ): boolean {
   return ed25519.verify(sig, data, pub);
 }
-
 
 /**
  * FUNCTION GROUP: Encoding Helpers
@@ -283,7 +277,6 @@ export function bytesToBase64(bytes: Uint8Array): string {
   return btoa(binString);
 }
 
-
 /**
  * FUNCTION: getX25519PublicFromPrivate
  *
@@ -307,4 +300,8 @@ export function base64ToArrayBuffer(base64: string): ArrayBuffer {
     bytes[i] = binary.charCodeAt(i);
   }
   return bytes.buffer;
+}
+export async function deriveMasterKEK(priv: Uint8Array): Promise<Uint8Array> {
+  const digest = await crypto.subtle.digest("SHA-256", priv);
+  return new Uint8Array(digest);
 }

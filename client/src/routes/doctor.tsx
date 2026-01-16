@@ -18,12 +18,11 @@
  *  - Authorization: backend must enforce that doctors can only act on patients they are allowed to access.
  *  - E2EE: doctor/patient record access relies on X25519 private key presence in-memory (window.__MY_PRIV__),
  *          and key wrapping via ECDH (X25519) + AES-GCM for DEKs.
- *  - Signed actions: doctor requests are signed with an Ed25519 key derived from the doctor’s X25519 private key.
+ *  - Signed actions: doctor requests are signed with their PKI-signed X509 private key.
  *  - PKI: doctor actions attach a CA chain (root/intermediate/doctor) fetched from /api/ca/my_chain/.
  *
  * SENSITIVE STATE:
- *  - Uses sessionStorage('x25519_priv_b64') and window.__MY_PRIV__ for E2EE functionality.
- *    These are sensitive and should be treated as secrets (prototype/debug convenience).
+ *  - Uses IndexedDB and window.__MY_PRIV__ for E2EE functionality.
  */
 
 import { useState, useEffect } from "react";
@@ -87,6 +86,7 @@ import {
   ecdhSharedSecret,
   decryptAES,
 } from "../components/CryptoUtils";
+import { saveKey, getKey } from "../lib/key-store";
 
 /**
  * FUNCTION: getCookie
@@ -126,6 +126,9 @@ interface PendingRequest {
   id: string;
   type: string;
   status: string;
+  patient_id: string;
+  patient_name: string;
+  timestamp: string;
   details: any;
 }
 
@@ -148,18 +151,54 @@ interface User {
 }
 
 /**
- * FUNCTION: Route.beforeLoad
+ * FUNCTION: deriveMasterKEK
  *
  * PURPOSE:
- *      Blocks access to the doctor portal unless the user has a valid authenticated session.
+ *      Derives a local “master key” from the user’s X25519 private key.
+ *      Used to decrypt the patient’s self-wrapped DEK when approving appointment requests.
  *
- * FLOW:
- *  1) GET /api/webauthn/auth/status/ with cookies.
- *  2) If not authenticated → redirect to /login.
+ * METHOD:
+ *      SHA-256(priv) → 32-byte key.
  *
  * SECURITY NOTES:
- *  - This is a UI gate only. Backend must still enforce authorization on every API endpoint.
+ *  - This is a deterministic derivation; compromise of priv implies compromise of this KEK.
+ *  - Works only if the patient’s record is self-wrapped under this same derivation.
  */
+
+const deriveMasterKEK = async (priv: Uint8Array): Promise<Uint8Array> => {
+  const digest = await crypto.subtle.digest("SHA-256", priv);
+  return new Uint8Array(digest);
+};
+
+/**
+ * FUNCTION: decryptDEK
+ *
+ * PURPOSE:
+ *      Decrypts an encrypted DEK blob using AES-GCM.
+ *
+ * INPUT FORMAT:
+ *  - encDekStr is base64 of: [12-byte IV | 32-byte ciphertext | 16-byte tag] = 60 bytes total.
+ *
+ * RETURNS:
+ *      32-byte DEK (raw).
+ *
+ * SECURITY NOTES:
+ *  - Throws on format mismatch or invalid authentication tag.
+ */
+
+const decryptDEK = async (
+  encDekStr: string,
+  key: Uint8Array,
+): Promise<Uint8Array> => {
+  const dekBytes = base64ToBytes(encDekStr);
+  if (dekBytes.length !== 60) {
+    throw new Error(`Invalid encrypted DEK length: ${dekBytes.length}`);
+  }
+  const iv = dekBytes.slice(0, 12);
+  const tag = dekBytes.slice(-16);
+  const ciphertext = dekBytes.slice(12, -16);
+  return await decryptAES(ciphertext, key, iv, tag);
+};
 
 export const Route = createFileRoute("/doctor")({
   beforeLoad: async () => {
@@ -191,10 +230,10 @@ function UserPortal() {
   const [searchedPatients, setSearchedPatients] = useState<SearchedPatient[]>(
     [],
   );
-  const [pendingRequests, setPendingRequests] = useState<PendingRequest[]>([]); // Doctor's own requests
+  const [pendingRequests, setPendingRequests] = useState<PendingRequest[]>([]);
   const [pendingAppointments, setPendingAppointments] = useState<
     PendingAppointment[]
-  >([]); // Patient's incoming requests
+  >([]);
   const [searchQuery, setSearchQuery] = useState("");
   const [addPatientDialogOpen, setAddPatientDialogOpen] = useState(false);
   const [fileRequestDialogOpen, setFileRequestDialogOpen] = useState(false);
@@ -222,67 +261,19 @@ function UserPortal() {
   const [inputCertPrivOpen, setInputCertPrivOpen] = useState(false);
   const [inputCertPriv, setInputCertPriv] = useState("");
 
-
-
-  /**
- * FUNCTION: deriveMasterKEK
- *
- * PURPOSE:
- *      Derives a local “master key” from the user’s X25519 private key.
- *      Used to decrypt the patient’s self-wrapped DEK when approving appointment requests.
- *
- * METHOD:
- *      SHA-256(priv) → 32-byte key.
- *
- * SECURITY NOTES:
- *  - This is a deterministic derivation; compromise of priv implies compromise of this KEK.
- *  - Works only if the patient’s record is self-wrapped under this same derivation.
- */
-
-  const deriveMasterKEK = async (priv: Uint8Array): Promise<Uint8Array> => {
-    const digest = await crypto.subtle.digest("SHA-256", priv);
-    return new Uint8Array(digest);
-  };
-
-
-
-
-/**
- * FUNCTION: decryptDEK
- *
- * PURPOSE:
- *      Decrypts an encrypted DEK blob using AES-GCM.
- *
- * INPUT FORMAT:
- *  - encDekStr is base64 of: [12-byte IV | 32-byte ciphertext | 16-byte tag] = 60 bytes total.
- *
- * RETURNS:
- *      32-byte DEK (raw).
- *
- * SECURITY NOTES:
- *  - Throws on format mismatch or invalid authentication tag.
- */
-
-  const decryptDEK = async (
-    encDekStr: string,
-    key: Uint8Array,
-  ): Promise<Uint8Array> => {
-    const dekBytes = base64ToBytes(encDekStr);
-    if (dekBytes.length !== 60) {
-      throw new Error(`Invalid encrypted DEK length: ${dekBytes.length}`);
-    }
-    const iv = dekBytes.slice(0, 12);
-    const tag = dekBytes.slice(-16);
-    const ciphertext = dekBytes.slice(12, -16);
-    return await decryptAES(ciphertext, key, iv, tag);
-  };
-
   useEffect(() => {
-    const stored = sessionStorage.getItem("x25519_priv_b64");
-    if (stored) {
-      window.__MY_PRIV__ = base64ToBytes(stored);
+    async function loadKeys() {
+      const storedX = sessionStorage.getItem("x25519_priv_b64");
+      if (storedX) {
+        window.__MY_PRIV__ = base64ToBytes(storedX);
+      }
+      const storedCert = await getKey('cert_priv');
+      if (storedCert) {
+        window.__MY_CERT_PRIV__ = storedCert as Uint8Array;
+      }
+      fetchUser();
     }
-    fetchUser();
+    loadKeys();
   }, []);
 
   useEffect(() => {
@@ -297,21 +288,6 @@ function UserPortal() {
     setLoading(false);
   }, [user]);
 
-
-/**
- * FUNCTION: fetchUser
- *
- * PURPOSE:
- *      Loads the current authenticated user identity and type (doctor/patient).
- *
- * FLOW:
- *  1) GET /api/user/me/
- *  2) setUser() with response JSON.
- *
- * SIDE EFFECTS:
- *  - Drives which portal view is rendered and which data fetches occur next.
- */
-
   const fetchUser = async () => {
     try {
       const r = await fetch("/api/user/me/");
@@ -323,24 +299,6 @@ function UserPortal() {
       setError("Failed to load user info");
     }
   };
-
-
-/**
- * FUNCTION: handlePrivInput
- *
- * PURPOSE:
- *      Imports the user-provided X25519 private key (base64) into memory for E2EE operations.
- *
- * FLOW:
- *  1) Decode base64 → Uint8Array and set window.__MY_PRIV__.
- *  2) Persist base64 string in sessionStorage for this browser session.
- *  3) If a PRF-derived KEK exists (window.__KEK__), encrypt and upload encrypted_priv to server.
- *
- * SECURITY NOTES:
- *  - Storing secrets in sessionStorage is a trade-off (usability vs. exposure).
- *  - Consider verifying the private key matches the server public key (as done in /record)
- *    to prevent “wrong key” situations and confusing decryption errors.
- */
 
   const handlePrivInput = async () => {
     try {
@@ -376,47 +334,17 @@ function UserPortal() {
     }
   };
 
-/**
- * FUNCTION: handleCertPrivInput
- *
- * PURPOSE:
- *      Imports the user-provided certificate private key (base64) into memory for signing operations.
- *
- * FLOW:
- *  1) Decode base64 → Uint8Array and set window.__MY_CERT_PRIV__.
- *  2) Persist base64 string in sessionStorage for this browser session.
- *
- * SECURITY NOTES:
- *  - Storing secrets in sessionStorage is a trade-off (usability vs. exposure).
- *  - Assuming the cert privkey is in a format that can be imported for signing (e.g., RSA).
- *  - You may need to adjust the import based on the key type (RSA/ECDSA).
- */
-
   const handleCertPrivInput = async () => {
     try {
       const newCertPriv = base64ToBytes(inputCertPriv);
       window.__MY_CERT_PRIV__ = newCertPriv;
-      sessionStorage.setItem("cert_priv_b64", inputCertPriv);
+      await saveKey('cert_priv', newCertPriv);
       setInputCertPrivOpen(false);
       setInputCertPriv("");
     } catch (err) {
       setError("Invalid certificate private key");
     }
   };
-
-/**
- * FUNCTION: fetchAppointedPatients
- *
- * PURPOSE:
- *      Retrieves the list of patients who have appointed this doctor (authorization boundary).
- *
- * FLOW:
- *  1) GET /api/appoint/patients/
- *  2) setAppointedPatients(patients)
- *
- * SECURITY NOTES:
- *  - Backend must ensure a doctor only sees their own appointed patients.
- */
 
   const fetchAppointedPatients = async () => {
     try {
@@ -430,18 +358,6 @@ function UserPortal() {
     }
   };
 
-
-/**
- * FUNCTION: fetchPendingRequests
- *
- * PURPOSE:
- *      Loads pending requests initiated by the doctor (appointment/file-change requests).
- *
- * FLOW:
- *  1) GET /api/pending/my_requests/
- *  2) setPendingRequests(requests)
- */
-
   const fetchPendingRequests = async () => {
     try {
       const r = await fetch("/api/pending/my_requests/");
@@ -454,20 +370,6 @@ function UserPortal() {
     }
   };
 
- /**
- * FUNCTION: fetchCertChain
- *
- * PURPOSE:
- *      Loads the doctor’s CA-issued certificate chain required for “trusted doctor” actions.
- *
- * FLOW:
- *  1) GET /api/ca/my_chain/
- *  2) Store PEM strings for root, intermediate, and doctor leaf cert.
- *
- * FAILURE MODE:
- *  - If unavailable, doctor actions that require cert_chain should be blocked.
- */
- 
   const fetchCertChain = async () => {
     try {
       const r = await fetch("/api/ca/my_chain/");
@@ -483,21 +385,6 @@ function UserPortal() {
       setError("Failed to load PKI chain. Signing disabled.");
     }
   };
-
-
-/**
- * FUNCTION: searchPatients
- *
- * PURPOSE:
- *      Queries the backend for patients matching a search string (name/DOB/etc.).
- *
- * FLOW:
- *  1) GET /api/patients/search/?q=...
- *  2) setSearchedPatients(patients)
- *
- * SECURITY NOTES:
- *  - Backend should limit data exposure (minimal fields) and apply rate limiting.
- */
 
   const searchPatients = async (q: string) => {
     if (!q) {
@@ -515,122 +402,83 @@ function UserPortal() {
     }
   };
 
+  const requestAppointment = async (patientId: string) => {
+    if (!window.__MY_PRIV__) {
+      setInputPrivOpen(true);
+      return;
+    }
+    if (!window.__MY_CERT_PRIV__) {
+      setInputCertPrivOpen(true);
+      return;
+    }
+    if (!certChain) {
+      setError("PKI chain missing");
+      return;
+    }
 
-/**
- * FUNCTION: requestAppointment
- *
- * PURPOSE:
- *      Sends a doctor→patient appointment request, authenticated with:
- *        (a) Ed25519 signature derived from doctor’s X25519 private key, and
- *        (b) attached CA certificate chain (PKI trust).
- *
- * FLOW:
- *  1) Ensure X25519 private key is loaded (window.__MY_PRIV__).
- *  2) Ensure PKI chain is loaded (certChain).
- *  3) Create request payload (patient_id + timestamp), sign it with Ed25519.
- *  4) POST /api/appoint/request/ with { signature, cert_chain, patient_id }.
- *
- * SECURITY NOTES:
- *  - Backend should validate signature and validate the certificate chain + doctor identity binding.
- *  - Timestamp should be checked server-side to reduce replay window.
- */
+    const existing = pendingRequests.find(
+      r => r.patient_id === patientId && r.status === "pending" && r.type === "appointment"
+    );
+    if (existing) {
+      alert("You already have a pending appointment request for this patient.");
+      return;
+    }
 
-const requestAppointment = async (patientId: string) => {
-  if (!window.__MY_PRIV__) {
-    setInputPrivOpen(true);
-    return;
-  }
-  if (!window.__MY_CERT_PRIV__) {
-    setInputCertPrivOpen(true);
-    return;
-  }
-  if (!certChain) {
-    setError("PKI chain missing");
-    return;
-  }
+    try {
+      const timestamp = new Date().toISOString();
+      const requestMsg = new TextEncoder().encode(
+        JSON.stringify({
+          type: "appointment_request",
+          patient_id: patientId,
+          timestamp: timestamp,
+        }),
+      );
 
-  try {
-    const timestamp = new Date().toISOString();
-    const requestMsg = new TextEncoder().encode(
-      JSON.stringify({
-        type: "appointment_request",
+      // Import RSA private key (matches generation in register.tsx)
+      const certPrivKey = await crypto.subtle.importKey(
+        "pkcs8",
+        window.__MY_CERT_PRIV__,
+        {
+          name: "RSASSA-PKCS1-v1_5",
+          hash: "SHA-256",
+        },
+        false,
+        ["sign"],
+      );
+
+      // Sign using RSASSA-PKCS1-v1_5 (standard for your key)
+      const signature = await crypto.subtle.sign(
+        "RSASSA-PKCS1-v1_5",  // No extra params needed for PKCS#1 v1.5
+        certPrivKey,
+        requestMsg,
+      );
+      const signatureB64 = bytesToBase64(new Uint8Array(signature));
+
+      const body = {
+        signature: signatureB64,
+        cert: certChain.doctor,  // Leaf cert PEM (backend can trust via its CA config)
         patient_id: patientId,
         timestamp: timestamp,
-      }),
-    );
+      };
 
-    // Import RSA private key (matches generation in register.tsx)
-    const certPrivKey = await crypto.subtle.importKey(
-      "pkcs8",
-      window.__MY_CERT_PRIV__,
-      {
-        name: "RSASSA-PKCS1-v1_5",
-        hash: "SHA-256",
-      },
-      false,
-      ["sign"],
-    );
-
-    // Sign using RSASSA-PKCS1-v1_5 (standard for your key)
-    const signature = await crypto.subtle.sign(
-      "RSASSA-PKCS1-v1_5",  // No extra params needed for PKCS#1 v1.5
-      certPrivKey,
-      requestMsg,
-    );
-    const signatureB64 = bytesToBase64(new Uint8Array(signature));
-
-    const body = {
-      signature: signatureB64,
-      cert: certChain.doctor,  // Leaf cert PEM (backend can trust via its CA config)
-      patient_id: patientId,
-      timestamp: timestamp,
-    };
-
-    const res = await fetch("/api/appoint/request/", {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "X-CSRFToken": getCookie("csrftoken") || "",
-      },
-      credentials: "include",
-      body: JSON.stringify(body),
-    });
-    if (!res.ok) throw new Error(await res.text());
-    alert("Appointment request sent. Awaiting patient approval.");
-    fetchPendingRequests();
-    setAddPatientDialogOpen(false);
-  } catch (err) {
-    console.error("Appointment request failed:", err);
-    setError((err as Error).message || "Failed to send appointment request");
-  }
-};
-
-  /**
- * FUNCTION: requestFileChange
- *
- * PURPOSE:
- *      Creates a signed pending request for a patient to approve record changes.
- *      For add/edit with content:
- *        - Encrypts the content client-side
- *        - Encrypts a per-request DEK to the patient using X25519 ECDH
- *        - Signs the request metadata with Ed25519
- *
- * FLOW:
- *  1) Validate selected patient and requestType.
- *  2) Ensure doctor X25519 private key is loaded and PKI chain exists.
- *  3) Build details: path/name/mime.
- *  4) If content is included:
- *      a) Generate random DEK 
- *      b) Encrypt content with AES-GCM(DEK)
- *      c) Fetch patient encryption public key
- *      d) Derive shared secret via X25519 ECDH and encrypt DEK to patient
- *  5) Sign the request message with Ed25519.
- *  6) POST /api/pending/ with { signature, cert_chain, type, patient, details }.
- *
- * SECURITY NOTES:
- *  - Backend should verify: signature, certificate chain, doctor authorization for patient, and request schema.
- *  - Patient should only decrypt content after verifying signature and doctor authorization.
- */
+      const res = await fetch("/api/appoint/request/", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "X-CSRFToken": getCookie("csrftoken") || "",
+        },
+        credentials: "include",
+        body: JSON.stringify(body),
+      });
+      if (!res.ok) throw new Error(await res.text());
+      alert("Appointment request sent. Awaiting patient approval.");
+      fetchPendingRequests();
+      setAddPatientDialogOpen(false);
+    } catch (err) {
+      console.error("Appointment request failed:", err);
+      setError((err as Error).message || "Failed to send appointment request");
+    }
+  };
 
   const requestFileChange = async () => {
     if (!selectedPatientId || !requestType) {
@@ -695,12 +543,13 @@ const requestAppointment = async (patientId: string) => {
         }
       }
 
+      const timestamp = new Date().toISOString();
       const requestMsg = new TextEncoder().encode(
         JSON.stringify({
           type: requestType,
           patient_id: selectedPatientId,
           details,
-          timestamp: new Date().toISOString(),
+          timestamp: timestamp,
         }),
       );
 
@@ -759,17 +608,6 @@ const requestAppointment = async (patientId: string) => {
     }
   };
 
-
-/**
- * FUNCTION: readFileAsBase64
- *
- * PURPOSE:
- *      Reads a browser File object and returns its base64 payload (without data: prefix).
- *
- * USED FOR:
- *  - Packaging binary file requests before encryption.
- */
-
   const readFileAsBase64 = (file: File): Promise<string> =>
     new Promise((resolve) => {
       const reader = new FileReader();
@@ -780,19 +618,6 @@ const requestAppointment = async (patientId: string) => {
   const viewPatientRecord = (patientId: string) => {
     navigate({ to: "/record", search: { patient: patientId } });
   };
-
-  
-  
-/**
- * FUNCTION: fetchPendingAppointments
- *
- * PURPOSE:
- *      (Patient view) Loads incoming doctor appointment requests waiting for patient action.
- *
- * FLOW:
- *  1) GET /api/pending/appointments/
- *  2) setPendingAppointments(requests)
- */
 
   const fetchPendingAppointments = async () => {
     try {
@@ -805,26 +630,6 @@ const requestAppointment = async (patientId: string) => {
       setError(err.message);
     }
   };
-
-
-  /**
- * FUNCTION: approveAppointment
- *
- * PURPOSE:
- *      (Patient view) Approves a doctor’s appointment request by encrypting the patient’s current DEK
- *      to the doctor, enabling the doctor to decrypt the patient record (E2EE sharing).
- *
- * FLOW:
- *  1) Fetch patient record: GET /api/record/my/
- *  2) Extract encrypted_deks["self"] and decrypt it using masterKEK derived from patient private key.
- *  3) Fetch doctor public key and derive shared secret (X25519 ECDH).
- *  4) Encrypt DEK for doctor and POST it to /api/pending/{id}/approve/.
- *
- * SECURITY NOTES:
- *  - This is the critical “access grant” operation. Backend must bind:
- *      request.id ↔ doctor identity ↔ patient identity ↔ appointment relationship.
- *  - The DEK encrypted for the doctor must be stored server-side only as ciphertext.
- */
 
   const approveAppointment = async (req: PendingAppointment) => {
     if (!window.__MY_PRIV__) {
@@ -876,20 +681,6 @@ const requestAppointment = async (patientId: string) => {
       setError((err as Error).message);
     }
   };
-
-
-  /**
- * FUNCTION: denyAppointment
- *
- * PURPOSE:
- *      (Patient view) Rejects an appointment request without sharing any DEK material.
- *
- * FLOW:
- *  1) POST /api/pending/{id}/deny/
- *
- * SECURITY NOTES:
- *  - Deny must not leak any record metadata beyond what is necessary.
- */
 
   const denyAppointment = async (reqId: string) => {
     if (!confirm("Deny this appointment request?")) return;
@@ -1028,7 +819,7 @@ const requestAppointment = async (patientId: string) => {
                       <TableHead>Type</TableHead>
                       <TableHead>Patient</TableHead>
                       <TableHead>Status</TableHead>
-                      <TableHead>Details</TableHead>
+                      <TableHead>Timestamp</TableHead>
                     </TableRow>
                   </TableHeader>
                   <TableBody>
@@ -1041,7 +832,7 @@ const requestAppointment = async (patientId: string) => {
                             .toUpperCase()}
                         </TableCell>
                         <TableCell>
-                          {req.details.patient_name || "N/A"}
+                          {req.patient_name || "N/A"}
                         </TableCell>
                         <TableCell
                           className={
@@ -1049,13 +840,15 @@ const requestAppointment = async (patientId: string) => {
                               ? "text-yellow-600"
                               : req.status === "approved"
                                 ? "text-green-600"
+                                : req.status === "revoked"
+                                ? "text-purple-600"
                                 : "text-red-600"
                           }
                         >
                           {req.status.toUpperCase()}
                         </TableCell>
                         <TableCell>
-                          {JSON.stringify(req.details, null, 2).slice(0, 50)}...
+                          {req.timestamp ? new Date(req.timestamp).toLocaleString() : "N/A"}
                         </TableCell>
                       </TableRow>
                     ))}
@@ -1063,6 +856,9 @@ const requestAppointment = async (patientId: string) => {
                 </Table>
               )}
             </CardContent>
+            <CardFooter>
+              <Button variant="outline" onClick={fetchPendingRequests}>Refresh</Button>
+            </CardFooter>
           </Card>
 
           <Card>
@@ -1223,7 +1019,7 @@ const requestAppointment = async (patientId: string) => {
           <DialogHeader>
             <DialogTitle>Enter Certificate Private Key</DialogTitle>
             <DialogDescription>
-              Paste the base64-encoded certificate private key (e.g., PKCS8 format) from your password
+              Paste the PKI-signed Certificate Private Key from your password
               manager. This is required for signing file change requests.
             </DialogDescription>
           </DialogHeader>

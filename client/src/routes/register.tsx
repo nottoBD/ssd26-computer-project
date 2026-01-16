@@ -64,7 +64,7 @@ import * as pkijs from "pkijs";
 import * as asn1js from "asn1js";
 import QRCode from 'qrcode';
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogDescription } from "@/components/ui/dialog";
-import { encryptAES, bytesToHex, hexToBytes, generateX25519Keypair, deriveEd25519FromX25519, base64ToBytes, base64ToArrayBuffer } from '../components/CryptoUtils'
+import { encryptAES, bytesToHex, hexToBytes, generateX25519Keypair, deriveEd25519FromX25519, base64ToBytes, base64ToArrayBuffer, deriveMasterKEK, bytesToBase64 } from '../components/CryptoUtils'
 
 export const Route = createFileRoute("/register")({
   component: () => (
@@ -86,7 +86,8 @@ function RegisterPage() {
   const formRef = useRef<HTMLFormElement>(null);
   const [xQrModalOpen, setXQrModalOpen] = useState(false);
   const [qrModalOpen, setQrModalOpen] = useState(false);
-  const [qrDataUrl, setQrDataUrl] = useState<string | null>(null);
+  const [rsaQrDataUrl, setRsaQrDataUrl] = useState<string | null>(null);
+  const [xQrDataUrl, setXQrDataUrl] = useState<string | null>(null);
   const [modalCloseResolve, setModalCloseResolve] = useState<(() => void) | null>(null);
   const [privInputModalOpen, setPrivInputModalOpen] = useState(false);
   const [privInput, setPrivInput] = useState('');
@@ -210,7 +211,6 @@ const handleGenerateCertificate = async () => {
 
     const { certificate } = await signResp.json();
 
-
     function pemToDer(pem: string): ArrayBuffer {
       const lines = pem.split('\n');
       let base64 = '';
@@ -261,7 +261,6 @@ const handleGenerateCertificate = async () => {
     const pubKeyCrypto = await cert.getPublicKey();
     const pubKeyRaw = await crypto.subtle.exportKey("spki", pubKeyCrypto);
     const pubKeyHex = bytesToHex(new Uint8Array(pubKeyRaw));
-    console.log("Doctor's certificate public key (hex):", pubKeyHex); // LOG
 
     setDoctorCert(certificate);
     setDoctorCertPubkey(pubKeyHex);
@@ -328,7 +327,8 @@ const handleGenerateCertificate = async () => {
    * 11) POST credential + encrypted key material to /api/webauthn/register/finish/
    * 12) Refresh auth state, verify that the encryption public key is saved server-side,
    *     and retry /api/user/keys/update/ if needed.
-   * 13) Navigate to "/" on success.
+   * 13) If patient, initialize DEK for medical record (generate DEK, encrypt for "self", POST to /api/record/init_dek/).
+   * 14) Navigate to "/" on success.
    *
    * SIDE EFFECTS:
    *  - Creates a new WebAuthn credential on the authenticator.
@@ -498,7 +498,7 @@ const handleGenerateCertificate = async () => {
               alert("PRF not supported. Generating QR code for secure transfer to password manager (e.g., Bitwarden). Scan and store as a secure note.");
               const qrData = await QRCode.toDataURL(doctorRsaPrivB64!, { errorCorrectionLevel: 'M', scale: 8 });  // High EC for scan reliability
 
-              setQrDataUrl(qrData);
+              setRsaQrDataUrl(qrData);
               setQrModalOpen(true);
               const modalPromise = new Promise<void>(resolve => {
                 setModalCloseResolve(() => resolve);
@@ -566,7 +566,7 @@ const handleGenerateCertificate = async () => {
             const qrText = `${xPrivB64}`;
             const qrData = await QRCode.toDataURL(qrText, { errorCorrectionLevel: 'M', scale: 8 });
 
-            setQrDataUrl(qrData);
+            setXQrDataUrl(qrData);
             const modalPromise = new Promise<void>(resolve => {
               setModalCloseResolve(() => resolve);
             });
@@ -643,6 +643,55 @@ const handleGenerateCertificate = async () => {
         } else {
           console.log("Public key verified as saved");
         }
+
+
+      // Initialize DEK for patients post-registration
+        if (userType === "patient") {
+          try {
+            if (!window.__MY_PRIV__) {
+              throw new Error("Private key not available for DEK init");
+            }
+
+            // Generate random DEK (AES-256)
+            const dek = crypto.getRandomValues(new Uint8Array(32));
+
+            // Derive master KEK from X25519 private key (assume deriveMasterKEK is defined in CryptoUtils)
+            const masterKEK = await deriveMasterKEK(window.__MY_PRIV__);
+
+            // Encrypt DEK for "self"
+            const encryptedDekSelf = await encryptAES(dek, masterKEK);
+            const encDekStr = bytesToBase64(
+              new Uint8Array([
+                ...encryptedDekSelf.iv,
+                ...encryptedDekSelf.ciphertext,
+                ...encryptedDekSelf.tag,
+              ]),
+            );
+
+            // POST to init endpoint
+            const initRes = await fetch("/api/record/init_dek/", {
+              method: "POST",
+              headers: {
+                "Content-Type": "application/json",
+                "X-CSRFToken": getCookie("csrftoken") || "",
+              },
+              credentials: "include",
+              body: JSON.stringify({ encrypted_dek_self: encDekStr }),
+            });
+
+            if (!initRes.ok) {
+              throw new Error(await initRes.text());
+            }
+
+            console.log("Patient DEK initialized successfully");
+          } catch (initErr) {
+            console.error("DEK init failed:", initErr);
+            setError("Failed to initialize medical record encryption. Please try in settings after login.");
+            return; // Don't navigate if init fails, but allow registration to complete
+          }
+        }
+
+      
         navigate({ to: "/" });
       } catch (err) {
         console.error(err);
@@ -663,9 +712,23 @@ const handleGenerateCertificate = async () => {
       }
     };
 
+    function getCookie(name: string): string | null {
+        let cookieValue = null;
+        if (document.cookie && document.cookie !== '') {
+            const cookies = document.cookie.split(';');
+            for (let i = 0; i < cookies.length; i++) {
+            const cookie = cookies[i].trim();
+            if (cookie.substring(0, name.length + 1) === (name + '=')) {
+                cookieValue = decodeURIComponent(cookie.substring(name.length + 1));
+                break;
+            }
+            }
+        }
+        return cookieValue;
+        }
+
   const handleQrModalClose = () => {
     setQrModalOpen(false);
-    setQrDataUrl(null);
     if (modalCloseResolve) {
       modalCloseResolve();
       setModalCloseResolve(null);
@@ -674,7 +737,6 @@ const handleGenerateCertificate = async () => {
 
   const handleXQrModalClose = () => {
     setXQrModalOpen(false);
-    setQrDataUrl(null);
     if (modalCloseResolve) {
       modalCloseResolve();
       setModalCloseResolve(null);
@@ -957,7 +1019,7 @@ const handleGenerateCertificate = async () => {
               Use your password manager to scan and store your certificate private key.
             </DialogDescription>
           </DialogHeader>
-          {qrDataUrl && <img src={qrDataUrl} alt="Private Key QR" className="mx-auto" />}
+          {rsaQrDataUrl && <img src={rsaQrDataUrl} alt="Private Key QR" className="mx-auto" />}
         </DialogContent>
       </Dialog>
       {/* Separate modal for X25519 QR to avoid conflict */}
@@ -976,7 +1038,7 @@ const handleGenerateCertificate = async () => {
             <DialogTitle>Scan X25519 Private Key QR Code</DialogTitle>
             <DialogDescription>Use your password manager to save your encryption key.</DialogDescription>
           </DialogHeader>
-          {qrDataUrl && <img src={qrDataUrl} alt="X25519 Private Key QR" className="mx-auto" />}
+          {xQrDataUrl && <img src={xQrDataUrl} alt="X25519 Private Key QR" className="mx-auto" />}
         </DialogContent>
       </Dialog>
       {/* Dialog for manual priv key input input */}
@@ -1004,6 +1066,14 @@ const handleGenerateCertificate = async () => {
             </DialogDescription>
           </DialogHeader>
           <Input type="password" autoComplete="current-password" name="password" id="password" value={privInput} onChange={(e) => setPrivInput(e.target.value)} placeholder="Base64 private key..." />
+          <Button variant="destructive" onClick={() => setXQrModalOpen(true)} disabled={!xQrDataUrl}>
+            Redisplay X25519 QR Code
+          </Button>
+          {userType === "doctor" && (
+            <Button variant="destructive" onClick={() => setQrModalOpen(true)} disabled={!rsaQrDataUrl}>
+              Redisplay RSA QR Code
+            </Button>
+          )}
           <Button onClick={() => {
             if (privInputResolve) privInputResolve(base64ToBytes(privInput.trim()));
             setPrivInputModalOpen(false);
