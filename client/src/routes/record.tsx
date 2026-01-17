@@ -4,35 +4,35 @@
  * PURPOSE:
  *      Implements the Medical Record page 
  *      Provides a patient-facing portal to manage an encrypted record tree,
- *      and a doctor-facing portal to view a patient record and submit encrypted change requests.
+ *      and a doctor-facing portal to view a patient record and submit encrypted change requests
  *
  * CORE SECURITY GOALS:
- *  - End-to-End Encryption (E2EE): server stores ciphertext only.
- *  - Fine-grained sharing: patient selectively grants doctors access to the Data Encryption Key (DEK).
- *  - Integrity + authenticity: Ed25519 signatures protect record ciphertext from tampering.
- *  - Zero-knowledge server: the backend cannot decrypt medical content.
+ *  - End-to-End Encryption (E2EE): server stores ciphertext only
+ *  - Fine-grained sharing: patient selectively grants doctors access to the Data Encryption Key (DEK)
+ *  - Integrity + authenticity: Ed25519 signatures protect record ciphertext from tampering
+ *  - Zero-knowledge server: the backend cannot decrypt medical content
  *
  * CRYPTO DESIGN OVERVIEW:
- *  - Record payload is JSON serialized then encrypted with a random DEK (AES-GCM).
- *  - The encrypted record blob is signed using an Ed25519 key derived from the user X25519 private key.
+ *  - Record payload is JSON serialized then encrypted with a random DEK (AES-GCM)
+ *  - The encrypted record blob is signed using an Ed25519 key derived from the user X25519 private key
  *  - The DEK is wrapped (encrypted) multiple times:
- *      (a) For patient self-access: DEK wrapped under masterKEK = SHA256(patient_x25519_priv).
- *      (b) For each appointed doctor: DEK wrapped under shared_secret = X25519(patient_priv, doctor_pub).
- *  - Doctors never receive plaintext record content unless they can derive the shared_secret for DEK unwrap.
+ *      (a) For patient self-access: DEK wrapped under masterKEK = SHA256(patient_x25519_priv)
+ *      (b) For each appointed doctor: DEK wrapped under shared_secret = X25519(patient_priv, doctor_pub)
+ *  - Doctors never receive plaintext record content unless they can derive the shared_secret for DEK unwrap
  *
  * KEY MATERIAL HANDLING:
- *  - X25519 private key is expected in memory (window.__MY_PRIV__) or sessionStorage fallback.
+ *  - X25519 private key is expected in memory (window.__MY_PRIV__) or sessionStorage fallback
  *  - The page verifies that the supplied private key matches the public key stored server-side
- *    to prevent accidental key mismatch and signature verification failures.
+ *    to prevent accidental key mismatch and signature verification failures
  *
  * ROLE-BASED BEHAVIOR:
  *  - Patient:
- *      - Can add/edit/delete record nodes locally, then "Save Record" to re-encrypt and upload ciphertext.
- *      - Can appoint/revoke doctors; appointing includes sending a DEK wrapped for that doctor.
- *      - Can rotate keys (new X25519 identity + new DEK) and re-encrypt everything.
+ *      - Can add/edit/delete record nodes locally, then "Save Record" to re-encrypt and upload ciphertext
+ *      - Can appoint/revoke doctors; appointing includes sending a DEK wrapped for that doctor
+ *      - Can rotate keys (new X25519 identity + new DEK) and re-encrypt everything
  *  - Doctor:
- *      - Can list appointed patients and view a selected patient record (read-only).
- *      - Cannot directly modify record; instead submits encrypted "pending requests" to patient.
+ *      - Can list appointed patients and view a selected patient record (read-only)
+ *      - Cannot directly modify record; instead submits encrypted "pending requests" to patient
  */
 import { useState, useEffect, useMemo } from 'react'
 import { createFileRoute, Link, useNavigate, useSearch, Outlet } from '@tanstack/react-router'
@@ -92,14 +92,14 @@ interface CertChain {
  * ROUTE GUARD: beforeLoad
  *
  * PURPOSE:
- *      Enforces that /record is only accessible to authenticated users.
+ *      Enforces that /record is only accessible to authenticated users
  *
  * FLOW:
- *  1) Call backend /api/webauthn/auth/status/ with session cookies.
- *  2) If not authenticated, redirect to /login.
+ *  1) Call backend /api/webauthn/auth/status/ with session cookies
+ *  2) If not authenticated, redirect to /login
  *
  * SECURITY NOTE:
- *  - This is a UI guard only. The backend must still enforce authorization on every API endpoint.
+ *  - This is a UI guard only. The backend must still enforce authorization on every API endpoint
  */
 
 export const Route = createFileRoute('/record')({
@@ -128,7 +128,7 @@ export const Route = createFileRoute('/record')({
  *
  * PURPOSE:
  *      Derives a patient-local “master key encryption key” used to wrap/unwrap
- *      the record DEK for patient self-access.
+ *      the record DEK for patient self-access
  *
  * INPUT:
  *  - priv: patient's X25519 private key bytes
@@ -139,7 +139,7 @@ export const Route = createFileRoute('/record')({
  * SECURITY RATIONALE:
  *  - Enables the patient to decrypt their own DEK without involving any doctor keys.
  *  - Note: hashing a private key into a KEK is a pragmatic derivation; in a hardened design,
- *    HKDF with context info would be preferable to avoid key reuse across domains across domains.
+ *    HKDF with context info would be preferable to avoid key reuse across domains across domains
  */
 async function deriveMasterKEK(priv: Uint8Array): Promise<Uint8Array> {
   const digest = await crypto.subtle.digest('SHA-256', priv);
@@ -152,10 +152,10 @@ async function deriveMasterKEK(priv: Uint8Array): Promise<Uint8Array> {
  *
  * PURPOSE:
  *      Reads CSRF token (or other cookie values) from document.cookie to attach
- *      to state-changing requests.
+ *      to state-changing requests
  *
  * SECURITY NOTE:
- *  - Used for X-CSRFToken header on write operations.
+ *  - Used for X-CSRFToken header on write operations
  */
 
 function getCookie(name: string): string | undefined {

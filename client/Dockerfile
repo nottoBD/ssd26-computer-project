@@ -1,3 +1,5 @@
+# Frontend container for client
+# Builds and runs the React using pnpm
 FROM node:22-alpine AS base
 
 WORKDIR /app

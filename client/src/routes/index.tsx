@@ -1,3 +1,23 @@
+/**
+ * FILE: index.tsx
+ *
+ * ROLE:
+ *      Public landing page of the application
+ *
+ * PURPOSE:
+ *      Serves as the entry point for unauthenticated users and presents
+ *      the security architecture and core guarantees of the system
+ *
+ * CONTENT:
+ *  - High-level description of WebAuthn-based authentication.
+ *  - Overview of end-to-end encryption and zero-trust principles
+ *  - Navigation links to registration and login flows
+ *
+ * SECURITY NOTES:
+ *  - No authentication state is required to access this page
+ *  - No cryptographic keys or sensitive data are handled 
+ */
+
 import { useEffect } from 'react'
 import { createFileRoute } from '@tanstack/react-router'
 import { Button } from '@/components/ui/button'
@@ -5,13 +25,58 @@ import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/com
 import { Shield, Lock, Fingerprint, Database, Users, FileLock } from 'lucide-react'
 import { Link } from '@tanstack/react-router'
 
+
+/**
+ * ROUTE: /
+ *
+ * PURPOSE:
+ *      Declares the public homepage route and binds it to the IndexPage component.
+ *
+ * NOTES:
+ *  - This route is accessible without authentication.
+ *  - Used as the first contact point for new users.
+ */
+
 export const Route = createFileRoute('/')({
   component: IndexPage,
 })
 
+
+/**
+ * COMPONENT: IndexPage
+ *
+ * PURPOSE:
+ *      Renders the public homepage of the application
+ *
+ * FLOW:
+ *  1) On mount, performs a lightweight backend health check
+ *  2) Displays a hero section with security-focused messaging
+ *  3) Presents static feature descriptions (WebAuthn, E2EE, RBAC)
+ *  4) Provides navigation to registration and login routes
+ *
+ * SECURITY NOTES:
+ *  - This component does not depend on authentication state
+ *  - All displayed content is static and non-sensitive
+ */
+
 function IndexPage() {
   useEffect(() => {
-    // Health check
+      /**
+     * EFFECT: backendHealthCheck
+     *
+     * PURPOSE:
+     *      Verifies that the backend API is reachable
+     *
+     * FLOW:
+     *  1) Send GET request to /api/health/
+     *  2) Log backend status if reachable
+     *  3) Log a warning if the backend is unreachable
+     *
+     * SECURITY NOTES:
+     *  - This check is informational only
+     *  - It does not authenticate the user or affect UI behavior
+     */
+
     fetch('/api/health/')
       .then(r => r.json())
       .then(data => console.log('Backend status:', data))

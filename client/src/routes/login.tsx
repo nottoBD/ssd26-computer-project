@@ -1,22 +1,22 @@
 "use client";
 /**
- * Login route (WebAuthn + PRF + E2EE bootstrap).
+ * Login route (WebAuthn + PRF + E2EE bootstrap)
  *
  * Purpose:
- * - Perform passwordless authentication using WebAuthn discoverable credentials.
+ * - Perform passwordless authentication using WebAuthn discoverable credentials
  * - If available, use the WebAuthn PRF extension to derive a KEK used to encrypt/decrypt the
- *   user's X25519 private key (client-side E2EE bootstrap).
+ *   user's X25519 private key (client-side E2EE bootstrap)
  * - Fallback path: allow manual import of an X25519 private key from a password manager when
- *   PRF is not available on the current authenticator/device.
- * - Support enrollment of a secondary device via an "add device" code issued by a primary device.
+ *   PRF is not available on the current authenticator/device
+ * - Support enrollment of a secondary device via an "add device" code issued by a primary device
  *
  * Notes:
  * - The PRF evaluation inputs (extensions.prf.eval.{first,second}) must be ArrayBuffer/TypedArray
  *   when passed to navigator.credentials.get(); this file normalizes base64url inputs accordingly.
  * - The derived KEK and decrypted private key are held in memory for the session; the PRF byte array
- *   is explicitly zeroed to reduce data remanence.
+ *   is explicitly zeroed to reduce data remanence
  * - After login/bootstrap, the client verifies the private key corresponds to the server-stored public
- *   key to detect mismatches (wrong key import, stale server state, etc.).
+ *   key to detect mismatches (wrong key import, stale server state)
  */
 
 import { useState,useEffect } from "react";
