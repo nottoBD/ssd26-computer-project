@@ -79,8 +79,7 @@ interface Patient {
 
 interface AppointedDoctor {
   id: string
-  name: string
-  org: string
+  email: string
 }
 
 interface CertChain {
@@ -213,9 +212,9 @@ function RecordPage() {
   const [rawRecordData, setRawRecordData] = useState<{ encrypted_data: string; signature: string; encrypted_deks: Record<string, string>; encrypted_dek?: string } | null>(null)
   const [refreshKey, setRefreshKey] = useState(0);
 
-  const doctorNames = useMemo(() => {
+  const doctorEmails = useMemo(() => {
     return appointedDoctors.reduce((acc: Record<string, string>, d) => {
-      acc[d.id] = d.name;
+      acc[d.id] = d.email;
       return acc;
     }, {});
   }, [appointedDoctors]);
@@ -1214,7 +1213,7 @@ console.log(`Patient-side shared hash for doctor ${doctorId}: ${sharedHash}`);
                   {node.addedBy && node.addedBy !== 'self' && (
                     <>
                       <DropdownMenuLabel className="font-bold">
-                        Dr. {doctorNames[node.addedBy] || 'Unknown'}
+                        Dr. {doctorEmails[node.addedBy] || 'Unknown'}
                       </DropdownMenuLabel>
                       <DropdownMenuSeparator />
                     </>
@@ -1623,16 +1622,14 @@ const handleRequest = async () => {
               <Table>
                 <TableHeader>
                   <TableRow>
-                    <TableHead>Name</TableHead>
-                    <TableHead>Organization</TableHead>
+                    <TableHead>Email</TableHead>
                     <TableHead>Actions</TableHead>
                   </TableRow>
                 </TableHeader>
                 <TableBody>
                   {appointedDoctors.map((doc) => (
                     <TableRow key={doc.id}>
-                      <TableCell>{doc.name}</TableCell>
-                      <TableCell>{doc.org}</TableCell>
+                      <TableCell>{doc.email}</TableCell>
                       <TableCell>
                         <Button variant="destructive" onClick={() => removeDoctor(doc.id)}>Revoke</Button>
                       </TableCell>
@@ -1655,7 +1652,7 @@ const handleRequest = async () => {
                 <div className="mt-4">
                   {searchedDoctors.map((doc) => (
                     <div key={doc.id} className="flex justify-between items-center py-2 border-b">
-                      <span>{doc.name} ({doc.org})</span>
+                      <span>{doc.email}</span>
                       <Button onClick={() => appointDoctor(doc.id)}>Appoint</Button>
                     </div>
                   ))}

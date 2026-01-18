@@ -363,6 +363,8 @@ def get_my_doctors(request):
     doctors = [
         {
             'id': str(link.doctor.id),  # UUID as string
+            'email': link.doctor.email,
+        
         }
         for link in links
     ]
@@ -420,6 +422,7 @@ def search_doctors(request):
     data = [
         {
             'id': str(d.id),
+            'email': d.email,
         } for d in doctors
     ]
     

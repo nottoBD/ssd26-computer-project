@@ -83,8 +83,12 @@ else
   echo "STEP_CA_PASSWORD=$CA_PASSWORD" >> "$ENV_FILE"
 fi
 say "STEP_CA_PASSWORD stored in $(basename "$ENV_FILE")"
-shred -u .step-ca-password
-
+# shred doesn't work on macOS
+if command -v shred >/dev/null 2>&1; then
+  shred -u .step-ca-password
+else
+  rm -f .step-ca-password
+fi
 # 3) Provisioner
 ################################################################################
 # Add a dedicated JWK provisioner used to mint X.509 leaf certificates for our services
