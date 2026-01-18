@@ -5,7 +5,9 @@
 \usepackage[T1]{fontenc}
 \usepackage[utf8]{inputenc}
 \usepackage{csquotes}
+\usepackage{listings}
 \usepackage{babel}
+
 
 \usepackage[bookmarks=true,bookmarksnumbered]{hyperref}
 \hypersetup{
@@ -176,11 +178,7 @@ Advisor\\[1ex]
 \section{Introduction}
 The goal of this project is to implement a secure client/server system handling medical records, with an untrusted server and emphasis on security.
 
-We designed our system as a Dockerized application using Django for the backend, React for the frontend, Nginx as a reverse proxy, and Step-CA for PKI management. Authentication relies on WebAuthn with PRF extensions for key derivation, supporting multi-device access via a primary-secondary hierarchy. All sensitive data, including medical records, is encrypted client-side using AES-GCM, with keys managed via ECDH for sharing between patients and appointed doctors. The server stores only ciphertexts and metadata, ensuring no access to plaintext even if compromised.
-
-This approach prioritizes efficiency and security: WebAuthn over passwords to resist phishing, client-side E2EE to maintain confidentiality, and a local PKI chain (Root CA $\to$ Intermediate $\to$ Leaf certs) for TLS.
-
-The report is structured as follows: Section 2 describes the system architecture; Section 3 details features and security measures; Section 4 lists all process flows; Section 5 evaluates threats; and Section 6 concludes. An appendix addresses the security checklist.
+We designed our system as a Dockerized application using Django for the backend, React for the frontend, Nginx as a reverse proxy, and Step-CA for PKI management. Authentication relies on WebAuthn with PRF extensions for key derivation, supporting multi-device access via a primary-secondary hierarchy. All sensitive data, including medical records, is encrypted client-side using AES-GCM, with keys managed via ECDH for sharing between patients and appointed doctors. The server stores only ciphertexts and metadata, ensuring no access to plaintext even if compromised. This approach prioritizes efficiency and security: WebAuthn over passwords to resist phishing, client-side E2EE to maintain confidentiality.
 
 % Per Mélot Section 4.2 (Content): Ensure content is rigorous, scientific, and justified. Use tables/figures for clarity (e.g., architecture diagram). Question: Are claims backed by evidence/references? Did you avoid speculation?
 
@@ -256,61 +254,365 @@ Logs record activity
 
 % Per Mélot Section 4.2: Evaluate your work critically. Question: Did you assess limitations and efficiencies? Is this section concise yet comprehensive?
 
-\section{Process Flows}
+\section{Process Flows & Protocols}
+This section details the cryptographic protocols for the main actions using sequence diagrams. These diagrams illustrate the execution flow of critical operations within the application.
 
-\subsection{Register}
-\subsection{Login}
+\subsection{Doctor Login \& Key Recovery}
+The doctor login process, detailed in the sequence diagram (Figure \ref{fig:doctor_login}), enforces zero-trust principles by deriving encryption keys strictly on the client side without ever exposing them to the server.
 
-\subsection{etc..}
+\begin{enumerate}
+    \item \textbf{PRF Salt Normalization:} Upon receiving the authentication challenge and the PRF salt from the server, the client first normalizes the salt (converting from Base64URL to ArrayBuffer) to ensure compatibility with the WebCrypto API.
+    \item \textbf{KEK Derivation:} The authenticator (e.g., YubiKey) processes the normalized salt to produce the raw entropy, which is then used to derive the \textbf{Key Encryption Key (KEK)}.
+    \item \textbf{Transient Storage:} This KEK is stored exclusively in volatile memory (\texttt{window.\_\_KEK\_\_}) and is never written to disk, mitigating data remanence risks.
+    \item \textbf{E2EE Key Recovery:} The client retrieves the doctor's encrypted X25519 private key (used for E2EE) and decrypts it using the resident KEK.
+    \item \textbf{Anti-Mismatch Check:} Before finalizing the session, the client derives the public key from the decrypted private key and compares it against the public key stored on the server. This "Anti-Mismatch" verification ensures that the local identity matches the server-side identity, preventing potential key synchronization attacks.
+\end{enumerate}
+
+\begin{figure}[H]
+    \centering
+    % Ajuste la taille pour ne pas dépasser la largeur du texte NI la hauteur de la page
+    \includegraphics[width=\textwidth, height=0.9\textheight, keepaspectratio]{figures/Login-Doctor.drawio.png}
+    \caption{Sequence Diagram: Doctor Login...}
+    \label{fig:doctor_login}
+\end{figure}
+\subsection{Patient Login \& Key Recovery}
+The patient login flow (Figure \ref{fig:patient_login}) is designed to securely restore the user's cryptographic context on a new session without entrusting private keys to the server.
+
+\begin{enumerate}
+    \item \textbf{Salt Normalization:} Upon authentication success, the client receives the PRF salt from the server and normalizes it (Base64URL to ArrayBuffer) to prepare for key derivation.
+    \item \textbf{KEK Derivation \& Storage:} The authenticator computes the deterministic PRF output, which is converted into the \textbf{Key Encryption Key (KEK)}. This key is held strictly in volatile memory (\texttt{window.\_\_KEK\_\_}).
+    \item \textbf{Material Retrieval:} The server returns the patient's encrypted E2EE material (the X25519 private key and its initialization vector) along with the public key.
+    \item \textbf{Decryption:} The client uses the resident KEK to decrypt the X25519 private key, enabling the patient to decrypt their own medical records locally.
+\end{enumerate}
+
+\begin{figure}[H]
+    \centering
+    % Ensure you export your drawio as 'patient_login.png' in the figures folder
+    \includegraphics[width=\textwidth, height=0.9\textheight, keepaspectratio]{figures/Login-Patient.drawio.png}
+    \caption{Sequence Diagram: Patient Login and E2EE Material Recovery}
+    \label{fig:patient_login}
+\end{figure}
+
+\subsection{Key Rotation \& Revocation}
+The key rotation protocol (Figure \ref{fig:key_rotation}) allows a user to revoke their cryptographic identity (e.g., in case of device theft) and migrate to a new keypair without losing data access.
+
+\begin{enumerate}
+    \item \textbf{New Keys Generation:} The client generates a fresh set of X25519 (encryption) and Ed25519 (signing) keypairs locally.
+    \item \textbf{Record Re-encryption:} The client iterates through the user's medical records. It decrypts the Data Encryption Keys (DEKs) using the \textit{old} private key and immediately re-encrypts them with the \textit{new} public key. Note that the actual medical data (large blobs) is not decrypted, only the small keys protecting them.
+    \item \textbf{Access Re-wrapping:} If the user had shared access with doctors, the relevant access entries are updated ("re-wrapped") to ensure they point to the new cryptographic identity where necessary.
+    \item \textbf{Atomic Server Update:} The new Public Key and the batch of re-encrypted DEKs are sent to the server in a single, atomic transaction. The server replaces the old public key and updates the records simultaneously. If the transaction fails, the old keys remain valid, preventing data corruption.
+\end{enumerate}
+
+\begin{figure}[H]
+    \centering
+    % Ensure you export your drawio as 'rotate_key.png' in the figures folder
+    \includegraphics[width=\textwidth, height=0.9\textheight, keepaspectratio]{figures/RotateKey.drawio(1).png}
+    \caption{Sequence Diagram: Atomic Key Rotation and Data Re-encryption}
+    \label{fig:key_rotation}
+\end{figure}
+
+\subsection{Doctor-Initiated Appointment \& Approval}
+This protocol (Figure \ref{fig:doctor_add}) addresses the scenario where a doctor proposes a medical link. To respect the patient's data sovereignty, this process is split into two asynchronous phases: request creation and patient approval.
+
+\textbf{Phase 1: Request Creation (Doctor)}
+\begin{enumerate}
+    \item \textbf{Request Generation:} The doctor initiates a "Link Request" targeting a specific patient. This request includes the doctor's identity and is signed with their Ed25519 private key to prevent spoofing.
+    \item \textbf{Request Encryption:} The request payload is encrypted with the patient's public key (retrieved from the server) before upload. This ensures that the nature of the request and the medical relationship remain confidential; the server sees only an opaque blob pending for the patient.
+\end{enumerate}
+
+\textbf{Phase 2: Approval (Patient)}
+\begin{enumerate}
+    \item \textbf{Fetch \& Decrypt:} Upon logging in, the patient retrieves pending requests and decrypts them using their private key (recovered via WebAuthn PRF).
+    \item \textbf{Verification:} The client application verifies the doctor's signature against their PKI certificate to ensure the request is legitimate.
+    \item \textbf{Consent \& Wrapping:} If the patient accepts, the client performs the ECDH key exchange (computing the shared secret) and encrypts the Record DEK for the doctor.
+    \item \textbf{Finalization:} The wrapped DEK is uploaded, effectively converting the "pending request" into an active "authorized link."
+\end{enumerate}
+
+\begin{figure}[H]
+    \centering
+    % Ensure you export your drawio as 'doctor_add_sequence.png'
+    \includegraphics[width=\textwidth, height=0.9\textheight, keepaspectratio]{figures/DoctorAddSequence.drawio(1).png}
+    \caption{Sequence Diagram: Doctor-Initiated Request and Patient Approval}
+    \label{fig:doctor_add}
+\end{figure}
+
+\subsection{Patient Record Creation \& Upload}
+This sequence (Figure \ref{fig:add_record}) details how a patient securely adds a new file (video or document) to their medical record. The process ensures that the server acts purely as a storage provider for encrypted blobs.
+
+\begin{enumerate}
+    \item \textbf{DEK Generation:} The client generates a fresh, random \textbf{Data Encryption Key (DEK)} (AES-256) specifically for this file.
+    \item \textbf{Encryption (E2EE):} The file content is encrypted locally using this DEK (AES-GCM), ensuring confidentiality.
+    \item \textbf{Signing:} To guarantee integrity and authenticity, the client signs the resulting ciphertext using the patient's \textbf{Ed25519 private key}.
+    \item \textbf{Key Wrapping:} The DEK itself is encrypted with the patient's \textbf{X25519 public key}. This allows the patient to recover the key later (during login/decryption) without storing the plaintext key on the server.
+    \item \textbf{Upload:} The client sends a payload containing the \textit{Encrypted Content}, the \textit{Digital Signature}, and the \textit{Wrapped DEK} to the server. The server stores these artifacts and confirms persistence (200 OK).
+\end{enumerate}
+
+\begin{figure}[H]
+    \centering
+    % Ensure you export your drawio as 'add_record_patient.png'
+    \includegraphics[width=\textwidth, height=0.9\textheight, keepaspectratio]{figures/AddRecordPatient.drawio.png}
+    \caption{Sequence Diagram: Secure Record Creation and Upload by Patient}
+    \label{fig:add_record}
+\end{figure}
+
+
+\newpage
+\section{Threat Modeling (STRIDE)}
+We applied the STRIDE methodology to guide our security choices:
+
+\begin{table}[H]
+\centering
+\begin{tabular}{@{}lp{10cm}@{}}
+\toprule
+\textbf{Threat} & \textbf{Mitigation Strategy} \\ \midrule
+\textbf{S}poofing & WebAuthn (FIDO2) prevents phishing and impersonation. PKI/X.509 certificates authenticate the Server and Doctors. \\
+\textbf{T}ampering & All records and lists are signed using Ed25519. Any modification by the server is detected by the client upon retrieval. \\
+\textbf{R}epudiation & Doctor actions are signed (digital signatures), ensuring they cannot deny authorizing a record creation or modification. \\
+\textbf{I}nformation Disclosure & End-to-End Encryption (AES-GCM). The server sees only ciphertext. \\
+\textbf{D}enial of Service & Rate limiting via Nginx. \\
+\textbf{E}levation of Privilege & Role-Based Access Control (RBAC) enforced by backend logic + Cryptographic Access Control (you cannot decrypt if you don't have the key). \\ \bottomrule
+\end{tabular}
+\caption{STRIDE Analysis}
+\end{table}
+
+\section{Security Checklist Analysis}
+The following analysis addresses the security questions posed in the \textit{Security questions check-list}.
+
+\subsection{Confidentiality and Data Protection}
+
+\subsection*{1. Do I properly ensure confidentiality?}
+\textbf{Status: Yes.}
+
+Confidentiality is enforced via End-to-End Encryption (E2EE) and strict Transport Layer Security.
+\begin{itemize}
+    \item \textbf{Transmission:} All data between client and server is encrypted using TLS v1.2/1.3. The Nginx configuration enforces HSTS (HTTP Strict Transport Security) to prevent downgrade attacks.
+    \begin{lstlisting}[language=Java, caption={Nginx configuration (nginx.conf)}]
+        ...
+        ssl_protocols TLSv1.2 TLSv1.3;
+        ...
+        add_header Strict-Transport-Security "max-age=31536000; includeSubDomains" always;
+        ...
+    }
+\end{lstlisting}
+    \item \textbf{Storage:} The server operates on a "Zero-Knowledge" principle. Medical records are encrypted on the client side using \textbf{AES-256-GCM} before upload. The database only stores the encrypted blobs (\texttt{encrypted\_data}) and encrypted keys.
+    \item \textbf{Access:} Administrators cannot view sensitive data because they do not possess the user's private key required to unwrap the Data Encryption Keys (DEKs).
+\end{itemize}
 
 
 
-\section{Threat Modeling and Evaluation}
-We performed threat modeling using STRIDE to identify risks and mitigations.
+\begin{lstlisting}[language=Java, caption={Client-side Encryption (CryptoUtils.ts)}]
+export function encryptAES(data: Uint8Array, key: Uint8Array) {
+  const iv = randomBytes(12);
+  const aes = new AES(key);
+  const cipher = new GCM(aes); // Authenticated Encryption
+  const sealed = cipher.seal(iv, data);
+  // Returns ciphertext, iv, and tag
+}
+\end{lstlisting}
 
-- \textbf{Spoofing}: Mitigated by WebAuthn; PKI prevents fake servers.
-- \textbf{Tampering}: Ed25519 signatures on records/lists.
-- \textbf{Repudiation}: Logs with non-repudiable signatures.
-- \textbf{Information Disclosure}: E2EE; no plaintext on server.
-- \textbf{Denial of Service}: reCAPTCHA, rate limiting.
-- \textbf{Elevation of Privilege}: Primary-only management; RBAC.
+\subsubsection*{2. Did I harden my authentication scheme?}
+\textbf{Status: Yes.}
 
-Limitations: Incomplete logging separation; no ML anomaly detection due to data constraints. Efficient choices: WebAuthn reduces overhead vs. MFA; client-side crypto offloads server.
+The project uses a passwordless authentication scheme based on FIDO2/WebAuthn.
+\begin{itemize}
+    \item \textbf{MFA by Design:} WebAuthn provides multi-factor authentication (Possession of device + Biometrics/PIN) by default.
+    \item \textbf{Zero-Knowledge:} The server never receives a password or a private key; it only validates a cryptographic signature.
+    \item \textbf{Anti-Bot:} Google reCAPTCHA v3 is implemented on the registration endpoint to prevent automated spam.
+\end{itemize}
 
-\printbibliography
+\begin{lstlisting}[language=Python, caption={reCAPTCHA use (server/webauthn/views.py)}]
+try:
+    recaptcha_token = clean_str(data.get("recaptcha_token", ""), "recaptcha_token", max_len=4096)
+except ValueError as e:
+    return bad(str(e), status=400)
 
-% Per Mélot Annexes: Use for supplementary material. Question: Is this non-essential? Does it support main content without overwhelming?
+verify_url = "https://www.google.com/recaptcha/api/siteverify"
+verify_data = {
+    "secret": settings.RECAPTCHA_SECRET_KEY,
+    "response": recaptcha_token,
+    "remoteip": request.META.get("REMOTE_ADDR"),
+}
 
-\appendix
-\section{Security Checklist Responses}
-% \begin{table}[H]
-% \centering
-% \begin{tabular}{ll}
-% \toprule
-% Question & Response \\
-% \midrule
-% 1. Do I properly ensure confidentiality? & Yes, via client-side E2EE with AES-GCM; no plaintext transmitted/stored. Admin has no key access. \\
-% 2. Did I harden my authentication scheme? & Yes, WebAuthn with PRF and zero-knowledge proofs; no Captcha/MFA needed due to built-in resistance. \\
-% 3. Do I properly ensure integrity of stored data? & Yes, Ed25519 signatures on ciphertexts. \\
-% 4. Do I properly ensure the integrity of sequences of items? & Yes, hash chains/signatures on doctor lists/records; tampering detected via verification. \\
-% 5. Do I properly ensure non-repudiation? & Yes, Ed25519 signatures and PKI certs for actions/attributes. \\
-% 6. Do my security features rely on secrecy, beyond cryptographic keys and access codes? & No, all rely on standards; no obscurity. \\
-% 7. Am I vulnerable to injection? & No, Django sanitizes URL/SQL/JS inputs. \\
-% 8. Am I vulnerable to data remanence attacks? & No, deletions overwrite with random data. \\
-% 9. Am I vulnerable to fraudulent request forgery? & No, CSRF tokens. \\
-% 10. Am I monitoring enough user activity...? & Yes, AuthenticationLog with sanitization; anomaly detection via metadata; no whistleblower yet. \\
-% 11. Am I using components with known vulnerabilities? & No, deps updated via PNPM. \\
-% 12. Is my system updated? & Yes, Docker images pinned to latest secure versions. \\
-% 13. Is my access control broken (cf. OWASP 10)? & No, RBAC with primary hierarchy. \\
-% 14. Is my authentication broken (cf. OWASP 10)? & No, WebAuthn aligns with OWASP. \\
-% 15. Are my general security features misconfigured (cf. OWASP 10)? & No, TLS, secure cookies configured. \\
-% \bottomrule
-% \end{tabular}
-% \caption{Security Checklist Answers}
-% \end{table}
+try:
+    verify_resp = requests.post(verify_url, data=verify_data, timeout=6)
+    verify_json = verify_resp.json()
+except Exception:
+    return bad("reCAPTCHA verification error", status=400)
 
-\section{Additional Material}
-% Code snippets, diagrams, setup instructions (e.g., Docker).
+if (not verify_json.get("success")) or (verify_json.get("score", 0) < settings.RECAPTCHA_SCORE_THRESHOLD):
+    return bad("reCAPTCHA verification failed - are you for real?", status=400)
+\end{lstlisting}
+
+\begin{lstlisting}[language=Python, caption={WebAuthn Registration (server/webauthn/views.py)}]
+# User verification required ensures local auth (biometrics/pin)
+options, state = server.register_begin(
+    user={ ... },
+    credentials=[],
+    user_verification="required",
+)
+\end{lstlisting}
+
+\subsection{Integrity and Non-Repudiation}
+
+\subsection*{3. Do I properly ensure integrity of stored data?}
+\textbf{Status: Yes.}
+
+We utilize \textbf{Ed25519} digital signatures. Before uploading a record, the client signs the encrypted blob using a signing key derived from their identity. When fetching data, the signature is verified. If the data on the server is tampered with (e.g., by a malicious admin), the signature verification will fail on the client side.
+
+\begin{lstlisting}[language=Java, caption={Payload upload with signature and encrypted blob (client/src/routes/record.tsx)}]
+    // Signing the encrypted blob (concatenated) before upload
+    const sig = signEd25519(concatenated, edPriv)
+    ...
+    const updatePayload = {
+      encrypted_data: bytesToBase64(concatenated),
+      encrypted_deks: deks,
+      signature: bytesToBase64(sig),
+      metadata,
+    };
+\end{lstlisting}
+
+
+\subsection*{4. Do I properly ensure the integrity of sequences of items?}
+\textbf{Status: Yes.}
+
+The medical record is structured as a tree but serialized into a single JSON object before encryption. This means the entire structure (file sequence, folder hierarchy) is encrypted and signed as one monolithic block. It is impossible to insert, delete, or reorder an item in the sequence without invalidating the signature of the whole record.
+
+\begin{lstlisting}[language=Java, caption={Encrypted serialize JSON as a block (client/src/routes/record.tsx)}]
+    const raw = new TextEncoder().encode(JSON.stringify(record))
+    const encrypted = await encryptAES(raw, dek)
+    const concatenated = new Uint8Array([...encrypted.iv, ...encrypted.ciphertext, ...encrypted.tag])
+    const edPriv = deriveEd25519FromX25519(priv).privateKey
+    const sig = signEd25519(concatenated, edPriv)
+\end{lstlisting}
+
+\subsection*{5. Do I properly ensure non-repudiation?}
+\textbf{Status: Yes.}
+
+\begin{itemize}
+    \item \textbf{Patients:} All record updates are signed with their private Ed25519 key.
+    \item \textbf{Doctors:} Doctors are issued X.509 Certificates signed by an internal Certificate Authority (Step-CA). Critical actions (like requesting file changes) must be signed with the private key associated with this certificate, preventing doctors from denying their actions later.
+\end{itemize}
+\begin{lstlisting}[language=Java, caption={RSA signature of a request for non-repudiation (client/src/routes/record.tsx)}]
+const certPrivKey = await crypto.subtle.importKey(
+  "pkcs8",
+  window.__MY_CERT_PRIV__, 
+  { name: "RSASSA-PKCS1-v1_5", hash: "SHA-256" },
+  false,
+  ["sign"]
+);
+
+const signature = await crypto.subtle.sign(
+  "RSASSA-PKCS1-v1_5",
+  certPrivKey,
+  requestMsg
+);
+\end{lstlisting}
+
+
+\subsection{Vulnerability Management}
+
+\subsection*{6. Do my security features rely on secrecy?}
+\textbf{Status: No.}
+
+The system follows Kerckhoffs's principle. We use standard, open-source cryptographic libraries (\texttt{@stablelib}, \texttt{cryptography} in Python) and standard algorithms (AES-GCM, SHA-256, Curve25519). Security relies solely on the secrecy of the keys, not the code.
+
+\subsection*{7. Am I vulnerable to injection?}
+\textbf{Status: No.}
+
+\begin{itemize}
+    \item \textbf{SQL Injection:} The backend uses Django's ORM, which parameterizes queries to prevent SQL injection.
+    \item \textbf{XSS:} The frontend uses React (which escapes output by default). Nginx is configured with a strict \texttt{Content-Security-Policy} (CSP).
+    \item \textbf{Validation:} A strict input validation layer (\texttt{inputValidation.ts}) sanitizes all incoming data.
+\end{itemize}
+
+\subsection*{8. Am I vulnerable to data remanence attacks?}
+\textbf{Status: Partially Mitigated.}
+
+The system employs a hybrid storage strategy balancing security and usability:
+\begin{itemize}
+    \item \textbf{Identity Keys (Patients \& Doctors):} The master identity key (X25519) used for encryption is kept in \textbf{SessionStorage} and volatile memory (RAM). It is never written to persistent storage like LocalStorage or Cookies. Closing the tab wipes this key.
+    \item \textbf{Signing Keys (Doctors only):} To facilitate daily workflows, the doctor's RSA private key used for signing requests is stored in \textbf{IndexedDB} (persistent client-side storage). While this improves UX, it introduces a data remanence risk on shared devices, requiring explicit logout to clear.
+\end{itemize}
+
+\begin{lstlisting}[language=Java, caption={Hybrid Key Storage Strategy (client/src/routes/record.tsx)}]
+  useEffect(() => {
+    // 1. Identity Key: Volatile (SessionStorage)
+    const stored = sessionStorage.getItem('x25519_priv_b64');
+    if (stored) {
+      window.__MY_PRIV__ = base64ToBytes(stored);
+    }
+
+    // 2. Doctor Signing Key: Persistent (IndexedDB)
+    async function loadCertKey() {
+      if (user?.type === "doctor") {
+        const storedCert = await getKey('cert_priv');
+        if (storedCert) {
+          window.__MY_CERT_PRIV__ = storedCert as Uint8Array;
+        }
+      }
+    }
+    loadCertKey();
+  }, [user]);
+\end{lstlisting}
+
+\subsection*{9. Am I vulnerable to fraudulent request forgery?}
+\textbf{Status: Mitigated.}
+
+The application enforces CSRF protection. The frontend must extract the \texttt{csrftoken} cookie and send it in the \texttt{X-CSRFToken} header for every state-changing request.
+
+\begin{lstlisting}[language=Java, caption={Manual inclusion of the CSRF token in fetch headers (client/src/routes/record.tsx)}]
+    const r = await fetch('/api/record/update/', {
+      method: 'POST',
+      headers: { 
+        'Content-Type': 'application/json', 
+        'X-CSRFToken': getCookie('csrftoken') || '',
+        "X-Metadata": updateMetadataHeader // Attach as header
+      },
+      credentials: 'include',
+      body: JSON.stringify(updatePayload),
+    })
+\end{lstlisting}
+
+\subsection{Monitoring and Configuration}
+
+\subsection*{10. Am I monitoring enough user activity?}
+\textbf{Status: Yes.}
+
+A dedicated \textbf{Logger Service} records sensitive actions (login, key access). 
+
+\subsection*{11. Am I using components with known vulnerabilities?}
+\textbf{Status: Managed.}
+
+Dependencies are managed via \texttt{npm} and \texttt{pip}, allowing for regular audits. Docker containers are used to isolate the environment and allow for easy system updates.
+
+\subsection*{12. Is my system updated?}
+\textbf{Status: Yes.}
+
+The architecture relies on Docker. Updating the system (OS patches, library updates) is done by rebuilding the container images, ensuring a clean and up-to-date state.
+
+\subsection*{13. Is my access control broken?}
+\textbf{Status: No.}
+
+Access control is enforced at two levels:
+\begin{enumerate}
+    \item \textbf{Logical:} Django views check user permissions (e.g., \texttt{@login\_required}).
+    \item \textbf{Cryptographic:} Even if logical checks fail, a user cannot read data without the correct decryption key (DEK), which is physically encrypted for specific users only.
+\end{enumerate}
+
+\subsection*{14. Is my authentication broken?}
+\textbf{Status: No.}
+
+By eliminating passwords, we eliminate the most common authentication vulnerabilities (Weak passwords, Credential stuffing, Phishing).
+
+\subsection*{15. Are my general security features misconfigured?}
+\textbf{Status: No.}
+
+Server configuration is hardened:
+\begin{itemize}
+    \item \textbf{Django:} Debug mode is controlled via env vars, secrets are not hardcoded.
+    \item \textbf{Nginx:} Security headers are active (\texttt{X-Frame-Options}, \texttt{X-Content-Type-Options}, \texttt{CSP}).
+\end{itemize}
+
 
 
 \end{document}
