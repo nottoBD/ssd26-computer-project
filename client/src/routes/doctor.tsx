@@ -315,8 +315,7 @@ function UserPortal() {
     try {
       const newPriv = base64ToBytes(inputPriv);
       window.__MY_PRIV__ = newPriv;
-      sessionStorage.setItem("x25519_priv_b64", inputPriv);
-
+      await saveKey('master_priv_key', newPriv);
       // Generate metadata for own public key fetch (user-specific, no tree depth)
       const ownPubMetadata = generateMetadata({}, ['user', 'get_public_key'], 'GET');
       const ownPubMetadataHeader = await prepareMetadata(ownPubMetadata); // No signing yet
@@ -633,105 +632,143 @@ const searchPatients = async (q: string) => {
   };
 
   const approveAppointment = async (req: PendingAppointment) => {
-    if (!window.__MY_PRIV__) {
-      setInputPrivOpen(true);
-      return;
-    }
-    try {
-      // Generate metadata for record fetch (patient-specific, tree depth 0 for root)
-      const recordMetadata = generateMetadata({}, ['patient', 'get_record'], 'GET', 0);
-      const recordMetadataHeader = await prepareMetadata(recordMetadata, window.__SIGN_PRIV__); // Sign available
-
-      // Load current DEK from patient's record
-      const recordRes = await fetch("/api/record/my/", {
-        headers: { "X-Metadata": recordMetadataHeader } // Attach as header
-      });
-      if (!recordRes.ok) throw new Error("Failed to fetch record");
-      const recordData = await recordRes.json();
-      const encDekSelf = recordData.encrypted_deks["self"];
-      if (!encDekSelf) throw new Error("No self DEK found");
+  if (!window.__MY_PRIV__) {
+    setInputPrivOpen(true);
+    return;
+  }
+  try {
+    // Generate metadata for record fetch (patient-specific, tree depth 0 for root)
+    const recordMetadata = generateMetadata({}, ['patient', 'get_record'], 'GET', 0);
+    const recordMetadataHeader = await prepareMetadata(recordMetadata, window.__SIGN_PRIV__);
+    // Load current DEK from patient's record
+    const recordRes = await fetch("/api/record/my/", {
+      headers: { "X-Metadata": recordMetadataHeader }
+    });
+    if (!recordRes.ok) throw new Error("Failed to fetch record");
+    const recordData = await recordRes.json();
+    let encDekSelf = recordData.encrypted_deks?.["self"];
+    let dek: Uint8Array;
+    if (!encDekSelf) {
+      // Initialize empty record with new DEK
+      dek = randomBytes(32);
       const masterKEK = await deriveMasterKEK(window.__MY_PRIV__);
-      const dek = await decryptDEK(encDekSelf, masterKEK);
-
-      // Generate metadata for doctor public key fetch (patient-specific, no tree depth)
-      const docPubMetadata = generateMetadata({}, ['patient', 'get_doctor_public_key'], 'GET');
-      const docPubMetadataHeader = await prepareMetadata(docPubMetadata, window.__SIGN_PRIV__); // Sign available
-
-      // Fetch doctor's public key
-      const pubRes = await fetch(`/api/user/public_key/${req.requester.id}`, {
-        headers: { "X-Metadata": docPubMetadataHeader } // Attach as header
-      });
-      if (!pubRes.ok) throw new Error("Failed to fetch doctor public key");
-      const { public_key } = await pubRes.json();
-      const docPub = hexToBytes(public_key);
-      const shared = await ecdhSharedSecret(window.__MY_PRIV__, docPub);
-
-      // Encrypt DEK for doctor
-      const encryptedDek = await encryptAES(dek, shared);
-      const encDekStr = bytesToBase64(
-        new Uint8Array([
-          ...encryptedDek.iv,
-          ...encryptedDek.ciphertext,
-          ...encryptedDek.tag,
-        ]),
-      );
-
-      // Fetch and decrypt own profile to share name/dob (encrypted for doctor)
-      const profileRes = await fetch("/api/user/profile/encrypted/");
-      if (!profileRes.ok) throw new Error("Failed to fetch encrypted profile");
-      const { encrypted_sensitive } = await profileRes.json();
-      const encBytes = base64ToBytes(encrypted_sensitive);
-      const profileIv = encBytes.slice(0, 12);
-      const profileTag = encBytes.slice(-16);
-      const profileCipher = encBytes.slice(12, -16);
-      const profileBytes = await decryptAES(profileCipher, masterKEK, profileIv, profileTag);
-      const sensitive = JSON.parse(new TextDecoder().decode(profileBytes));
-      const profileForDoc = JSON.stringify({
-        name: `${sensitive.first_name} ${sensitive.last_name}`,
-        dob: sensitive.date_of_birth,
-      });
-      const encProfile = await encryptAES(new TextEncoder().encode(profileForDoc), shared);
-      const encProfileStr = bytesToBase64(
-        new Uint8Array([...encProfile.iv, ...encProfile.ciphertext, ...encProfile.tag])
-      );
-
-      // Generate metadata for approve (patient-specific, no tree depth)
-      const approvePayload = { encrypted_dek: encDekStr, encrypted_patient_profile: encProfileStr };
-      const approveMetadata = generateMetadata(approvePayload, ['patient', 'approve_appointment'], 'POST');
-      const approveMetadataHeader = await prepareMetadata(approveMetadata, window.__SIGN_PRIV__); // Sign available
-
-      // Send to backend for approval
-      const approveRes = await fetch(`/api/pending/${req.id}/approve/`, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          "X-CSRFToken": getCookie("csrftoken") || "",
-          "X-Metadata": approveMetadataHeader // Attach as header
+      const encryptedSelfDek = await encryptAES(dek, masterKEK);
+      const deks: Record<string, string> = {};
+      deks['self'] = bytesToBase64(new Uint8Array([...encryptedSelfDek.iv, ...encryptedSelfDek.ciphertext, ...encryptedSelfDek.tag]));
+      const emptyRoot: RecordNode = {
+        name: 'Root',
+        type: 'folder',
+        children: [],
+        metadata: { created: new Date().toISOString(), size: 0 }
+      };
+      const raw = new TextEncoder().encode(JSON.stringify(emptyRoot));
+      const encrypted = await encryptAES(raw, dek);
+      const concatenated = new Uint8Array([...encrypted.iv, ...encrypted.ciphertext, ...encrypted.tag]);
+      const edPriv = deriveEd25519FromX25519(window.__MY_PRIV__).privateKey;
+      const sig = signEd25519(concatenated, edPriv);
+      const metadata = {
+        time: new Date().toISOString(),
+        size: concatenated.length,
+        privileges: 'patient',
+        tree_depth: 0,
+      };
+      const updatePayload = {
+        encrypted_data: bytesToBase64(concatenated),
+        encrypted_deks: deks,
+        signature: bytesToBase64(sig),
+        metadata,
+      };
+      const updateMetadataObj = generateMetadata(updatePayload, ['patient', 'update_record'], 'POST', 0);
+      const updateMetadataHeader = await prepareMetadata(updateMetadataObj, window.__SIGN_PRIV__);
+      const updateRes = await fetch('/api/record/update/', {
+        method: 'POST',
+        headers: { 
+          'Content-Type': 'application/json', 
+          'X-CSRFToken': getCookie('csrftoken') || '',
+          "X-Metadata": updateMetadataHeader
         },
-        credentials: "include",
-        body: JSON.stringify(approvePayload),
+        credentials: 'include',
+        body: JSON.stringify(updatePayload),
       });
-      if (!approveRes.ok) throw new Error(await approveRes.text());
-      alert("Appointment approved successfully!");
-      fetchPendingAppointments();
-    } catch (err) {
-      console.error("Approval failed:", err);
-      setError((err as Error).message);
+      if (!updateRes.ok) throw new Error('Failed to initialize record');
+    } else {
+      const masterKEK = await deriveMasterKEK(window.__MY_PRIV__);
+      dek = await decryptDEK(encDekSelf, masterKEK);
     }
-  };
-
+    // Generate metadata for doctor public key fetch (patient-specific, no tree depth)
+    const docPubMetadata = generateMetadata({}, ['patient', 'get_doctor_public_key'], 'GET');
+    const docPubMetadataHeader = await prepareMetadata(docPubMetadata, window.__SIGN_PRIV__);
+    // Fetch doctor's public key
+    const pubRes = await fetch(`/api/user/public_key/${req.requester.id}`, {
+      headers: { "X-Metadata": docPubMetadataHeader } // Attach as header
+    });
+    if (!pubRes.ok) throw new Error("Failed to fetch doctor public key");
+    const { public_key } = await pubRes.json();
+    const docPub = hexToBytes(public_key);
+    const shared = await ecdhSharedSecret(window.__MY_PRIV__, docPub);
+    // Encrypt DEK for doctor
+    const encryptedDek = await encryptAES(dek, shared);
+    const encDekStr = bytesToBase64(
+      new Uint8Array([
+        ...encryptedDek.iv,
+        ...encryptedDek.ciphertext,
+        ...encryptedDek.tag,
+      ]),
+    );
+    // Fetch and decrypt own profile to share name/dob (encrypted for doctor)
+    const profileRes = await fetch("/api/user/profile/encrypted/");
+    if (!profileRes.ok) throw new Error("Failed to fetch encrypted profile");
+    const { encrypted_sensitive } = await profileRes.json();
+    const encBytes = base64ToBytes(encrypted_sensitive);
+    const profileIv = encBytes.slice(0, 12);
+    const profileTag = encBytes.slice(-16);
+    const profileCipher = encBytes.slice(12, -16);
+    const masterKEK = await deriveMasterKEK(window.__MY_PRIV__);
+    const profileBytes = await decryptAES(profileCipher, masterKEK, profileIv, profileTag);
+    const sensitive = JSON.parse(new TextDecoder().decode(profileBytes));
+    const profileForDoc = JSON.stringify({
+      name: `${sensitive.first_name} ${sensitive.last_name}`,
+      dob: sensitive.date_of_birth,
+    });
+    const encProfile = await encryptAES(new TextEncoder().encode(profileForDoc), shared);
+    const encProfileStr = bytesToBase64(
+      new Uint8Array([...encProfile.iv, ...encProfile.ciphertext, ...encProfile.tag])
+    );
+    // Generate metadata for approve (patient-specific, no tree depth)
+    const approvePayload = { encrypted_dek: encDekStr, encrypted_patient_profile: encProfileStr };
+    const approveMetadata = generateMetadata(approvePayload, ['patient', 'approve_appointment'], 'POST');
+    const approveMetadataHeader = await prepareMetadata(approveMetadata, window.__SIGN_PRIV__); // Sign available
+    // Send to backend for approval
+    const approveRes = await fetch(`/api/pending/${req.id}/approve/`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "X-CSRFToken": getCookie("csrftoken") || "",
+        "X-Metadata": approveMetadataHeader
+      },
+      credentials: "include",
+      body: JSON.stringify(approvePayload),
+    });
+    if (!approveRes.ok) throw new Error(await approveRes.text());
+    alert("Appointment approved successfully!");
+    fetchPendingAppointments();
+  } catch (err) {
+    console.error("Approval failed:", err);
+    setError((err as Error).message);
+  }
+};
+  
   const denyAppointment = async (reqId: string) => {
     if (!confirm("Deny this appointment request?")) return;
     try {
-      // Generate metadata for deny (patient-specific, no tree depth)
       const denyMetadata = generateMetadata({}, ['patient', 'deny_appointment'], 'POST');
-      const denyMetadataHeader = await prepareMetadata(denyMetadata, window.__SIGN_PRIV__); // Sign available
+      const denyMetadataHeader = await prepareMetadata(denyMetadata, window.__SIGN_PRIV__);
 
       const res = await fetch(`/api/pending/${reqId}/deny/`, {
         method: "POST",
         headers: { 
           "X-CSRFToken": getCookie("csrftoken") || "",
-          "X-Metadata": denyMetadataHeader // Attach as header
+          "X-Metadata": denyMetadataHeader
         },
         credentials: "include",
       });
@@ -960,28 +997,11 @@ const approveFileRequest = async (req: PendingFileRequest) => {
   }
 };
 
-// Add this function (used in metadata and delete)
 function calculateMaxDepth(node: any, current = 0): number {
   if (node.type !== 'folder' || !node.children || node.children.length === 0) return current;
   return Math.max(...node.children.map((child: any) => calculateMaxDepth(child, current + 1)), current);
 }
 
-// Updated getParent (replace the existing one)
-function getParent(root: any, parts: string[]): any {
-  let current = root;
-  for (let i = 0; i < parts.length; i++) {
-    if (!current.children) return null;
-    const child = current.children.find((c: any) => c.name.toLowerCase() === parts[i].toLowerCase());
-    if (!child) return null;
-    current = child;
-  }
-  return current;
-}
-
-  function calculateMaxDepth(node: any, current = 0): number {
-    if (node.type !== 'folder' || !node.children) return current;
-    return Math.max(...node.children.map((child: any) => calculateMaxDepth(child, current + 1)), current);
-  }
 
   const denyFileRequest = async (reqId: string) => {
     if (!confirm("Deny this file change request?")) return;
@@ -1327,9 +1347,14 @@ function getParent(root: any, parts: string[]): any {
             value={inputCertPriv}
             onChange={(e) => setInputCertPriv(e.target.value)}
             placeholder="Base64 certificate private key..."
+            minLength={100}
           />
           <DialogFooter>
-            <Button onClick={handleCertPrivInput}>Submit</Button>
+            <Button
+              onClick={handleCertPrivInput}
+              disabled={inputCertPriv.length < 1000}
+            >
+               Submit</Button>
           </DialogFooter>
         </DialogContent>
       </Dialog>

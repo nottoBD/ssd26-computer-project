@@ -940,24 +940,23 @@ def approve_pending(request, pk):
     # Type-specific
     if pending.type == 'appointment':
         encrypted_dek = request.data.get('encrypted_dek')
+        encrypted_patient_profile = request.data.get('encrypted_patient_profile')
+        
         if not encrypted_dek:
             forward_to_logger(request, 'approve_pending', 'fail', metadata)
             return Response({'error': 'Missing encrypted_dek'}, status=400)
 
-        # encrypted_patient_profile = request.data.get('encrypted_patient_profile')
-        # if not encrypted_patient_profile:
-        #     forward_to_logger(request, 'approve_pending', 'fail', metadata)
-        #     return Response({'error': 'Missing encrypted_patient_profile'}, status=400)    
+        if not encrypted_patient_profile:
+            forward_to_logger(request, 'approve_pending', 'fail', metadata)
+            return Response({'error': 'Missing encrypted_patient_profile'}, status=400)
 
         record = request.user.medical_record
         record.encrypted_deks[str(pending.requester.id)] = encrypted_dek
         record.save()
-
         link = DoctorPatientLink.objects.get_or_create(doctor=pending.requester, patient=request.user)[0]
         link.encrypted_profile = base64.b64decode(encrypted_patient_profile)
         link.save()
 
-    # For file types, client handles record update, here just status
 
     pending.status = PendingRequest.StatusChoices.APPROVED
     pending.save()
