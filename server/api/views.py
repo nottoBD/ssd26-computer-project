@@ -29,9 +29,20 @@ from django.conf import settings
 
 from django.views.decorators.csrf import csrf_exempt
 
-
+# API handlers
+#
+# This module is the security boundary for the backend
+# It enforces role checks (patient vs doctor), appointment constraints, and pending workflows
+# Encrypted record payloads are treated as opaque blobs
+# The server stores ciphertext + wrapped DEKs but does not decrypt medical data
+#
+# Most endpoints emit small JSON metadata logs for later anomaly detection
 logger = logging.getLogger(__name__)
 
+
+# Returns the authenticated user's profile summary for the frontend
+# Patient gets DOB, doctor gets organization, nothing sensitive beyond that
+# Logs a small access metadata record for monitoring
 @api_view(['GET'])
 @permission_classes([IsAuthenticated])
 def get_current_user(request):
@@ -56,6 +67,9 @@ def get_current_user(request):
 
 @api_view(['GET'])
 @permission_classes([IsAuthenticated])
+# Patient-only endpoint to fetch their encrypted medical record
+# Server returns ciphertext + encrypted DEKs map + record signature
+# No decryption happens here, client is responsible for crypto
 def get_my_record(request):
     if request.user.type != User.Type.PATIENT:
         return Response({'error': 'Only patients have records'}, status=403)
@@ -77,6 +91,9 @@ def get_my_record(request):
 
 @api_view(['POST'])
 @permission_classes([IsAuthenticated])
+# Patient-only endpoint to replace their encrypted record payload
+# Expects base64 ciphertext and signature generated client-side
+# Treats the payload as opaque, stores it, logs the write event
 def update_my_record(request):
     if request.user.type != User.Type.PATIENT:
         return Response({'error': 'Only patients can update'}, status=403)
@@ -100,6 +117,9 @@ def update_my_record(request):
 
 @api_view(['POST'])
 @permission_classes([IsAuthenticated])
+# Patient appoints a doctor and optionally uploads a DEK wrapped for that doctor
+# Link is stored in DoctorPatientLink
+# If encrypted_dek is provided, it is inserted into the record.encrypted_deks map under doctor_id
 def appoint_doctor(request, doctor_id):
     if request.user.type != User.Type.PATIENT:
         return Response({'error': 'Only patients appoint'}, status=403)
@@ -130,6 +150,9 @@ def appoint_doctor(request, doctor_id):
 
 @api_view(['GET'])
 @permission_classes([IsAuthenticated])
+# Doctor-only endpoint to read a patient's encrypted record
+# Requires an existing DoctorPatientLink (appointment gate)
+# Returns ciphertext plus the DEK entry wrapped for the requesting doctor
 def get_patient_record(request, patient_id):
   if request.user.type != User.Type.DOCTOR:
     return Response({'error': 'Only doctors access'}, status=403)
@@ -162,6 +185,9 @@ def get_patient_record(request, patient_id):
 
 @api_view(['DELETE'])
 @permission_classes([IsAuthenticated])
+# Patient removes an appointed doctor
+# Deletes the appointment link and revokes DEK access by removing the doctor entry from encrypted_deks
+# Also revokes any previously approved appointment PendingRequest to keep state consistent
 def remove_doctor(request, doctor_id):
     if request.user.type != User.Type.PATIENT:
         return Response({'error': 'Only patients can remove doctors'}, status=403)
@@ -197,6 +223,8 @@ def remove_doctor(request, doctor_id):
 
 @api_view(['GET'])
 @permission_classes([IsAuthenticated])
+# Patient-only list of currently appointed doctors
+# Used by the UI to display trusted doctors and manage revocation
 def get_my_doctors(request):
     if request.user.type != User.Type.PATIENT:
         return Response({'error': 'Only patients can view appointed doctors'}, status=403)
@@ -223,6 +251,8 @@ def get_my_doctors(request):
 
 @api_view(['GET'])
 @permission_classes([IsAuthenticated])
+# Doctor-only list of currently appointed patients
+# Used by doctor portal to view records and send file requests
 def get_my_patients(request):
     if request.user.type != User.Type.DOCTOR:
         return Response({'error': 'Only doctors can view appointed patients'}, status=403)
@@ -250,6 +280,8 @@ def get_my_patients(request):
 
 @api_view(['GET'])
 @permission_classes([IsAuthenticated])
+# Patient-only doctor search directory
+# Simple name/org filtering, returns minimal identifying info for appointment requests
 def search_doctors(request):
     if request.user.type != User.Type.PATIENT:
         return Response({'error': 'Only patients can search doctors'}, status=403)
@@ -278,6 +310,8 @@ def search_doctors(request):
 
 @api_view(['GET'])
 @permission_classes([IsAuthenticated])
+# Doctor-only patient search
+# Used when requesting an appointment, does not return record data
 def search_patients(request):
     if request.user.type != User.Type.DOCTOR:
         return Response({'error': 'Only doctors can search patients'}, status=403)
@@ -304,6 +338,10 @@ def search_patients(request):
 
     return Response({'patients': data})
 
+# Stores user key material generated on the client
+# Validates X25519 and Ed25519 public keys by parsing them
+# Stores an encrypted private key blob (server never sees plaintext private keys)
+# Notes: csrf_exempt is used because the client posts during setup flows, keep this scoped and audited
 @csrf_exempt
 @api_view(['POST'])
 @permission_classes([IsAuthenticated])
@@ -361,6 +399,10 @@ def update_user_keys(request):
 
 @api_view(['POST'])
 @permission_classes([IsAuthenticated])
+# Doctor requests an appointment with a patient
+# Verifies the request signature using the public key extracted from the presented certificate
+# Enforces a short timestamp window to reduce replay risk
+# Stores the pending request for patient approval
 def request_appointment(request):
     if request.user.type != User.Type.DOCTOR:
         return Response({'error': 'Doctors only'}, status=403)
@@ -429,6 +471,8 @@ def request_appointment(request):
 
 @api_view(['GET'])
 @permission_classes([IsAuthenticated])
+# Doctor-only view of requests created by the doctor
+# Used for status tracking in the doctor portal
 def get_pending_requests(request):
     if request.user.type != User.Type.DOCTOR:
         return Response({'error': 'Doctors only'}, status=403)
@@ -438,6 +482,8 @@ def get_pending_requests(request):
 
 @api_view(['GET'])
 @permission_classes([IsAuthenticated])
+# Doctor-only endpoint to retrieve the local CA chain plus the user's stored doctor certificate
+# This is used by the frontend to attach cert material to signed actions
 def get_my_cert_chain(request):
     if request.user.type != User.Type.DOCTOR:
         return Response({'error': 'Doctors only'}, status=403)
@@ -462,10 +508,13 @@ def get_my_cert_chain(request):
         logger.error(f"Unexpected error: {str(e)}")
         return Response({'error': str(e)}, status=500)
 
+# Convenience helper to extract a public key from a PEM certificate
 def load_pub_from_cert(pem: str):
     cert = load_pem_x509_certificate(pem.encode(), default_backend())
     return cert.public_key()
 
+# Verifies a root -> intermediate -> doctor certificate chain
+# Checks signature linkage, issuer/subject continuity, and validity periods
 def verify_cert_chain(chain: dict) -> bool:
     try:
         root_cert = load_pem_x509_certificate(chain['root'].encode(), default_backend())
@@ -498,7 +547,8 @@ def verify_cert_chain(chain: dict) -> bool:
         raise ValueError("Invalid chain signature")
     except Exception as e:
         raise ValueError(str(e))
-
+# Verifies signatures for multiple key types (RSA, EC, Ed25519)
+# Kept as a single helper to avoid duplicating verify logic in chain checks
 def verify_signature(pub_key, signature: bytes, data: bytes, hash_alg=hashes.SHA256()):
     if isinstance(pub_key, RSAPublicKey):
         pub_key.verify(
@@ -516,6 +566,9 @@ def verify_signature(pub_key, signature: bytes, data: bytes, hash_alg=hashes.SHA
 
 @api_view(['POST'])
 @permission_classes([IsAuthenticated])
+# Doctor creates a pending file change request for an appointed patient
+# Appointment link is checked first
+# Payload is signed and verified with the presented certificate public key before storing
 def create_pending_request(request):
     if request.user.type != User.Type.DOCTOR:
         return Response({'error': 'Doctors only'}, status=403)
@@ -582,6 +635,8 @@ def create_pending_request(request):
     
 @api_view(['GET'])
 @permission_classes([IsAuthenticated])
+# Returns a user's stored public keys for ECDH and signing
+# Used to wrap DEKs and verify signatures client-side
 def get_user_public_key(request, user_id):
     try:
         user = User.objects.get(id=user_id)
@@ -596,6 +651,8 @@ def get_user_public_key(request, user_id):
 
 @api_view(['GET'])
 @permission_classes([IsAuthenticated])
+# Lists pending requests addressed to the current user
+# Patient uses this to approve or deny incoming requests
 def get_pending_received(request):
     requests = PendingRequest.objects.filter(target=request.user, status=PendingRequest.StatusChoices.PENDING)
     data = [{
@@ -616,6 +673,7 @@ def get_pending_received(request):
 
 @api_view(['GET'])
 @permission_classes([IsAuthenticated])
+# Patient-only view of pending appointment requests
 def get_pending_appointments(request):
     if request.user.type != User.Type.PATIENT:
         return Response({'error': 'Patients only'}, status=403)
@@ -630,6 +688,7 @@ def get_pending_appointments(request):
 
 @api_view(['GET'])
 @permission_classes([IsAuthenticated])
+# Patient-only view of pending file requests from currently appointed doctors
 def get_pending_file_requests(request):
     if request.user.type != User.Type.PATIENT:
         return Response({'error': 'Patients only'}, status=403)
@@ -648,6 +707,9 @@ def get_pending_file_requests(request):
 
 @api_view(['POST'])
 @permission_classes([IsAuthenticated])
+# Patient approves a pending request
+# For appointments: stores the DEK wrapped for the doctor and ensures the appointment link exists
+# For file requests: backend only updates status, client applies record changes after approval
 def approve_pending(request, pk):
     if request.user.type != User.Type.PATIENT:
         return Response({'error': 'Patients only'}, status=403)
@@ -682,6 +744,7 @@ def approve_pending(request, pk):
 
 @api_view(['POST'])
 @permission_classes([IsAuthenticated])
+# Patient denies a pending request, status becomes rejected
 def deny_pending(request, pk):
     if request.user.type != User.Type.PATIENT:
         return Response({'error': 'Patients only'}, status=403)
@@ -702,6 +765,8 @@ def deny_pending(request, pk):
 
 @api_view(['POST'])
 @permission_classes([IsAuthenticated])
+# Patient initializes the "self" DEK entry once
+# Used during first-time setup so the record can be encrypted and later shared via wrapped DEKs
 def init_dek(request):
     if request.user.type != User.Type.PATIENT:
         return Response({'error': 'Patients only'}, status=403)

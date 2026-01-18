@@ -1,3 +1,6 @@
+# CA helper endpoints used by the app to bootstrap and validate doctor certificates
+# Backed by step-ca + OpenSSL inside the server container, not by Django crypto primitives
+# Exposes root CA and signs CSRs, so keep strict input validation and rate limiting at the edge
 import os
 import tempfile
 import subprocess
@@ -12,6 +15,9 @@ from rest_framework.permissions import AllowAny
 from rest_framework.response import Response
 from django.http import HttpResponse
 
+# Step-CA connection and file paths come from env so dev/prod can mount different CA material
+# STEP_ROOT and STEP_INTERMEDIATE are used for chain validation (trust anchor + untrusted intermediate)
+# STEP_PASSWORD_FILE is only expected to exist in the CA container or a trusted signer container
 STEP_CA_URL = os.getenv("STEP_CA_URL", "https://step-ca:9000")
 STEP_ROOT = os.getenv("STEP_ROOT", "/ca/certs/root_ca.crt")
 STEP_INTERMEDIATE = os.getenv("STEP_INTERMEDIATE", "/ca/certs/intermediate_ca.crt")
@@ -19,6 +25,8 @@ STEP_PROVISIONER = os.getenv("STEP_PROVISIONER", "healthsecure-provisioner")
 STEP_PASSWORD_FILE = os.getenv("STEP_PASSWORD_FILE", "/home/step/secrets/password")
 
 
+# Thin wrapper around the step CLI so we get consistent error messages and non-zero exit handling
+# Uses capture_output to avoid leaking secrets to logs and to return readable diagnostics to the caller
 def _run_step(args):
     try:
         return subprocess.run(
@@ -26,6 +34,7 @@ def _run_step(args):
             check=True,
             capture_output=True,
             text=True,
+            # stdin is present to support future interactive flows, currently not used
             stdin=subprocess.PIPE,
         )
     except FileNotFoundError as exc:
@@ -36,15 +45,19 @@ def _run_step(args):
         ) from exc
 
 
+# Verifies that a presented leaf certificate chains back to our Step root via the intermediate
+# Extracts CN for UI display and auditing, does not establish identity on its own
 def verify_certificate(certificate):
+    # Defensive parsing: only take the first PEM block to avoid concatenated input tricks
     cert = certificate.split("-----END CERTIFICATE-----")[0] + "-----END CERTIFICATE-----\n"
 
+    # Use a temp file because openssl verify/x509 expect a file path
     cert_file = tempfile.NamedTemporaryFile(delete=False, suffix=".pem")
     try:
         cert_file.write(cert.encode("utf-8"))
         cert_file.flush()
         cert_file.close()
-
+        # Verify chain: trust anchor is STEP_ROOT, intermediate provided as untrusted candidate
         verify = subprocess.run(
             [
                 "openssl",
@@ -62,6 +75,7 @@ def verify_certificate(certificate):
         if "OK" not in verify.stdout:
             return {"valid": False, "detail": verify.stderr}
 
+        # Read subject to extract CN for display, not used as an authorization decision
         inspect = subprocess.run(
             [
                 "openssl",
@@ -85,6 +99,7 @@ def verify_certificate(certificate):
         return {"valid": True, "cn": cn}
     except subprocess.CalledProcessError as exc:
         return {"valid": False, "detail": exc.stderr}
+    # Always remove temp file to avoid leaving certificate material on disk
     finally:
         try:
             os.unlink(cert_file.name)
@@ -94,6 +109,8 @@ def verify_certificate(certificate):
 
 @api_view(["GET"])
 @permission_classes([AllowAny])
+# Public endpoint to serve the root CA so clients can pin or bootstrap trust locally
+# This returns the PEM content only, no authentication required by design
 def ca_root(_request):
     try:
         with open(STEP_ROOT, "r", encoding="utf-8") as handle:
@@ -108,7 +125,10 @@ def ca_root(_request):
 
 @api_view(["POST"])
 @permission_classes([AllowAny])
+# Signs a CSR using step-ca, intended for doctor certificate issuance flows
+# We bind issuance to the email SAN from the CSR to avoid relying on CN formatting conventions
 def ca_sign(request):
+    # Inputs come from JSON body, keep these fields narrow and validated to reduce CA abuse surface
     csr = request.data.get("csr")
     not_after = request.data.get("notAfter")
     not_before = request.data.get("notBefore")
@@ -139,6 +159,7 @@ def ca_sign(request):
     except Exception as exc:
         return Response({"message": "Failed to parse CSR", "detail": str(exc)}, status=400)
 
+    # Temp files avoid shell quoting issues and keep step CLI usage predictable across environments
     token_file = tempfile.NamedTemporaryFile(delete=False, suffix=".txt")
     csr_file = tempfile.NamedTemporaryFile(delete=False, suffix=".csr")
     cert_file = tempfile.NamedTemporaryFile(delete=False, suffix=".crt")
@@ -149,6 +170,7 @@ def ca_sign(request):
         cert_file.close()
         token_file.close()
 
+        # Create a one-time step token scoped to the CSR subject, bounded by optional notBefore/notAfter
         token_args = [
             "step",
             "ca",
@@ -205,10 +227,13 @@ def ca_sign(request):
 
 @api_view(["POST"])
 @permission_classes([AllowAny])
+# Public verification endpoint used by the UI/backend to validate a presented cert chain and extract CN
+# Returns 500 on verify failure here because it indicates trust failure, adjust to 400 if treating as user input
 def ca_verify(request):
     cert = request.data.get("cert")
     if not isinstance(cert, str) or "BEGIN CERTIFICATE" not in cert:
         return Response({"message": "cert field with PEM certificate is required"}, status=400)
+    # Delegate to openssl chain verification using the configured root and intermediate
     result = verify_certificate(cert)
     if not result["valid"]:
         return Response({"message": "Verification failed", "detail": result.get("detail")}, status=500)
