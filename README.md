@@ -15,12 +15,15 @@
 To build and run this project, you must fulfill certain requirements:
 - Docker
 - Docker Buildx
-- Docker Compose
+- [Docker Compose](https://docs.docker.com/compose/install/linux/)
 - Make
 - Python 3.10 or newer
-- QR code reader (ie: CoBang Linux)
+- QR code reader (ie: [CoBang](https://github.com/hongquan/CoBang?tab=readme-ov-file#ubuntu))
 - Web browser (Chrome-based for its Webauthn DevTool)
-- Windows Hello or any browser Password Manager (for Linux & non-PRF enabled devices)
+- Have at least one of these:
+  - Hardware Key 
+  - Windows Hello or Apple Touch ID
+  - Browser Password Manager Extension (non-PRF fallback)
 
 The project is designed to build and run on an x64 Ubuntu 22.04 distribution or an x64 Windows 10 machine.
 
