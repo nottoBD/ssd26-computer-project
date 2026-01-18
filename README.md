@@ -1,29 +1,69 @@
-## User Management
+# Secure Medical Records System
 
-- **Credential/Info Changes (Master Note)**: Implement PUT `/api/users/credentials` for updating WebAuthn credentials or certs. Client generates new keypair, signs update request; server revokes old cert via CRL update in PKI (using oscrypto or similar for CRL management). Support multi-device: broadcast changes to approved devices via WebSocket (ws module), require secondary approval if primary initiates.
+## Group Members
 
-- **Revocation**: Add DELETE `/api/users/revoke` endpoint. Client signs revocation; server marks user inactive, adds cert to CRL, cascades to remove from appointed lists (atomic transaction with mongoose-transactions). Prevent access to records post-revocation by checking CRL on every request.
+| Matricule | Name              |
+|-----------|-------------------|
+| 519237    | Peetroons Simon   |
+| 604350    | Andrianirina Mino |
+| 615056    | Botton David      |
+| 616822    | Gerday Léandre    |
+| 617441    | Varga Ferenc      |
 
-## Doctor Appointment Management
+## Prerequisites
 
-- **Add/Remove Doctors**: For patient-initiated: POST/DELETE `/api/appointments/doctor/:doctorId` from client, signed by patient cert. Server verifies sig, updates patient's encrypted appointedDoctors array (decrypt not needed; use blinded index for doctor ID search). Sanitize :doctorId with express-validator to prevent Mongo injection.
+To build and run this project, you must fulfill certain requirements:
+- Docker
+- Docker Buildx
+- Docker Compose
+- Make
+- Python 3.10 or newer
+- QR code reader (ie: CoBang Linux)
+- Web browser (Chrome-based for its Webauthn DevTool)
+- Windows Hello or any browser Password Manager (for Linux & non-PRF enabled devices)
 
-- **Doctor-Initiated Appointments**: POST `/api/appointments/request/:patientId` from doctor client, signed. Server stores pending request in temp collection, notifies patient via email (nodemailer) or push (if implemented). Patient approves via PUT `/api/appointments/approve/:requestId`, signing approval; server then updates lists. Use uuid for requestId to avoid guessable IDs.
+The project is designed to build and run on an x64 Ubuntu 22.04 distribution or an x64 Windows 10 machine.
 
-- **Integrity/Non-Repudiation**: Chain appointment history with hashes (previousHash field in schema), verify on read to detect tampering. Use helmet middleware for CSP/XSS protection on related endpoints.
+## Building and Running the Project
 
-## Medical Record Management
+1. Clone the repository to your local machine.
 
-- **Record Structure**: Model in `server/models/record.js` as tree: Patient has root Record doc with files array (each: encryptedContent as Binary, encryptedName as string, date as Date, signatures array). Support directory depth up to 5 (config const); store treeDepth in metadata. No subdirs enforced, but allow nested via parentId refs.
+2. Navigate to the project root directory.
 
-- **Viewing Records**: GET `/api/records/:patientId` (for self or appointed doctor). Server checks caller cert against appointed list (blinded query), sends encrypted files. Client decrypts/verifies sigs. For doctors, require re-auth if session >1h (using express-session with secure cookies).
+3. Run the following command from project's root to build and launch the project:
 
-- **Uploading Files**: POST `/api/records/upload` using multer (diskStorage with uuid filenames, limits: {fileSize: 10*1024*1024}, fileFilter: validate MIME with file-type module to allow pdf/docx/jpg/png only, reject others to prevent shell injections). Client encrypts file/content/date/name, signs; server stores, adds to tree. Sandbox uploads: process in /tmp dir, use fs.promises.unlink post-upload. For doctor-initiated: require patient approval via signed token (JWT with jose module, short expiry).
+```
+make
+```
 
-- **Editing Files**: PUT `/api/records/:fileId` similar to upload, but append version (use mongoose-version plugin for auto-versioning). Client re-encrypts new content, signs; server replaces, preserves old version hash for audit.
+This will execute three scripts in sequence:
+- `reset`: Resets the environment.
+- `pki`: Sets up the Public Key Infrastructure.
+- `run`: Starts the containers.
 
-- **Deleting Files**: DELETE `/api/records/:fileId`, signed by patient/approved doctor. Server marks as deleted (soft delete with isDeleted flag), overwrites content with zeros (via node:crypto randomBytes) to mitigate remanence. Ensure non-repudiation by logging signed delete request immutably.
+If the `make` command fails (container not running or malformed pki/ tree structure), it might be due to a poor internet connection. Try `make` again with a stable connection.
 
-- **Doctor Actions Approval**: For upload/edit/delete by doctor, create pendingAction doc, patient approves via multi-device flow (poll endpoint or WebSocket). Use rate-limit on approvals to prevent spam.
+4. To restart the containers without resetting or regenerating the PKI, use:
 
-- **Key Rotation**: Implement PUT `/api/records/rotate-key` for per-patient symmetric key rotation to limit breach impact. Each patient's records use a unique symmetric key, derived via PBKDF2 from their WebAuthn credential (or cert passphrase) + salt. Store encrypted key metadata (e.g., version, creation date) on server as blinded index. Client generates new AES-GCM 256-bit key (crypto.subtle.generateKey), optionally re-encrypts existing files in batches (download, decrypt with old, encrypt with new, re-upload). Share new key with appointed doctors via ECDH (from X.509 certs) for secure wrap (crypto.subtle.wrapKey). Trigger manually or auto (every 90 days, timestamp check on login). Require multi-device approval. Retain old keys client-side in IndexedDB for historical decryption; purge after full re-encryption.
+```
+make run
+```
+
+
+## How to Use the Project
+
+Once the project is running via Docker containers:
+
+- Add step-root.pem (Root CA) to your Chrome browser's trust store.
+- The platform will be accessible at `https://healthsecure.local:3443` (nginx port). 
+
+Detailed usage examples and report can be found in the `docs/` directory.
+
+
+## Notes
+
+- This project implements a secure client/server system for handling medical records, focusing on security aspects such as confidentiality, integrity, authentication, and non-repudiation.
+- All sensitive data is handled securely: encrypted in transit and at rest, with the server not trusted for sensitive information.
+- The system uses a PKI with a chain of trust for certificate validation.
+- Logs are implemented for monitoring user activity, with input sanitization and anomaly detection.
+- Only security and compliance with the project instructions are prioritized; web-development best practices are followed only where they impact security or efficiency.
