@@ -94,6 +94,7 @@ class DoctorPatientLink(models.Model):
         User, on_delete=models.CASCADE, related_name="appointed_doctors"
     )
     appointed_at = models.DateTimeField(auto_now_add=True)
+    encrypted_profile = models.BinaryField(null=True, blank=True)  # AES-GCM encrypted {name, dob} for doctor (IV + ciphertext + tag)
 
     class Meta:
         unique_together = ("doctor", "patient")

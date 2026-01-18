@@ -102,7 +102,7 @@ def get_current_user(request):
     
     return Response(data)
 
-# New: Fetch encrypted_profile for a user (self or appointed)
+# Fetch encrypted_profile for a user (self or appointed)
 # For appointed: check link if not self
 @api_view(['GET'])
 @permission_classes([IsAuthenticated])
@@ -140,7 +140,7 @@ def get_encrypted_profile(request, user_id=None):
     
     return Response({'encrypted_sensitive': enc_b64})
 
-# New: Batch fetch encrypted_profiles for list of IDs (with permission checks)
+# Batch fetch encrypted_profiles for list of IDs (with permission checks)
 @api_view(['POST'])
 @permission_classes([IsAuthenticated])
 def batch_encrypted_profiles(request):
@@ -290,13 +290,17 @@ def get_patient_record(request, patient_id):
 
     record = PatientRecord.objects.get(patient_id=patient_id)
     encrypted_dek = record.encrypted_deks.get(str(request.user.id))
-    
+    encrypted_profile_b64 = base64.b64encode(link.encrypted_profile).decode('utf-8') if link.encrypted_profile else None 
+    patient_public_key = record.patient.encryption_public_key.hex() if record.patient.encryption_public_key else None
+
     forward_to_logger(request, 'get_patient_record', 'success', metadata)
     
     return Response({
         'encrypted_data': base64.b64encode(record.encrypted_data).decode('utf-8') if record.encrypted_data else None,
         'encrypted_dek': encrypted_dek if encrypted_dek else None,
         'signature': base64.b64encode(record.record_signature).decode('utf-8') if record.record_signature else None,
+        'encrypted_patient_profile': encrypted_profile_b64,
+        'patient_public_key': patient_public_key,
     })
 
 
@@ -387,6 +391,8 @@ def get_my_patients(request):
         {
             'id': str(link.patient.id),
             'appointedDate': link.appointed_at.isoformat(),
+            'patient_public_key': link.patient.encryption_public_key.hex() if link.patient.encryption_public_key else None,
+            'encrypted_profile': base64.b64encode(link.encrypted_profile).decode('utf-8') if link.encrypted_profile else None,
         }
         for link in links
     ]
@@ -421,6 +427,7 @@ def search_doctors(request):
     
     return Response({'doctors': data})
 
+# Modified views.py (search_patients view)
 @api_view(['GET'])
 @permission_classes([IsAuthenticated])
 # Doctor-only patient search
@@ -436,7 +443,31 @@ def search_patients(request):
         forward_to_logger(request, 'search_patients', 'fail', metadata)
         return Response({'error': 'Only doctors can search patients'}, status=403)
 
-    patients = User.objects.filter(type=User.Type.PATIENT)
+    field = request.GET.get('field')
+
+    if not field:
+        forward_to_logger(request, 'search_patients', 'fail', metadata)
+        return Response({'error': 'field required'}, status=400)
+
+    if field in ['name', 'dob']:
+        hmac = request.GET.get('hmac')
+        if not hmac:
+            forward_to_logger(request, 'search_patients', 'fail', metadata)
+            return Response({'error': 'hmac required for name or dob'}, status=400)
+        if field == 'name':
+            patients = User.objects.filter(type=User.Type.PATIENT, name_hmac=hmac)
+        elif field == 'dob':
+            patients = User.objects.filter(type=User.Type.PATIENT, dob_hmac=hmac)
+    elif field == 'email':
+        query = request.GET.get('query')
+        if not query:
+            forward_to_logger(request, 'search_patients', 'fail', metadata)
+            return Response({'error': 'query required for email'}, status=400)
+        patients = User.objects.filter(type=User.Type.PATIENT, email__iexact=query)
+    else:
+        forward_to_logger(request, 'search_patients', 'fail', metadata)
+        return Response({'error': 'Invalid field'}, status=400)
+
     data = [
         {
             'id': str(p.id),
@@ -845,7 +876,7 @@ def get_pending_appointments(request):
     requests = PendingRequest.objects.filter(target=request.user, type='appointment', status='pending')
     data = [{
         'id': str(r.id),
-        'requester': {'id': str(r.requester.id)},
+        'requester': {'id': str(r.requester.id), 'email': r.requester.email},
         'timestamp': r.created_at.isoformat(),
     } for r in requests]
     
@@ -909,10 +940,20 @@ def approve_pending(request, pk):
         if not encrypted_dek:
             forward_to_logger(request, 'approve_pending', 'fail', metadata)
             return Response({'error': 'Missing encrypted_dek'}, status=400)
+
+        # encrypted_patient_profile = request.data.get('encrypted_patient_profile')
+        # if not encrypted_patient_profile:
+        #     forward_to_logger(request, 'approve_pending', 'fail', metadata)
+        #     return Response({'error': 'Missing encrypted_patient_profile'}, status=400)    
+
         record = request.user.medical_record
         record.encrypted_deks[str(pending.requester.id)] = encrypted_dek
         record.save()
-        DoctorPatientLink.objects.get_or_create(doctor=pending.requester, patient=request.user)
+
+        link = DoctorPatientLink.objects.get_or_create(doctor=pending.requester, patient=request.user)[0]
+        link.encrypted_profile = base64.b64decode(encrypted_patient_profile)
+        link.save()
+
     # For file types, client handles record update, here just status
 
     pending.status = PendingRequest.StatusChoices.APPROVED

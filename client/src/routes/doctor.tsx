@@ -136,7 +136,7 @@ interface PendingRequest {
 interface PendingFileRequest {
   id: string;
   type: string;
-  requester: { id: string; name: string };
+  requester: { id: string; email: string };
   details: any;
   timestamp: string;
 }
@@ -398,6 +398,9 @@ function UserPortal() {
         if (!window.__MY_PRIV__) {
           return { id: p.id, name: `Encrypted Patient (${p.id.slice(-4)})`, dob: 'Encrypted', appointedDate: p.appointedDate };
         }
+        if (!p.patient_public_key || !p.encrypted_profile) {
+          return { id: p.id, name: `Patient (${p.id.slice(-4)})`, dob: 'N/A', appointedDate: p.appointedDate };
+        }
         const patientPub = hexToBytes(p.patient_public_key);
         const shared = await ecdhSharedSecret(window.__MY_PRIV__, patientPub);
         const encBytes = base64ToBytes(p.encrypted_profile);
@@ -455,17 +458,21 @@ function UserPortal() {
     }
   };
 
-  const searchPatients = async (q: string) => {
-    if (!q) {
-      setSearchedPatients([]);
-      return;
-    }
-    try {
-      // Compute blinded HMAC for query
-      const queryLower = q.trim().toLowerCase();
-      const dateRegex = /^\d{4}-\d{2}-\d{2}$/;
-      const field = dateRegex.test(queryLower) ? 'dob' : 'name';
+// Modified doctor.tsx (searchPatients function)
+const searchPatients = async (q: string) => {
+  if (!q) {
+    setSearchedPatients([]);
+    return;
+  }
+  try {
+    // Compute blinded HMAC for query if not email
+    const queryLower = q.trim().toLowerCase();
+    const dateRegex = /^\d{4}-\d{2}-\d{2}$/;
+    const isEmail = queryLower.includes('@') && queryLower.split('@').length === 2;
+    const field = isEmail ? 'email' : dateRegex.test(queryLower) ? 'dob' : 'name';
 
+    let searchParams = `field=${field}`;
+    if (!isEmail) {
       const hmacKey = await window.crypto.subtle.importKey(
         "raw",
         SEARCH_SECRET,
@@ -475,28 +482,32 @@ function UserPortal() {
       );
       const hmacBytes = await window.crypto.subtle.sign("HMAC", hmacKey, new TextEncoder().encode(queryLower));
       const hmac = bytesToHex(new Uint8Array(hmacBytes));
-
-      // Generate metadata for patients search (doctor-specific, no tree depth)
-      const searchMetadata = generateMetadata({}, ['doctor', 'search_patients'], 'GET');
-      const searchMetadataHeader = await prepareMetadata(searchMetadata, window.__SIGN_PRIV__); // Sign available
-
-      const r = await fetch(`/api/patients/search/?hmac=${encodeURIComponent(hmac)}&field=${field}`, {
-        headers: { "X-Metadata": searchMetadataHeader } // Attach as header
-      });
-      if (!r.ok) throw new Error(await r.text());
-      const { patients } = await r.json(); // [{id}]
-      const searched = patients.map((p: {id: string}, index: number) => ({
-        id: p.id,
-        name: field === 'name' ? q : `Matching Patient #${index + 1} (ID ...${p.id.slice(-4)})`,
-        dob: field === 'dob' ? q : ''
-      }));
-      setSearchedPatients(searched);
-    } catch (err) {
-      console.error("Search patients failed:", err);
-      setError(err.message);
+      searchParams += `&hmac=${encodeURIComponent(hmac)}`;
+    } else {
+      searchParams += `&query=${encodeURIComponent(queryLower)}`;
     }
-  };
 
+    // Generate metadata for patients search (doctor-specific, no tree depth)
+    const searchMetadata = generateMetadata({}, ['doctor', 'search_patients'], 'GET');
+    const searchMetadataHeader = await prepareMetadata(searchMetadata, window.__SIGN_PRIV__); // Sign available
+
+    const r = await fetch(`/api/patients/search/?${searchParams}`, {
+      headers: { "X-Metadata": searchMetadataHeader } // Attach as header
+    });
+    if (!r.ok) throw new Error(await r.text());
+    const { patients } = await r.json(); // [{id}]
+    const searched = patients.map((p: {id: string}, index: number) => ({
+      id: p.id,
+      name: field === 'name' || field === 'email' ? q : `Matching Patient #${index + 1} (ID ...${p.id.slice(-4)})`,
+      dob: field === 'dob' ? q : ''
+    }));
+    setSearchedPatients(searched);
+  } catch (err) {
+    console.error("Search patients failed:", err);
+    setError(err.message);
+  }
+};
+  
   const requestAppointment = async (patientId: string) => {
     if (!window.__MY_PRIV__) {
       setInputPrivOpen(true);
@@ -745,8 +756,9 @@ const approveFileRequest = async (req: PendingFileRequest) => {
 
     // Fetch current record
     const recordRes = await fetch("/api/record/my/", {
-      headers: { "X-Metadata": recordMetadataHeader } // Attach as header
+      headers: { "X-Metadata": recordMetadataHeader }
     });
+
     if (!recordRes.ok) throw new Error("Failed to fetch record");
     const recordData = await recordRes.json();
     const encDekSelf = recordData.encrypted_deks["self"];
@@ -754,11 +766,17 @@ const approveFileRequest = async (req: PendingFileRequest) => {
     const masterKEK = await deriveMasterKEK(window.__MY_PRIV__);
     let recordDek = await decryptDEK(encDekSelf, masterKEK);
     let encryptedData = base64ToBytes(recordData.encrypted_data || "");
-    const iv = encryptedData.slice(0, 12);
-    const tag = encryptedData.slice(-16);
-    const ciphertext = encryptedData.slice(12, -16);
-    let dirJson = await decryptAES(ciphertext, recordDek, iv, tag);
-    let dir = JSON.parse(new TextDecoder().decode(dirJson)) || { name: "Root", type: "folder", children: [], metadata: { created: new Date().toISOString(), size: 0 } };
+    let dir;
+    if (encryptedData.length === 0) {
+      dir = { name: "Root", type: "folder", children: [], metadata: { created: new Date().toISOString(), size: 0 } };
+    } else {
+      if (encryptedData.length < 28) throw new Error("Invalid encrypted data length for directory");
+      const iv = encryptedData.slice(0, 12);
+      const tag = encryptedData.slice(-16);
+      const ciphertext = encryptedData.slice(12, -16);
+      let dirJson = await decryptAES(ciphertext, recordDek, iv, tag);
+      dir = JSON.parse(new TextDecoder().decode(dirJson)) || { name: "Root", type: "folder", children: [], metadata: { created: new Date().toISOString(), size: 0 } };
+    }
     // Normalize path
     let pathStr = (req.details.path || '').trim();
     if (pathStr.startsWith('/')) pathStr = pathStr.slice(1);
@@ -798,7 +816,12 @@ const approveFileRequest = async (req: PendingFileRequest) => {
         current.children.splice(index, 1);
       } else if (pathParts.length > 0) {
         const parentPath = pathParts.slice(0, -1);
-        const parent = getParent(dir, parentPath);
+        let parent;
+        if (parentPath.length === 0) {
+          parent = dir;
+        } else {
+          parent = getParent(dir, parentPath);
+        }
         if (!parent || !parent.children) throw new Error("Parent not found");
         const lastName = pathParts[pathParts.length - 1];
         const index = parent.children.findIndex((c: RecordNode) => c.name === lastName);
@@ -1066,7 +1089,7 @@ function getParent(root: any, parts: string[]): any {
                     <DialogTitle>Search and Request Appointment</DialogTitle>
                   </DialogHeader>
                   <Input
-                    placeholder="Search by name or DOB (YYYY-MM-DD)"
+                    placeholder="Search by email"
                     value={searchQuery}
                     onChange={(e) => {
                       setSearchQuery(e.target.value);
@@ -1081,7 +1104,7 @@ function getParent(root: any, parts: string[]): any {
                         className="flex justify-between items-center py-2 border-b"
                       >
                         <span>
-                          {pat.name} (DOB: {pat.dob})
+                          {pat.name}
                         </span>
                         <Button onClick={() => requestAppointment(pat.id)}>
                           Request

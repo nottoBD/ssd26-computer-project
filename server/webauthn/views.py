@@ -1119,7 +1119,7 @@ class StartAddWithCode(View):
                 user={
                     "id": str(user.id).encode(),
                     "name": user.email,
-                    "displayName": f"{user.first_name} {user.last_name}",
+                    "displayName": user.email,
                 },
                 credentials=[c.get_credential_data() for c in user.webauthn_credentials.all()],
                 user_verification="required",
