@@ -6,7 +6,7 @@ from .models import WebAuthnCredential, AuthenticationLog
 
 class WebAuthnCredentialAdmin(admin.ModelAdmin):
     ordering = ('-created_at',)
-    list_display = ('user', 'name', 'prf_enabled', 'is_primary', 'supports_sign_count', 'sign_count', 'created_at', 'credential_status')
+    list_display = ('user', 'prf_enabled', 'is_primary', 'supports_sign_count', 'sign_count', 'created_at', 'credential_status')
     list_filter = ('prf_enabled', 'is_primary', 'supports_sign_count', 'created_at')
     search_fields = ('user__email', 'name')
     readonly_fields = ('credential_id', 'public_key', 'transports', 'aaguid', 'credential_status')

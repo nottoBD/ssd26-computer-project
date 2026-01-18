@@ -84,9 +84,10 @@ import {
   hexToBytes,
   ecdhSharedSecret,
   decryptAES,
+  bytesToHex,
 } from "../components/CryptoUtils";
 import { saveKey, getKey } from "../lib/key-store";
-import { generateMetadata, prepareMetadata } from '../lib/metadata'; // New import for metadata
+import { generateMetadata, prepareMetadata } from '../lib/metadata';
 
 /**
  * FUNCTION: getCookie
@@ -127,7 +128,7 @@ interface PendingRequest {
   type: string;
   status: string;
   patient_id: string;
-  patient_name: string;
+  patient_email: string;
   timestamp: string;
   details: any;
 }
@@ -142,7 +143,7 @@ interface PendingFileRequest {
 
 interface PendingAppointment {
   id: string;
-  requester: { id: string; name: string };
+  requester: { id: string; email: string };
   timestamp: string;
 }
 
@@ -207,6 +208,8 @@ const decryptDEK = async (
   const ciphertext = dekBytes.slice(12, -16);
   return await decryptAES(ciphertext, key, iv, tag);
 };
+
+const SEARCH_SECRET = new TextEncoder().encode("healthsecure_blind_search_v1_2026_jan"); // Hardcoded client-side secret for blinded HMAC indexes (do not expose to server logic)
 
 export const Route = createFileRoute("/doctor")({
   beforeLoad: async () => {
@@ -390,8 +393,22 @@ function UserPortal() {
         headers: { "X-Metadata": patientsMetadataHeader } // Attach as header
       });
       if (!r.ok) throw new Error(await r.text());
-      const { patients } = await r.json();
-      setAppointedPatients(patients);
+      const { patients } = await r.json(); // Expect [{id, appointedDate, encrypted_profile (b64), patient_public_key (hex)}]
+      const decryptedPatients = await Promise.all(patients.map(async (p: any) => {
+        if (!window.__MY_PRIV__) {
+          return { id: p.id, name: `Encrypted Patient (${p.id.slice(-4)})`, dob: 'Encrypted', appointedDate: p.appointedDate };
+        }
+        const patientPub = hexToBytes(p.patient_public_key);
+        const shared = await ecdhSharedSecret(window.__MY_PRIV__, patientPub);
+        const encBytes = base64ToBytes(p.encrypted_profile);
+        const iv = encBytes.slice(0, 12);
+        const tag = encBytes.slice(-16);
+        const ciphertext = encBytes.slice(12, -16);
+        const profileBytes = await decryptAES(ciphertext, shared, iv, tag);
+        const profile = JSON.parse(new TextDecoder().decode(profileBytes));
+        return { id: p.id, name: profile.name, dob: profile.dob, appointedDate: p.appointedDate };
+      }));
+      setAppointedPatients(decryptedPatients);
     } catch (err) {
       console.error("Patients fetch failed:", err);
       setError(err.message);
@@ -444,16 +461,36 @@ function UserPortal() {
       return;
     }
     try {
+      // Compute blinded HMAC for query
+      const queryLower = q.trim().toLowerCase();
+      const dateRegex = /^\d{4}-\d{2}-\d{2}$/;
+      const field = dateRegex.test(queryLower) ? 'dob' : 'name';
+
+      const hmacKey = await window.crypto.subtle.importKey(
+        "raw",
+        SEARCH_SECRET,
+        { name: "HMAC", hash: "SHA-256" },
+        false,
+        ["sign"]
+      );
+      const hmacBytes = await window.crypto.subtle.sign("HMAC", hmacKey, new TextEncoder().encode(queryLower));
+      const hmac = bytesToHex(new Uint8Array(hmacBytes));
+
       // Generate metadata for patients search (doctor-specific, no tree depth)
       const searchMetadata = generateMetadata({}, ['doctor', 'search_patients'], 'GET');
       const searchMetadataHeader = await prepareMetadata(searchMetadata, window.__SIGN_PRIV__); // Sign available
 
-      const r = await fetch(`/api/patients/search/?q=${encodeURIComponent(q)}`, {
+      const r = await fetch(`/api/patients/search/?hmac=${encodeURIComponent(hmac)}&field=${field}`, {
         headers: { "X-Metadata": searchMetadataHeader } // Attach as header
       });
       if (!r.ok) throw new Error(await r.text());
-      const { patients } = await r.json();
-      setSearchedPatients(patients);
+      const { patients } = await r.json(); // [{id}]
+      const searched = patients.map((p: {id: string}, index: number) => ({
+        id: p.id,
+        name: field === 'name' ? q : `Matching Patient #${index + 1} (ID ...${p.id.slice(-4)})`,
+        dob: field === 'dob' ? q : ''
+      }));
+      setSearchedPatients(searched);
     } catch (err) {
       console.error("Search patients failed:", err);
       setError(err.message);
@@ -628,8 +665,27 @@ function UserPortal() {
         ]),
       );
 
+      // Fetch and decrypt own profile to share name/dob (encrypted for doctor)
+      const profileRes = await fetch("/api/user/profile/encrypted/");
+      if (!profileRes.ok) throw new Error("Failed to fetch encrypted profile");
+      const { encrypted_sensitive } = await profileRes.json();
+      const encBytes = base64ToBytes(encrypted_sensitive);
+      const profileIv = encBytes.slice(0, 12);
+      const profileTag = encBytes.slice(-16);
+      const profileCipher = encBytes.slice(12, -16);
+      const profileBytes = await decryptAES(profileCipher, masterKEK, profileIv, profileTag);
+      const sensitive = JSON.parse(new TextDecoder().decode(profileBytes));
+      const profileForDoc = JSON.stringify({
+        name: `${sensitive.first_name} ${sensitive.last_name}`,
+        dob: sensitive.date_of_birth,
+      });
+      const encProfile = await encryptAES(new TextEncoder().encode(profileForDoc), shared);
+      const encProfileStr = bytesToBase64(
+        new Uint8Array([...encProfile.iv, ...encProfile.ciphertext, ...encProfile.tag])
+      );
+
       // Generate metadata for approve (patient-specific, no tree depth)
-      const approvePayload = { encrypted_dek: encDekStr };
+      const approvePayload = { encrypted_dek: encDekStr, encrypted_patient_profile: encProfileStr };
       const approveMetadata = generateMetadata(approvePayload, ['patient', 'approve_appointment'], 'POST');
       const approveMetadataHeader = await prepareMetadata(approveMetadata, window.__SIGN_PRIV__); // Sign available
 
@@ -1010,7 +1066,7 @@ function getParent(root: any, parts: string[]): any {
                     <DialogTitle>Search and Request Appointment</DialogTitle>
                   </DialogHeader>
                   <Input
-                    placeholder="Search by name, DOB..."
+                    placeholder="Search by name or DOB (YYYY-MM-DD)"
                     value={searchQuery}
                     onChange={(e) => {
                       setSearchQuery(e.target.value);
@@ -1065,7 +1121,7 @@ function getParent(root: any, parts: string[]): any {
                             .toUpperCase()}
                         </TableCell>
                         <TableCell>
-                          {req.patient_name || "N/A"}
+                          {req.patient_email || "N/A"}
                         </TableCell>
                         <TableCell
                           className={
@@ -1135,7 +1191,7 @@ function getParent(root: any, parts: string[]): any {
                 <TableBody>
                   {pendingAppointments.map((req) => (
                     <TableRow key={req.id}>
-                      <TableCell>{req.requester.name}</TableCell>
+                      <TableCell>{req.requester.email}</TableCell>
                       <TableCell>
                         {new Date(req.timestamp).toLocaleString()}
                       </TableCell>

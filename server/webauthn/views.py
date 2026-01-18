@@ -5,7 +5,7 @@ import enum
 import requests
 import os
 from base64 import urlsafe_b64decode, urlsafe_b64encode
-
+import base64
 from django.http import JsonResponse
 from django.views import View
 from django.views.decorators.csrf import csrf_exempt
@@ -19,8 +19,6 @@ from cryptography.hazmat.primitives.asymmetric import padding
 from cryptography.hazmat.primitives.asymmetric.rsa import RSAPublicKey
 from cryptography.hazmat.primitives import hashes
 from datetime import datetime
-import os
-import logging
 
 from fido2.webauthn import PublicKeyCredentialRpEntity, AttestedCredentialData, CollectedClientData, AttestationObject, AuthenticatorData
 from fido2.server import Fido2Server
@@ -158,6 +156,24 @@ from common.input_validation import (
     require_choice, require_pem_cert
 )
 
+@method_decorator(login_required, name='dispatch')
+class GetEncryptedProfile(View):
+    def get(self, request):
+        try:
+            metadata = parse_metadata(request, request.user)
+        except InputError as e:
+            forward_to_logger(request, 'get_encrypted_profile', 'fail', {})
+            return JsonResponse({"error": str(e)}, status=e.status)
+
+        if request.user.encrypted_profile is None:
+            return JsonResponse({"error": "No profile data"}, status=404)
+
+        enc_b64 = base64.b64encode(request.user.encrypted_profile).decode('utf-8')
+
+        forward_to_logger(request, 'get_encrypted_profile', 'success', metadata)
+
+        return JsonResponse({"encrypted_sensitive": enc_b64})
+    
 @method_decorator(csrf_exempt, name="dispatch")
 class StartRegistration(View):
     def post(self, request):
@@ -195,6 +211,16 @@ class StartRegistration(View):
             if key not in data or data[key] is None:
                 return default
             return clean_str(data[key], key, max_len=max_len, allow_empty=True)
+
+        def clean_hex_str(v, field, length=64):
+            s = clean_str(v, field, max_len=length, allow_empty=False)
+            try:
+                b = bytes.fromhex(s)
+                if len(b) != length // 2:
+                    raise ValueError(f"{field} must be {length} hex chars ({length//2} bytes)")
+            except ValueError as e:
+                raise ValueError(str(e))
+            return s
 
         # ---- 1) JSON parse + limite taille ----
         raw = request.body or b""
@@ -237,26 +263,47 @@ class StartRegistration(View):
             if not EMAIL_RE.match(email):
                 return bad("Invalid email format", status=400)
 
-            first_name = clean_str(data.get("first_name", ""), "first_name", max_len=50)
-            last_name = clean_str(data.get("last_name", ""), "last_name", max_len=50)
-
             user_type = clean_str(data.get("type", ""), "type", max_len=16, lower=False)
             if user_type not in (User.Type.PATIENT, User.Type.DOCTOR, "patient", "doctor"):
-                # supporte soit la string, soit l'enum (selon ton modèle)
                 return bad("Invalid user type", status=400)
 
-            # normalise en valeur attendue par ton modèle
-            # (si User.Type.PATIENT est une string "patient", ça marche pareil)
             if user_type == "patient":
                 user_type = User.Type.PATIENT
             elif user_type == "doctor":
                 user_type = User.Type.DOCTOR
 
-            date_of_birth = opt_str(data, "date_of_birth", max_len=32, default=None)
-            medical_organization = opt_str(data, "medical_organization", max_len=80, default="")
+            encrypted_sensitive = clean_str(data.get("encrypted_sensitive", ""), "encrypted_sensitive", max_len=2000)
+            try:
+                enc_profile = base64.b64decode(encrypted_sensitive + '==' * ((4 - len(encrypted_sensitive) % 4) % 4))
+                if len(enc_profile) > 1024:
+                    raise ValueError("Encrypted profile too large")
+            except Exception as e:
+                return bad(f"Invalid encrypted_sensitive: {str(e)}", status=400)
 
-            device_name = opt_str(data, "device_name", max_len=40, default="")
+            x25519_public_hex = opt_str(data, "x25519_public", max_len=64, default=None)
+            encryption_public_key = None
+            if x25519_public_hex:
+                try:
+                    enc_public_bytes = bytes.fromhex(x25519_public_hex)
+                    if len(enc_public_bytes) != 32:
+                        raise ValueError("Must be 32 bytes")
+                    X25519PublicKey.from_public_bytes(enc_public_bytes)
+                    encryption_public_key = enc_public_bytes
+                except ValueError as e:
+                    return bad(f"Invalid x25519_public: {str(e)}", status=400)
 
+            # Blinded indexes (required)
+            name_hmac = clean_hex_str(data.get("name_hmac", ""), "name_hmac")
+
+            dob_hmac = None
+            org_hmac = None
+            if user_type == User.Type.PATIENT:
+                dob_hmac = clean_hex_str(data.get("dob_hmac", ""), "dob_hmac")
+            else:
+                org_hmac = clean_hex_str(data.get("org_hmac", ""), "org_hmac")
+
+            # Device name not sent plaintext, use default
+            device_name = "New Device"
         except ValueError as e:
             return bad(str(e), status=400)
 
@@ -289,12 +336,16 @@ class StartRegistration(View):
         # ---- 5) Création user (comportement identique en happy path) ----
         user = User.objects.create_user(
             email=email,
-            first_name=first_name,
-            last_name=last_name,
             type=user_type,
-            date_of_birth=date_of_birth,
-            medical_organization=medical_organization,
+            encrypted_profile=enc_profile,
         )
+        if encryption_public_key is not None:
+            user.encryption_public_key = encryption_public_key
+        user.name_hmac = name_hmac
+        if user_type == User.Type.PATIENT:
+            user.dob_hmac = dob_hmac
+        else:
+            user.org_hmac = org_hmac
         user.is_active = False
         if certificate is not None:
             user.certificate = certificate
@@ -308,7 +359,7 @@ class StartRegistration(View):
             user={
                 "id": str(user.id).encode(),
                 "name": user.email,
-                "displayName": f"{user.first_name} {user.last_name}",
+                "displayName": user.email,
             },
             credentials=[],
             user_verification="required",
@@ -597,7 +648,6 @@ class FinishRegistration(View):
             import traceback
             logger.error(traceback.format_exc())
             return bad(f"Registration failed: {str(e)}", status=400)
-
 
 @method_decorator(csrf_exempt, name="dispatch")
 class StartAuthentication(View):
@@ -1392,3 +1442,4 @@ def is_primary_device(request):
         return True
     except WebAuthnCredential.DoesNotExist:
         return False
+

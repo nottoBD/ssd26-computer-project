@@ -9,10 +9,10 @@ from .models import User, PatientRecord, DoctorPatientLink, PendingRequest
 
 @admin.register(User)
 class UserAdmin(BaseUserAdmin):
-    ordering = ('email',)  # Default sort for changelist
+    ordering = ('email',)
 
     list_display = (
-        'email', 'first_name', 'last_name', 'type', 'is_active', 'date_joined',
+        'email', 'type', 'is_active', 'date_joined',
         'account_status', 'device_count', 'last_login_attempt', 'suspicious_activity'
     )
     list_filter = ('type', 'is_active', 'is_staff', 'date_joined')

@@ -30,6 +30,9 @@ from cryptography.exceptions import InvalidSignature
 from django.conf import settings
 from django.views.decorators.csrf import csrf_exempt
 from common.input_validation import parse_metadata, InputError
+from cryptography.hazmat.primitives.kdf.hkdf import HKDF
+from cryptography.hazmat.primitives import hashes
+import hmac
 
 # API handlers
 #
@@ -74,9 +77,13 @@ def forward_to_logger(request, view_name, outcome, metadata=None):
     except Exception as e:
         logger.error(f"Logger forward error: {str(e)}")
 
+# Helper to compute blinded HMAC index for names/org (use in registration/update)
+# SECRET from settings.HMAC_SECRET (add to settings.py as bytes)
+def compute_hmac(value: str) -> str:
+    return hmac.new(settings.HMAC_SECRET, value.lower().encode('utf-8'), hashes.SHA256()).hexdigest()
 
 # Returns the authenticated user's profile summary for the frontend
-# Patient gets DOB, doctor gets organization, nothing sensitive beyond that
+# Only ID/type; client decrypts encrypted_profile for name/DOB/org
 # Logs a small access metadata record for monitoring
 @api_view(['GET'])
 @permission_classes([IsAuthenticated])
@@ -90,16 +97,86 @@ def get_current_user(request):
     data = {
         'id': str(user.id),
         'type': user.type,
-        'name': f"{user.first_name} {user.last_name}",
     }
-    if user.type == User.Type.PATIENT:
-        data['dob'] = user.date_of_birth.isoformat() if user.date_of_birth else None
-    elif user.type == User.Type.DOCTOR:
-        data['org'] = user.medical_organization
-    
     forward_to_logger(request, 'get_current_user', 'success', metadata) 
     
     return Response(data)
+
+# New: Fetch encrypted_profile for a user (self or appointed)
+# For appointed: check link if not self
+@api_view(['GET'])
+@permission_classes([IsAuthenticated])
+def get_encrypted_profile(request, user_id=None):
+    try:
+        metadata = parse_metadata(request, request.user)
+    except InputError as e:
+        forward_to_logger(request, 'get_encrypted_profile', 'fail')
+        return Response({'error': str(e)}, status=e.status)
+    
+    if user_id is None:
+        target_user = request.user
+    else:
+        try:
+            target_user = User.objects.get(id=user_id)
+        except User.DoesNotExist:
+            forward_to_logger(request, 'get_encrypted_profile', 'fail', metadata)
+            return Response({'error': 'User not found'}, status=404)
+        
+        # Permission check: self or appointed (doctor to patient or vice versa)
+        is_appointed = DoctorPatientLink.objects.filter(
+            (Q(doctor=request.user, patient=target_user) | Q(doctor=target_user, patient=request.user))
+        ).exists()
+        if request.user != target_user and not is_appointed:
+            forward_to_logger(request, 'get_encrypted_profile', 'fail', metadata)
+            return Response({'error': 'Not authorized'}, status=403)
+
+    if target_user.encrypted_profile is None:
+        forward_to_logger(request, 'get_encrypted_profile', 'fail', metadata)
+        return Response({'error': 'No profile data'}, status=404)
+
+    enc_b64 = base64.b64encode(target_user.encrypted_profile).decode('utf-8')
+    
+    forward_to_logger(request, 'get_encrypted_profile', 'success', metadata)
+    
+    return Response({'encrypted_sensitive': enc_b64})
+
+# New: Batch fetch encrypted_profiles for list of IDs (with permission checks)
+@api_view(['POST'])
+@permission_classes([IsAuthenticated])
+def batch_encrypted_profiles(request):
+    try:
+        metadata = parse_metadata(request, request.user)
+    except InputError as e:
+        forward_to_logger(request, 'batch_encrypted_profiles', 'fail')
+        return Response({'error': str(e)}, status=e.status)
+    
+    ids = request.data.get('ids', [])
+    if not isinstance(ids, list) or len(ids) > 50 or len(ids) == 0:
+        forward_to_logger(request, 'batch_encrypted_profiles', 'fail', metadata)
+        return Response({'error': 'Invalid IDs (max 50)'}, status=400)
+
+    # Get appointed users (bidirectional)
+    appointed_ids = set()
+    if request.user.type == User.Type.PATIENT:
+        appointed_ids = {str(link.doctor.id) for link in DoctorPatientLink.objects.filter(patient=request.user)}
+    elif request.user.type == User.Type.DOCTOR:
+        appointed_ids = {str(link.patient.id) for link in DoctorPatientLink.objects.filter(doctor=request.user)}
+
+    data = {}
+    for uid in ids:
+        try:
+            target_user = User.objects.get(id=uid)
+            if str(request.user.id) == uid or uid in appointed_ids:
+                enc_b64 = base64.b64encode(target_user.encrypted_profile).decode('utf-8') if target_user.encrypted_profile else None
+                data[uid] = {'encrypted_sensitive': enc_b64}
+            else:
+                data[uid] = {'error': 'Not authorized'}
+        except User.DoesNotExist:
+            data[uid] = {'error': 'User not found'}
+
+    forward_to_logger(request, 'batch_encrypted_profiles', 'success', metadata)
+    
+    return Response({'profiles': data})
 
 @api_view(['GET'])
 @permission_classes([IsAuthenticated])
@@ -220,10 +297,6 @@ def get_patient_record(request, patient_id):
         'encrypted_data': base64.b64encode(record.encrypted_data).decode('utf-8') if record.encrypted_data else None,
         'encrypted_dek': encrypted_dek if encrypted_dek else None,
         'signature': base64.b64encode(record.record_signature).decode('utf-8') if record.record_signature else None,
-        'patient': {
-            'name': f"{record.patient.first_name} {record.patient.last_name}",
-            'dob': record.patient.date_of_birth.isoformat() if record.patient.date_of_birth else None
-        }
     })
 
 
@@ -286,8 +359,6 @@ def get_my_doctors(request):
     doctors = [
         {
             'id': str(link.doctor.id),  # UUID as string
-            'name': f"{link.doctor.first_name} {link.doctor.last_name}",
-            'org': link.doctor.medical_organization
         }
         for link in links
     ]
@@ -315,8 +386,6 @@ def get_my_patients(request):
     patients = [
         {
             'id': str(link.patient.id),
-            'name': f"{link.patient.first_name} {link.patient.last_name}",
-            'dob': link.patient.date_of_birth.isoformat() if link.patient.date_of_birth else None,
             'appointedDate': link.appointed_at.isoformat(),
         }
         for link in links
@@ -329,7 +398,7 @@ def get_my_patients(request):
 @api_view(['GET'])
 @permission_classes([IsAuthenticated])
 # Patient-only doctor search directory
-# Simple name/org filtering, returns minimal identifying info for appointment requests
+# Returns all doctor IDs (small DB assumption); client fetches batch profiles and searches locally
 def search_doctors(request):
     try:
         metadata = parse_metadata(request, request.user)
@@ -341,15 +410,10 @@ def search_doctors(request):
         forward_to_logger(request, 'search_doctors', 'fail', metadata)
         return Response({'error': 'Only patients can search doctors'}, status=403)
 
-    q = request.GET.get('q', '')
-    doctors = User.objects.filter(type=User.Type.DOCTOR).filter(
-        Q(first_name__icontains=q) | Q(last_name__icontains=q) | Q(medical_organization__icontains=q)
-    )
+    doctors = User.objects.filter(type=User.Type.DOCTOR)
     data = [
         {
             'id': str(d.id),
-            'name': f"{d.first_name} {d.last_name}",
-            'org': d.medical_organization
         } for d in doctors
     ]
     
@@ -372,15 +436,10 @@ def search_patients(request):
         forward_to_logger(request, 'search_patients', 'fail', metadata)
         return Response({'error': 'Only doctors can search patients'}, status=403)
 
-    q = request.GET.get('q', '')
-    patients = User.objects.filter(type=User.Type.PATIENT).filter(
-        Q(first_name__icontains=q) | Q(last_name__icontains=q)
-    )
+    patients = User.objects.filter(type=User.Type.PATIENT)
     data = [
         {
             'id': str(p.id),
-            'name': f"{p.first_name} {p.last_name}",
-            'dob': p.date_of_birth.isoformat() if p.date_of_birth else None,
         } for p in patients
     ]
     
@@ -542,8 +601,8 @@ def get_pending_requests(request):
     if request.user.type != User.Type.DOCTOR:
         forward_to_logger(request, 'get_pending_requests', 'fail', metadata)
         return Response({'error': 'Doctors only'}, status=403)
-    requests = PendingRequest.objects.filter(requester=request.user)
-    data = [{'id': str(r.id), 'type': r.type, 'status': r.status, 'patient_id': str(r.target.id), 'patient_name': f"{r.target.first_name} {r.target.last_name}", 'timestamp': r.created_at.isoformat(), 'details': r.details} for r in requests]
+    pending_requests = PendingRequest.objects.filter(requester=request.user)
+    data = [{'id': str(r.id), 'type': r.type, 'status': r.status, 'patient_id': str(r.target.id), 'patient_email': r.target.email, 'timestamp': r.created_at.isoformat(), 'details': r.details} for r in pending_requests]
     
     forward_to_logger(request, 'get_pending_requests', 'success', metadata)
     
@@ -760,7 +819,7 @@ def get_pending_received(request):
     data = [{
         'id': str(r.id),
         'type': r.type,
-        'requester': {'id': str(r.requester.id), 'name': f"{r.requester.first_name} {r.requester.last_name}"},
+        'requester': {'id': str(r.requester.id), 'email': r.requester.email},
         'details': r.details,
         'timestamp': r.created_at.isoformat(),
     } for r in requests]
@@ -786,7 +845,7 @@ def get_pending_appointments(request):
     requests = PendingRequest.objects.filter(target=request.user, type='appointment', status='pending')
     data = [{
         'id': str(r.id),
-        'requester': {'id': str(r.requester.id), 'name': f"{r.requester.first_name} {r.requester.last_name}"},
+        'requester': {'id': str(r.requester.id)},
         'timestamp': r.created_at.isoformat(),
     } for r in requests]
     
@@ -814,7 +873,7 @@ def get_pending_file_requests(request):
     data = [{
         'id': str(r.id),
         'type': r.type,
-        'requester': {'id': str(r.requester.id), 'name': f"{r.requester.first_name} {r.requester.last_name}"},
+        'requester': {'id': str(r.requester.id), 'email': r.requester.email},
         'details': r.details,
         'timestamp': r.created_at.isoformat(),
     } for r in requests]

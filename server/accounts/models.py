@@ -30,15 +30,17 @@ class User(AbstractBaseUser, PermissionsMixin):
 
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     email = models.EmailField(unique=True)
-    first_name = models.CharField(max_length=150)
-    last_name = models.CharField(max_length=150)
     type = models.CharField(max_length=10, choices=Type.choices)
 
-    # Patient-only
-    date_of_birth = models.DateField(null=True, blank=True)
+    # Encrypted profile (IV + ciphertext + tag for names, DOB/org)
+    encrypted_profile = models.BinaryField(null=True, blank=True)
+
+    # Blinded indexes for search (HMAC of lowercased values)
+    name_hmac = models.CharField(max_length=64, null=True, blank=True, db_index=True)
+    org_hmac = models.CharField(max_length=64, null=True, blank=True, db_index=True)  # Doctor-only
+    dob_hmac = models.CharField(max_length=64, null=True, blank=True, db_index=True)  # Patient-only
 
     # Doctor-only
-    medical_organization = models.CharField(max_length=255, blank=True)
     certificate = models.TextField(blank=True, null=True)  # Store PEM cert for doctors
     is_active = models.BooleanField(default=True)
     is_staff = models.BooleanField(default=False)  # for admin access
@@ -63,7 +65,7 @@ class User(AbstractBaseUser, PermissionsMixin):
     objects = UserManager()
 
     USERNAME_FIELD = "email"
-    REQUIRED_FIELDS = ["first_name", "last_name", "type"]
+    REQUIRED_FIELDS = ["type"]
 
     def __str__(self):
         return self.email
