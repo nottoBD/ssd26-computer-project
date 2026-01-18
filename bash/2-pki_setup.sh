@@ -164,7 +164,10 @@ docker cp step-ca:/home/step/certs/root_ca.crt         "$ROOTS_DIR/step-root.pem
 docker cp step-ca:/home/step/certs/intermediate_ca.crt "$ROOTS_DIR/intermediate_ca.crt"
 # Create hashed CApath symlink so OpenSSL can discover the intermediate via CAPATH
 ln -sf intermediate_ca.crt "$ROOTS_DIR/$(openssl x509 -noout -hash -in "$ROOTS_DIR/intermediate_ca.crt").0"
-# Generate OpenSSL hash links for the CA directory
+# conv full CA chain for verify bundles
+docker exec step-ca bash -c "cat /home/step/certs/intermediate_ca.crt /home/step/certs/root_ca.crt > /home/step/certs/ca_chain.crt"
+docker cp step-ca:/home/step/certs/ca_chain.crt "$ROOTS_DIR/ca_chain.crt"
+# conv rehash
 command -v c_rehash >/dev/null 2>&1 && c_rehash "$ROOTS_DIR" || openssl rehash "$ROOTS_DIR"
 
 # 6) Copy leaf certs to host

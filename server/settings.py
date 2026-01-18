@@ -17,6 +17,14 @@ STEP_ROOT = os.getenv("STEP_ROOT", "/ca/certs/root_ca.crt")
 
 STEP_INTERMEDIATE = os.getenv("STEP_INTERMEDIATE", "/ca/certs/intermediate_ca.crt")
 
+LOGGER_URL = 'https://logger:5001/'
+
+SERVER_CERT = '/tls/fullchain.crt'
+
+SERVER_KEY = '/tls/server.key'
+
+CA_CHAIN = '/tls/ca_chain.crt'
+
 # webauthn = our own custom implementation (PRF support, sign-count, anomaly detection, multi-device mngmt)
 
 INSTALLED_APPS = [
@@ -53,11 +61,16 @@ DATABASES = {
         'NAME': os.environ.get('POSTGRES_DB', 'health'),
         'USER': os.environ.get('POSTGRES_USER', 'health'),
         'PASSWORD': os.environ.get('POSTGRES_PASSWORD', 'health'),
-        'HOST': 'db',  # Matches your docker-compose service name
+        'HOST': 'db',
         'PORT': '5432',
         'OPTIONS': {
-            'sslmode': 'prefer',  # Optional: Enables SSL if your Postgres supports it for security
-        },
+            'sslmode': 'prefer',
+        },  
+    },
+    'logger': {
+        'ENGINE': 'django.db.backends.sqlite3',
+        'NAME': BASE_DIR / 'logs' / 'logger.db',
+        'OPTIONS': {'timeout': 20},
     }
 }
 
@@ -173,4 +186,3 @@ RECAPTCHA_SITE_KEY = os.getenv("RECAPTCHA_SITE_KEY", "6LcvdjYsAAAAAI4qUf4My6wWKk
 RECAPTCHA_SECRET_KEY = os.getenv("RECAPTCHA_SECRET_KEY", "6LcvdjYsAAAAALRD-sSqyR7I9B3dRFGsn8LqP2r8") #INFO: dev only
 
 RECAPTCHA_SCORE_THRESHOLD = 0.5  # 0<=val<=1
-

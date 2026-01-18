@@ -1,14 +1,16 @@
-# server/common/input_validation.py
-# Small input-validation helpers used by API endpoints
-# Goal: fail fast with clear 4xx errors and size limits before doing heavier work
-# Keeps validation consistent across views
 import json
 import re
 import base64
 import binascii
 from datetime import datetime
 from django.utils import timezone
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
+from cryptography.exceptions import InvalidSignature
 
+# Small input-validation helpers used by API endpoints
+# Goal: fail fast with clear 4xx errors and size limits before doing heavier work
+# Keeps validation consistent across views
+# 
 EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 
 # Raised when user input is invalid
@@ -143,3 +145,53 @@ def require_pem_cert(data: dict, key: str, *, max_len: int = 20_000) -> str:
         raise InputError("Invalid certificate PEM", 400)
     return pem
 
+
+
+def parse_metadata(request, user):
+    header = request.headers.get('X-Metadata')
+    if not header:
+        return {}
+    
+    parts = header.split('|')
+    if len(parts) > 2:
+        return {}
+    
+    metadata_b64 = parts[0]
+    try:
+        padding = '==' * ((4 - len(metadata_b64) % 4) % 4)
+        metadata_json_bytes = base64.b64decode((metadata_b64 + padding).encode('ascii'))
+        metadata_json = metadata_json_bytes.decode('utf-8')
+        metadata = json.loads(metadata_json)
+    except Exception:
+        return {}
+    
+    if 'timestamp' not in metadata:
+        return {}  # Ignore if missing
+    
+    try:
+        parse_iso_datetime(metadata['timestamp'], max_skew_seconds=30)
+    except:
+        return {}
+    
+    if 'size' in metadata:
+        if not isinstance(metadata['size'], int) or metadata['size'] < 0:
+            del metadata['size']  # Ignore invalid
+    
+    if 'privileges' in metadata and (not isinstance(metadata['privileges'], list) or not all(isinstance(p, str) for p in metadata['privileges'])):
+        del metadata['privileges']
+    
+    # treeDepth: Optional int >=0
+    if 'treeDepth' in metadata and (not isinstance(metadata['treeDepth'], int) or metadata['treeDepth'] < 0):
+        del metadata['treeDepth']
+    
+    if len(parts) == 2:
+        if user is not None:
+            sig_hex = parts[1]
+            try:
+                sig = bytes.fromhex(sig_hex)
+                pub = Ed25519PublicKey.from_public_bytes(bytes(user.signing_public_key))
+                pub.verify(sig, metadata_json.encode('utf-8'))
+            except (InvalidSignature, ValueError):
+                return {}  # Ignore invalid sig instead of raise
+    
+    return metadata

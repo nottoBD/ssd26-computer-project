@@ -33,6 +33,8 @@ import { deriveEd25519FromX25519 } from '../components/CryptoUtils';
 import { Button } from '@/components/ui/button'
 import { Shield, User, Stethoscope, Settings as SettingsIcon, LogOut as LogOutIcon } from 'lucide-react'
 import { useState, useEffect, createContext, useContext } from 'react'
+import { apiFetch } from '../lib/utils';
+import { generateMetadata, prepareMetadata } from '../lib/metadata';
 
 interface AuthContextType {
   isAuthenticated: boolean
@@ -112,10 +114,7 @@ export const Route = createRootRoute({
 
     const checkAuth = async () => {
       try {
-        const response = await fetch('/api/webauthn/auth/status/', {
-          method: 'GET',
-          credentials: 'include',
-        })
+        const response = await apiFetch('/api/webauthn/auth/status/', { method: 'GET', credentials: 'include' }, ["auth", "status"]);
         if (!response.ok) {
           setIsAuthenticated(false)
           return
@@ -123,10 +122,7 @@ export const Route = createRootRoute({
         const data = await response.json()
         setIsAuthenticated(data.authenticated)
         if (data.authenticated) {
-          const userRes = await fetch('/api/user/me/', {
-            method: 'GET',
-            credentials: 'include',
-          })
+          const userRes = await apiFetch('/api/user/me/', { method: 'GET', credentials: 'include' }, ["user", "get_me"]);
           if (userRes.ok) {
             const userData = await userRes.json()
             setUserType(userData.type)
@@ -138,14 +134,16 @@ export const Route = createRootRoute({
               if (storedKey) {
                   console.log("Restore key from IndexDB");
                   
-                  if (storedKey instanceof Uint8Array) {
-                    (window as any).__MY_PRIV__ = storedKey;
+                  let privBytes: Uint8Array;
+                  if (storedKey instanceof CryptoKey) {
+                    const raw = await crypto.subtle.exportKey("raw", storedKey);
+                    privBytes = new Uint8Array(raw);
                   } else {
-                    const raw = await crypto.subtle.exportKey("raw", storedKey as CryptoKey);
-                    (window as any).__MY_PRIV__ = new Uint8Array(raw);
+                    privBytes = storedKey as Uint8Array;
                   }
-
-                  (window as any).__SIGN_PRIV__ = deriveEd25519FromX25519((window as any).__MY_PRIV__).privateKey;
+                  
+                  (window as any).__MY_PRIV__ = privBytes;
+                  (window as any).__SIGN_PRIV__ = deriveEd25519FromX25519(privBytes).privateKey;
               }
             } catch (e) { console.error("Error during key restore", e); }
         }
@@ -181,15 +179,21 @@ export const Route = createRootRoute({
     const handleLogout = async () => {
       try {
         const csrfToken = getCsrfToken()
+        const logoutMetadata = generateMetadata({}, ['user', 'logout'], 'POST');
+        const logoutMetadataHeader = await prepareMetadata(logoutMetadata, (window as any).__SIGN_PRIV__);
         const response = await fetch('/api/webauthn/logout/', {
           method: 'POST',
           credentials: 'include',
-          headers: { 'X-CSRFToken': csrfToken },
+          headers: { 
+            'X-CSRFToken': csrfToken,
+            'X-Metadata': logoutMetadataHeader
+          },
         })
       } catch (error) {
         console.error('Logout request failed', error)
       } finally {
         await deleteKey('master_priv_key'); // delete from indexDB
+        await deleteKey('cert_priv');
         delete (window as any).__MY_PRIV__; // delete from ram
         delete (window as any).__SIGN_PRIV__;
         document.cookie = 'sessionid=; expires=Thu, 01 Jan 1970 00:00:00 UTC; path=/; secure; samesite=lax';

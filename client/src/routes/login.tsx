@@ -1,3 +1,4 @@
+// src/routes/login.tsx
 "use client";
 /**
  * Login route (WebAuthn + PRF + E2EE bootstrap)
@@ -46,6 +47,8 @@ import {
   hexToBytes,
   getX25519PublicFromPrivate
 } from "../components/CryptoUtils";
+import { generateMetadata, prepareMetadata } from '../lib/metadata'; // New import for metadata
+import { apiFetch } from '../lib/utils'; // New import for apiFetch
 import { useAuth } from './__root'
 
 export const Route = createFileRoute("/login")({
@@ -71,18 +74,32 @@ function LoginPage() {
   useEffect(() => {
     const tryAutoLogin = async () => {
       try {
+        // Check authentication status with metadata
+        const response = await apiFetch("/api/webauthn/auth/status/", { method: "GET" }, ["auth", "status"]);
+        if (!response.ok) {
+          const errData = await response.json().catch(() => ({}));
+          throw new Error(`Status check failed: ${response.status} - ${errData.error || 'Unknown error'}`);
+        }
+        const data = await response.json();
+        if (!data.authenticated) {
+          return; // Not authenticated, proceed to manual login
+        }
+
         const storedKey = await getKey('master_priv_key');
         if (storedKey) {
           console.log("📂 Key find in IndexDB !");
-          // save in RAM
-          const rawKey = await crypto.subtle.exportKey("raw", storedKey);
-          (window as any).__MY_PRIV__ = new Uint8Array(rawKey);
+          // Assume storedKey is Uint8Array, no export needed
+          (window as any).__MY_PRIV__ = storedKey;
           
           // signature key derived
-          (window as any).__SIGN_PRIV__ = deriveEd25519FromX25519((window as any).__MY_PRIV__).privateKey;
+          (window as any).__SIGN_PRIV__ = deriveEd25519FromX25519(storedKey).privateKey;
           
+          await refreshAuth();
           // redirection to home
           navigate({ to: "/" });
+        } else {
+          console.warn("Authenticated but no key stored - may need re-bootstrap");
+          // Optionally trigger key bootstrap or error
         }
       } catch (e) {
         console.error("Auto-login failed", e);
@@ -115,11 +132,19 @@ function LoginPage() {
     setLoading(true);
     setError(null);
     try {
+      // Generate metadata for start request (login-specific, no tree depth)
+      const startPayload = {}; // Empty body
+      const startMetadata = generateMetadata(startPayload, ['user', 'login_start'], 'POST');
+      const startMetadataHeader = await prepareMetadata(startMetadata); // No signing key yet
+
       // Step 1: Ask server for authentication options (discoverable credentials = no email needed)
       const resp = await fetch("/api/webauthn/login/start/", {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({}), // empty → allow any registered device
+        headers: { 
+          "Content-Type": "application/json",
+          "X-Metadata": startMetadataHeader // Attach as header
+        },
+        body: JSON.stringify(startPayload),
       });
 
       if (!resp.ok)
@@ -139,10 +164,17 @@ function LoginPage() {
       // Step 2: Trigger browser native prompt
       const credential = await startAuthentication({ optionsJSON: options })
 
+      // Generate metadata for finish request (login-specific, no tree depth)
+      const finishMetadata = generateMetadata(credential, ['user', 'login_finish'], 'POST');
+      const finishMetadataHeader = await prepareMetadata(finishMetadata); // No signing key yet
+
       // Step 3: Send back to server
       const finishResp = await fetch("/api/webauthn/login/finish/", {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: { 
+          "Content-Type": "application/json",
+          "X-Metadata": finishMetadataHeader // Attach as header
+        },
         body: JSON.stringify(credential),
       });
 
@@ -165,8 +197,14 @@ function LoginPage() {
         // Zero out PRF bytes (data remanence)
         prfBytes.fill(0);
 
+        // Generate metadata for keys fetch (user-specific, tree depth 0 for root keys)
+        const keysMetadata = generateMetadata({}, ['user', 'get_keys'], 'GET', 0);
+        const keysMetadataHeader = await prepareMetadata(keysMetadata); // No signing yet
+
         // Fetch encrypted priv + pub
-        const keysResp = await fetch("/api/user/me/keys/");
+        const keysResp = await fetch("/api/user/me/keys/", {
+          headers: { "X-Metadata": keysMetadataHeader } // Attach as header
+        });
 
         window.__KEK__ = new Uint8Array(await crypto.subtle.exportKey("raw", kek));
         const { encrypted_priv, pub_key } = await keysResp.json();
@@ -179,17 +217,25 @@ function LoginPage() {
             new Uint8Array(await crypto.subtle.exportKey("raw", kek)),
           );
 
+          // Generate metadata for keys update (user-specific, tree depth 0)
+          const updatePayload = {
+            public_key: Array.from(publicKey),
+            encrypted_priv: {
+              ciphertext: Array.from(encryptedPriv.ciphertext),
+              iv: Array.from(encryptedPriv.iv),
+              tag: Array.from(encryptedPriv.tag),
+            },
+          };
+          const updateMetadata = generateMetadata(updatePayload, ['user', 'update_keys'], 'POST', 0);
+          const updateMetadataHeader = await prepareMetadata(updateMetadata); // No signing yet
+
           await fetch("/api/user/keys/update/", {
             method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({
-              public_key: Array.from(publicKey),
-              encrypted_priv: {
-                ciphertext: Array.from(encryptedPriv.ciphertext),
-                iv: Array.from(encryptedPriv.iv),
-                tag: Array.from(encryptedPriv.tag),
-              },
-            }),
+            headers: { 
+              "Content-Type": "application/json",
+              "X-Metadata": updateMetadataHeader // Attach as header
+            },
+            body: JSON.stringify(updatePayload),
           });
 
           window.__MY_PRIV__ = privateKey;
@@ -236,12 +282,24 @@ function LoginPage() {
       }
 
       // Common: Verify loaded private key matches server public key (prevents mismatch issues)
-      const meResp = await fetch('/api/user/me/');
+      // Generate metadata for user me fetch (user-specific, no tree depth)
+      const meMetadata = generateMetadata({}, ['user', 'get_me'], 'GET');
+      const meMetadataHeader = await prepareMetadata(meMetadata, window.__SIGN_PRIV__); // Sign now available
+
+      const meResp = await fetch('/api/user/me/', {
+        headers: { "X-Metadata": meMetadataHeader } // Attach as header
+      });
       if (!meResp.ok) throw new Error('Failed to fetch user info');
       const me = await meResp.json();
       const userId = me.id;
 
-      const rPub = await fetch(`/api/user/public_key/${userId}`);
+      // Generate metadata for public key fetch (user-specific, no tree depth)
+      const pubMetadata = generateMetadata({}, ['user', 'get_public_key'], 'GET');
+      const pubMetadataHeader = await prepareMetadata(pubMetadata, window.__SIGN_PRIV__); // Sign available
+
+      const rPub = await fetch(`/api/user/public_key/${userId}`, {
+        headers: { "X-Metadata": pubMetadataHeader } // Attach as header
+      });
       if (!rPub.ok) throw new Error('Failed to fetch public key');
       const { public_key } = await rPub.json();
       if (!public_key) throw new Error('No public key on server');
@@ -339,10 +397,18 @@ function LoginPage() {
     setLoading(true);
     setError(null);
     try {
+      // Generate metadata for add start (device-specific, no tree depth)
+      const addPayload = { email, code, device_name: deviceName };
+      const addMetadata = generateMetadata(addPayload, ['user', 'add_device_start'], 'POST');
+      const addMetadataHeader = await prepareMetadata(addMetadata); // No signing yet
+
       const addStart = await fetch("/api/webauthn/add/start/", {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ email, code, device_name: deviceName }),
+        headers: { 
+          "Content-Type": "application/json",
+          "X-Metadata": addMetadataHeader // Attach as header
+        },
+        body: JSON.stringify(addPayload),
       });
       if (!addStart.ok) {
         const err = await addStart.json();
@@ -350,10 +416,18 @@ function LoginPage() {
       }
       const addOptions = await addStart.json();
       const addCred = await startRegistration(addOptions);
+
+      // Generate metadata for add finish (device-specific, no tree depth)
+      const addFinishMetadata = generateMetadata(addCred, ['user', 'add_device_finish'], 'POST');
+      const addFinishMetadataHeader = await prepareMetadata(addFinishMetadata); // No signing yet
+
       const addFinish = await fetch("/api/webauthn/credential/add/finish/", {
         method: "POST",
         credentials: "include",
-        headers: { "Content-Type": "application/json" },
+        headers: { 
+          "Content-Type": "application/json",
+          "X-Metadata": addFinishMetadataHeader // Attach as header
+        },
         body: JSON.stringify(addCred),
       });
       if (!addFinish.ok) throw new Error("Add failed");

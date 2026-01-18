@@ -20,7 +20,7 @@
  *      * Generate an X25519 keypair for end-to-end encryption.
  *      * Derive an Ed25519 signing key from the X25519 private key.
  *      * Encrypt private material using a PRF-derived KEK, with QR/manual
- *        fallback when PRF is unavailable.
+ *        fallback when PRF is not supported.
  *
  *  NOTES:
  *  - WebAuthn PRF extension is used to derive a device-bound KEK without
@@ -70,7 +70,9 @@ import * as pkijs from "pkijs";
 import * as asn1js from "asn1js";
 import QRCode from 'qrcode';
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogDescription } from "@/components/ui/dialog";
-import { encryptAES, bytesToHex, hexToBytes, generateX25519Keypair, deriveEd25519FromX25519, base64ToBytes, base64ToArrayBuffer, deriveMasterKEK, bytesToBase64 } from '../components/CryptoUtils'
+import { encryptAES, bytesToHex, hexToBytes, generateX25519Keypair, deriveEd25519FromX25519, base64ToBytes, base64ToArrayBuffer, generateX25519Keypair as generateX25519, deriveMasterKEK, bytesToBase64 } from '../components/CryptoUtils'
+import { generateMetadata, prepareMetadata } from '../lib/metadata'; // New import for metadata
+import { apiFetch } from '../lib/utils';
 
 export const Route = createFileRoute("/register")({
   component: () => (
@@ -204,10 +206,18 @@ const handleGenerateCertificate = async () => {
 
     console.log("Generated CSR:", csrPem);
 
+    // Generate metadata for this request (doctor-specific, no tree depth)
+    const requestPayload = { csr: csrPem };
+    const metadata = generateMetadata(requestPayload, ['doctor', 'sign_csr'], 'POST');
+    const metadataHeader = await prepareMetadata(metadata); // No signing key yet
+
     const signResp = await fetch("/api/ca/sign/", {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ csr: csrPem }),
+      headers: { 
+        "Content-Type": "application/json",
+        "X-Metadata": metadataHeader
+      },
+      body: JSON.stringify(requestPayload),
     });
 
     if (!signResp.ok) {
@@ -300,7 +310,7 @@ const handleGenerateCertificate = async () => {
    * FUNCTION: handleSubmit
    *
    * PURPOSE:
-   *       full account registration:
+   *      full account registration:
    *      - Validates inputs + reCAPTCHA.
    *      - Starts WebAuthn registration with the backend.
    *      - Bootstraps end-to-end encryption keys (X25519 + Ed25519).
@@ -395,8 +405,7 @@ payload.certificate = certText;
       }
 
       // check already authen
-      const authCheck = await fetch("/api/webauthn/auth/status/", { credentials: 'include' });
-      
+      const authCheck = await apiFetch("/api/webauthn/auth/status/", { credentials: 'include' }, ['auth', 'status']);
       if (authCheck.ok) {
         const { authenticated } = await authCheck.json();
         if (authenticated) {
@@ -405,10 +414,17 @@ payload.certificate = certText;
           return;
         }
       } 
+
+      // Generate metadata for start request (registration-specific, no tree depth)
+      const metadata = generateMetadata(payload, [userType, 'register_start'], 'POST');
+      const metadataHeader = await prepareMetadata(metadata); // No signing key yet
             
       const startResp = await fetch("/api/webauthn/register/start/", {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: { 
+          "Content-Type": "application/json",
+          "X-Metadata": metadataHeader
+        },
         body: JSON.stringify(payload),
       });
 
@@ -419,7 +435,7 @@ payload.certificate = certText;
 
       let options = await startResp.json();
           if (userType === "doctor") {
-            // Prefer platform authenticator (TouchID/Hello/Chrome built-in)
+            // Prefer platform authenticator when available
             const isPlatformAvailable = await PublicKeyCredential.isUserVerifyingPlatformAuthenticatorAvailable();
             options.authenticatorSelection = {
               ...options.authenticatorSelection,
@@ -612,10 +628,18 @@ payload.certificate = certText;
           if (userType === "doctor") {
             credential.certificate = doctorCert;
           }
+
+          // Generate metadata for finish request (registration-specific, no tree depth)
+          const finishMetadata = generateMetadata(credential, [userType, 'register_finish'], 'POST');
+          const finishMetadataHeader = await prepareMetadata(finishMetadata); // No signing key yet (or use window.__SIGN_PRIV__ if available post-PRF)
+
           // 3. Finish registration
           const finishResp = await fetch("/api/webauthn/register/finish/", {
             method: "POST",
-            headers: { "Content-Type": "application/json" },
+            headers: { 
+              "Content-Type": "application/json",
+              "X-Metadata": finishMetadataHeader
+            },
             body: JSON.stringify(credential),
           });
 
@@ -657,7 +681,7 @@ payload.certificate = certText;
           console.log("Public key retry successful");
         } else {
           console.log("Public key verified as saved");
-        }
+        } 
 
 
       // Initialize DEK for patients post-registration
@@ -683,15 +707,21 @@ payload.certificate = certText;
               ]),
             );
 
+            // Generate metadata for DEK init (patient-specific, tree depth 0 for root init)
+            const initPayload = { encrypted_dek_self: encDekStr };
+            const initMetadata = generateMetadata(initPayload, ['patient', 'init_dek'], 'POST', 0);
+            const initMetadataHeader = await prepareMetadata(initMetadata, window.__SIGN_PRIV__); // Sign with new signing key
+
             // POST to init endpoint
             const initRes = await fetch("/api/record/init_dek/", {
               method: "POST",
               headers: {
                 "Content-Type": "application/json",
                 "X-CSRFToken": getCookie("csrftoken") || "",
+                "X-Metadata": initMetadataHeader
               },
               credentials: "include",
-              body: JSON.stringify({ encrypted_dek_self: encDekStr }),
+              body: JSON.stringify(initPayload),
             });
 
             if (!initRes.ok) {

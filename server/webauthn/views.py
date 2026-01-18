@@ -14,8 +14,13 @@ from django.contrib.auth import login, logout
 from django.contrib.auth.decorators import login_required
 
 from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PublicKey
-from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
-from cryptography.exceptions import InvalidKey
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey, Ed25519PublicKey
+from cryptography.hazmat.primitives.asymmetric import padding
+from cryptography.hazmat.primitives.asymmetric.rsa import RSAPublicKey
+from cryptography.hazmat.primitives import hashes
+from datetime import datetime
+import os
+import logging
 
 from fido2.webauthn import PublicKeyCredentialRpEntity, AttestedCredentialData, CollectedClientData, AttestationObject, AuthenticatorData
 from fido2.server import Fido2Server
@@ -31,6 +36,7 @@ from datetime import timedelta
 from django.utils import timezone
 from .utils import get_server
 from django.conf import settings
+from common.input_validation import parse_metadata
 
 STEP_ROOT = os.getenv("STEP_ROOT", "/ca/certs/root_ca.crt")
 STEP_INTERMEDIATE = os.getenv("STEP_INTERMEDIATE", "/ca/certs/intermediate_ca.crt")
@@ -44,6 +50,39 @@ PRF_SALT_SECOND = sha256(b"HealthSecure Project - PRF salt v1 - second").digest(
 
 server = get_server()
 
+
+def forward_to_logger(request, view_name, outcome, metadata=None):
+    """Forward log entry to logger service """
+    try:
+        log_entry = {
+            'user_id': str(request.user.id) if request.user.is_authenticated else 'anonymous',
+            'action': view_name,
+            'outcome': outcome,
+            'metadata': metadata or {},
+            'timestamp': timezone.now().isoformat(),
+            'ip': request.META.get('REMOTE_ADDR'),
+            'user_agent': request.META.get('HTTP_USER_AGENT', ''),
+        }
+        
+        # Optional: Sign with server key
+        if hasattr(settings, 'SERVER_SIGN_PRIV'):
+            msg = json.dumps(log_entry, sort_keys=True).encode('utf-8')
+            sig = settings.SERVER_SIGN_PRIV.sign(msg)
+            log_entry['server_signature'] = base64.b64encode(sig).decode('utf-8')
+        
+        # Send to logger
+        response = requests.post(
+            settings.LOGGER_URL + 'log',
+            json=log_entry,
+            cert=(settings.SERVER_CERT, settings.SERVER_KEY),
+            verify=settings.CA_CHAIN,
+            timeout=5
+        )
+        if response.status_code != 201:
+            logger.warning(f"Logger forward failed: {response.text}")
+    except Exception as e:
+        logger.error(f"Logger forward error: {str(e)}")
+        
 def to_serializable(obj):
     if isinstance(obj, bytes):
         return websafe_encode(obj)
@@ -124,10 +163,17 @@ class StartRegistration(View):
     def post(self, request):
         import re
 
+        try:
+            metadata = parse_metadata(request, None)
+        except InputError as e:
+            forward_to_logger(request, 'start_registration', 'fail', {})
+            return JsonResponse({"error": str(e)}, status=e.status)
+
         # ---- helpers (local, pour rester 100% copier-coller) ----
         EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 
         def bad(msg, status=400):
+            forward_to_logger(request, 'start_registration', 'fail', metadata)
             return JsonResponse({"error": msg}, status=status)
 
         def clean_str(v, field, *, max_len, lower=False, allow_empty=False):
@@ -279,17 +325,26 @@ class StartRegistration(View):
         request.session["reg_state"] = state
         request.session["reg_user_id"] = str(user.id)
         request.session["reg_device_name"] = device_name
-
+        
+        forward_to_logger(request, 'start_registration', 'success', metadata)
+        
         return JsonResponse(to_serializable(pk_options))
 
 
 @method_decorator(csrf_exempt, name="dispatch")
 class FinishRegistration(View):
     def post(self, request):
+        try:
+            metadata = parse_metadata(request, None)
+        except InputError as e:
+            forward_to_logger(request, 'finish_registration', 'fail', {})
+            return JsonResponse({"error": str(e)}, status=e.status)
+
         import binascii
 
         # ---- helpers (local) ----
         def bad(msg, status=400):
+            forward_to_logger(request, 'finish_registration', 'fail', metadata)
             return JsonResponse({"error": msg}, status=status)
 
         def ensure_dict(v, field):
@@ -533,21 +588,29 @@ class FinishRegistration(View):
             for k in ("reg_state", "reg_user_id", "reg_device_name"):
                 if k in request.session:
                     del request.session[k]
-
+            
+            forward_to_logger(request, 'finish_registration', 'success', metadata)
+            
             return JsonResponse({"status": "OK", "prf_enabled": prf_enabled, "user_id": str(user.id)})
 
         except Exception as e:
             import traceback
             logger.error(traceback.format_exc())
-            return JsonResponse({"error": f"Registration failed: {str(e)}"}, status=400)
+            return bad(f"Registration failed: {str(e)}", status=400)
 
 
 @method_decorator(csrf_exempt, name="dispatch")
 class StartAuthentication(View):
     def post(self, request):
+        try:
+            metadata = parse_metadata(request, None)
+        except InputError as e:
+            forward_to_logger(request, 'start_authentication', 'fail', {})
+            return JsonResponse({"error": str(e)}, status=e.status)
+        
         # Discoverable credentials only (no email needed)
         options, state = server.authenticate_begin(
-            credentials=[],  # discoverable/resident keys
+            credentials=[],  # discoverable/resident
             user_verification="required",
             # 2 salts required by APPLE
             extensions={"prf": {"eval": {"first": PRF_SALT_FIRST, "second": PRF_SALT_SECOND}}},
@@ -556,13 +619,21 @@ class StartAuthentication(View):
         pk_options = dict(options.public_key)
 
         request.session["auth_state"] = state
-
+        
+        forward_to_logger(request, 'start_authentication', 'success', metadata)
+        
         return JsonResponse(to_serializable(pk_options))
 
 
 @method_decorator(csrf_exempt, name="dispatch")
 class FinishAuthentication(View):
     def post(self, request):
+        try:
+            metadata = parse_metadata(request, None)
+        except InputError as e:
+            forward_to_logger(request, 'finish_authentication', 'fail', {})
+            return JsonResponse({"error": str(e)}, status=e.status)
+        
         state = request.session.get("auth_state")
         if not state:
             return JsonResponse({"error": "No authentication in progress"}, status=400)
@@ -581,6 +652,8 @@ class FinishAuthentication(View):
             client_data_json = websafe_decode(response["response"]["clientDataJSON"])
             authenticator_data = websafe_decode(response["response"]["authenticatorData"])
             signature = websafe_decode(response["response"]["signature"])
+            client_data = CollectedClientData(client_data_json)
+            authenticator_data_obj = AuthenticatorData(authenticator_data)
             client_data = CollectedClientData(client_data_json)
             authenticator_data_obj = AuthenticatorData(authenticator_data)
 
@@ -610,7 +683,7 @@ class FinishAuthentication(View):
                 if not credential.supports_sign_count:
                     credential.supports_sign_count = True
 
-            # Log for anomaly detection (expand with metadata like time/size for master note)
+            # Log for anomaly detection
             elif current_counter == 0 and credential.sign_count == 0:
                 logger.info(f"Software authenticator (no counter) used for user {credential.user.id} from IP {request.META.get('REMOTE_ADDR')}")
             credential.sign_count = current_counter
@@ -650,6 +723,9 @@ class FinishAuthentication(View):
                     # tree_depth  here for record access
                 }
             )
+            
+            forward_to_logger(request, 'finish_authentication', 'success', metadata)
+            
             return JsonResponse({
                 "status": "OK",
                 "prf_hex": prf_hex, # used to derive/store encrypted X25519 key
@@ -667,19 +743,29 @@ class FinishAuthentication(View):
                     'privileges': 'login',
                 }
             )
+            forward_to_logger(request, 'finish_authentication', 'fail', metadata) 
             return JsonResponse({"error": str(e)}, status=400)
 
     #Approval to add secondary credential (auth with primary only)
 @method_decorator(csrf_exempt, name="dispatch")
 class StartAddCredentialApproval(View):
     def post(self, request):
+        try:
+            metadata = parse_metadata(request, request.user)
+        except InputError as e:
+            forward_to_logger(request, 'start_add_credential_approval', 'fail', {})
+            return JsonResponse({"error": str(e)}, status=e.status)
+        
         if not request.user.is_authenticated:
+            forward_to_logger(request, 'start_add_credential_approval', 'fail', metadata)
             return JsonResponse({"error": "Authentication required"}, status=401)
         if not is_primary_device(request):
+            forward_to_logger(request, 'start_add_credential_approval', 'fail', metadata)
             return JsonResponse({"error": "Primary device required"}, status=403)
 
         primary_cred = WebAuthnCredential.objects.filter(user=request.user, is_primary=True).first()
         if not primary_cred:
+            forward_to_logger(request, 'start_add_credential_approval', 'fail', metadata)
             return JsonResponse({"error": "No primary credential found"}, status=400)
         options, state = server.authenticate_begin(
             credentials=[primary_cred.get_credential_data()],
@@ -693,19 +779,38 @@ class StartAddCredentialApproval(View):
             "transports": primary_cred.transports,
         }]
         request.session["add_cred_approval_state"] = state
+        
+        forward_to_logger(request, 'start_add_credential_approval', 'success', metadata)  
+        
         return JsonResponse(to_serializable(pk_options))
 
 @method_decorator(csrf_exempt, name="dispatch")
 class FinishAddCredentialApproval(View):
     def post(self, request):
+        try:
+            metadata = parse_metadata(request, request.user)
+        except InputError as e:
+            forward_to_logger(request, 'finish_add_credential_approval', 'fail', {})
+            return JsonResponse({"error": str(e)}, status=e.status)
+        
+        if not request.user.is_authenticated:
+            forward_to_logger(request, 'finish_add_credential_approval', 'fail', metadata)
+            return JsonResponse({"error": "Authentication required"}, status=401)
+        if not is_primary_device(request):
+            forward_to_logger(request, 'finish_add_credential_approval', 'fail', metadata)
+            return JsonResponse({"error": "Primary device required"}, status=403)
+
         state = request.session.get("add_cred_approval_state")
         if not state:
+            forward_to_logger(request, 'finish_add_credential_approval', 'fail', metadata)
             return JsonResponse({"error": "No approval in progress"}, status=400)
+
         response = json.loads(request.body)
         credential_id = websafe_decode(response["rawId"])
 
         primary_cred = WebAuthnCredential.objects.filter(user=request.user, is_primary=True).first()
         if not primary_cred:
+            forward_to_logger(request, 'finish_add_credential_approval', 'fail', metadata)
             return JsonResponse({"error": "No primary credential found"}, status=400)
 
         primary_id = primary_cred.credential_id
@@ -713,9 +818,9 @@ class FinishAddCredentialApproval(View):
             primary_id = primary_id.tobytes()
 
         if credential_id != primary_id:
+            forward_to_logger(request, 'finish_add_credential_approval', 'fail', metadata)
             return JsonResponse({"error": "Not primary credential"}, status=403)
 
-        credential = primary_cred
         client_data_json = websafe_decode(response["response"]["clientDataJSON"])
         authenticator_data = websafe_decode(response["response"]["authenticatorData"])
         signature = websafe_decode(response["response"]["signature"])
@@ -723,25 +828,27 @@ class FinishAddCredentialApproval(View):
         authenticator_data_obj = AuthenticatorData(authenticator_data)
         server.authenticate_complete(
             state,
-            [credential.get_credential_data()],
+            [primary_cred.get_credential_data()],
             credential_id,
             client_data,
             authenticator_data_obj,
             signature,
         )
         if not authenticator_data_obj.is_user_verified:
+            forward_to_logger(request, 'finish_add_credential_approval', 'fail', metadata)
             raise ValueError("User verification required")
         current_counter = authenticator_data_obj.counter
-        if credential.supports_sign_count and current_counter <= credential.sign_count:
-            logger.warning(f"Possible clone detected for credential {credential.id} (counter {current_counter} <= {credential.sign_count}) from IP {request.META.get('REMOTE_ADDR')}")
-            raise ValueError("Possible cloned authenticator detected")
+        if primary_cred.supports_sign_count and current_counter <= primary_cred.sign_count:
+            logger.warning(f"Possible clone detected for credential {primary_cred.id} (counter {current_counter} <= {primary_cred.sign_count}) from IP {request.META.get('REMOTE_ADDR')}")
+            forward_to_logger(request, 'finish_add_credential_approval', 'fail', metadata)
+            return JsonResponse({"error": "Possible cloned authenticator detected"}, status=400)
 
-        if current_counter > credential.sign_count:
-            if not credential.supports_sign_count:
-                credential.supports_sign_count = True
+        if current_counter > primary_cred.sign_count:
+            if not primary_cred.supports_sign_count:
+                primary_cred.supports_sign_count = True
 
-        credential.sign_count = current_counter
-        credential.save()
+        primary_cred.sign_count = current_counter
+        primary_cred.save()
 
         # Generate one-time add code
         code = secrets.token_hex(16)
@@ -750,20 +857,32 @@ class FinishAddCredentialApproval(View):
         request.user.save()
 
         del request.session["add_cred_approval_state"]
+        
+        forward_to_logger(request, 'finish_add_credential_approval', 'success', metadata)  
+        
         return JsonResponse({"status": "OK", "add_code": code})
 
 @method_decorator(csrf_exempt, name="dispatch")
 class StartDeleteCredentialApproval(View):
     def post(self, request):
+        try:
+            metadata = parse_metadata(request, request.user)
+        except InputError as e:
+            forward_to_logger(request, 'start_delete_credential_approval', 'fail', {})
+            return JsonResponse({"error": str(e)}, status=e.status)
+        
         if not request.user.is_authenticated:
+            forward_to_logger(request, 'start_delete_credential_approval', 'fail', metadata)
             return JsonResponse({"error": "Authentication required"}, status=401)
 
         if not is_primary_device(request):
+            forward_to_logger(request, 'start_delete_credential_approval', 'fail', metadata)
             return JsonResponse({"error": "Primary device required"}, status=403)
 
         data = json.loads(request.body or "{}")
         target_cred_id = data.get("target_cred_id")
         if not target_cred_id:
+            forward_to_logger(request, 'start_delete_credential_approval', 'fail', metadata)
             return JsonResponse({"error": "target_cred_id required"}, status=400)
 
         # Target must exist + belong to user + must be secondary
@@ -771,14 +890,17 @@ class StartDeleteCredentialApproval(View):
             target_bin = websafe_decode(target_cred_id)
             target = WebAuthnCredential.objects.get(user=request.user, credential_id=target_bin)
         except WebAuthnCredential.DoesNotExist:
+            forward_to_logger(request, 'start_delete_credential_approval', 'fail', metadata)
             return JsonResponse({"error": "Credential not found"}, status=404)
 
         if target.is_primary:
+            forward_to_logger(request, 'start_delete_credential_approval', 'fail', metadata)
             return JsonResponse({"error": "Cannot delete primary device"}, status=403)
 
         # Authenticate using PRIMARY credential only
         primary_cred = WebAuthnCredential.objects.filter(user=request.user, is_primary=True).first()
         if not primary_cred:
+            forward_to_logger(request, 'start_delete_credential_approval', 'fail', metadata)
             return JsonResponse({"error": "No primary credential found"}, status=400)
 
         options, state = server.authenticate_begin(
@@ -796,23 +918,34 @@ class StartDeleteCredentialApproval(View):
 
         request.session["del_cred_approval_state"] = state
         request.session["del_target_cred_id"] = target_cred_id
-
+        
+        forward_to_logger(request, 'start_delete_credential_approval', 'success', metadata)
+        
         return JsonResponse(to_serializable(pk_options))
 
 
 @method_decorator(csrf_exempt, name="dispatch")
 class FinishDeleteCredentialApproval(View):
     def post(self, request):
+        try:
+            metadata = parse_metadata(request, request.user)
+        except InputError as e:
+            forward_to_logger(request, 'finish_delete_credential_approval', 'fail', {})
+            return JsonResponse({"error": str(e)}, status=e.status)
+        
         if not request.user.is_authenticated:
+            forward_to_logger(request, 'finish_delete_credential_approval', 'fail', metadata)
             return JsonResponse({"error": "Authentication required"}, status=401)
 
         if not is_primary_device(request):
+            forward_to_logger(request, 'finish_delete_credential_approval', 'fail', metadata)
             return JsonResponse({"error": "Primary device required"}, status=403)
 
         state = request.session.get("del_cred_approval_state")
         target_cred_id = request.session.get("del_target_cred_id")
 
         if not state or not target_cred_id:
+            forward_to_logger(request, 'finish_delete_credential_approval', 'fail', metadata)
             return JsonResponse({"error": "No delete approval in progress"}, status=400)
 
         response = json.loads(request.body)
@@ -820,23 +953,22 @@ class FinishDeleteCredentialApproval(View):
 
         primary_cred = WebAuthnCredential.objects.filter(user=request.user, is_primary=True).first()
         if not primary_cred:
+            forward_to_logger(request, 'finish_delete_credential_approval', 'fail', metadata)
             return JsonResponse({"error": "No primary credential found"}, status=400)
 
         primary_id = primary_cred.credential_id
         if isinstance(primary_id, memoryview):
             primary_id = primary_id.tobytes()
 
-        # The assertion MUST be from primary credential
         if credential_id != primary_id:
+            forward_to_logger(request, 'finish_delete_credential_approval', 'fail', metadata)
             return JsonResponse({"error": "Not primary credential"}, status=403)
 
         client_data_json = websafe_decode(response["response"]["clientDataJSON"])
         authenticator_data = websafe_decode(response["response"]["authenticatorData"])
         signature = websafe_decode(response["response"]["signature"])
-
         client_data = CollectedClientData(client_data_json)
         authenticator_data_obj = AuthenticatorData(authenticator_data)
-
         server.authenticate_complete(
             state,
             [primary_cred.get_credential_data()],
@@ -847,12 +979,14 @@ class FinishDeleteCredentialApproval(View):
         )
 
         if not authenticator_data_obj.is_user_verified:
+            forward_to_logger(request, 'finish_delete_credential_approval', 'fail', metadata)
             return JsonResponse({"error": "User verification required"}, status=400)
 
         # signCount anti-clone (même logique que add approval)
         current_counter = authenticator_data_obj.counter
         if primary_cred.supports_sign_count and current_counter <= primary_cred.sign_count:
             logger.warning(f"Possible clone during delete approval for user {request.user.id}")
+            forward_to_logger(request, 'finish_delete_credential_approval', 'fail', metadata)
             return JsonResponse({"error": "Possible cloned authenticator detected"}, status=400)
 
         if current_counter > primary_cred.sign_count and not primary_cred.supports_sign_count:
@@ -870,6 +1004,7 @@ class FinishDeleteCredentialApproval(View):
             target = None
 
         if target and target.is_primary:
+            forward_to_logger(request, 'finish_delete_credential_approval', 'fail', metadata)
             return JsonResponse({"error": "Cannot delete primary device"}, status=403)
 
         if target:
@@ -890,28 +1025,39 @@ class FinishDeleteCredentialApproval(View):
         # cleanup session
         request.session.pop("del_cred_approval_state", None)
         request.session.pop("del_target_cred_id", None)
-
+        
+        forward_to_logger(request, 'finish_delete_credential_approval', 'success', metadata)
+        
         return JsonResponse({"status": "OK"})
 
 
 
-@method_decorator(csrf_exempt, name='dispatch')
+@method_decorator(csrf_exempt, name="dispatch")
 class StartAddWithCode(View):
     def post(self, request):
-        data = json.loads(request.body)
+        try:
+            metadata = parse_metadata(request, None)
+        except InputError as e:
+            forward_to_logger(request, 'start_add_with_code', 'fail', {})
+            return JsonResponse({"error": str(e)}, status=e.status)
+        
+        data = json.loads(request.body or "{}")
         email = data.get('email', '').strip().lower()
         code = data.get('code', '')
         device_name = data.get('device_name', 'New Device')
 
         if not email or not code:
+            forward_to_logger(request, 'start_add_with_code', 'fail', metadata)
             return JsonResponse({"error": "Email and code required"}, status=400)
 
         try:
             user = User.objects.get(email=email)
             if not WebAuthnCredential.objects.filter(user=user, is_primary=True).exists():
+                forward_to_logger(request, 'start_add_with_code', 'fail', metadata)
                 return JsonResponse({"error": "Primary device required"}, status=403)
 
             if user.pending_add_code != code or user.pending_add_expiry < timezone.now():
+                forward_to_logger(request, 'start_add_with_code', 'fail', metadata)
                 raise ValueError("Invalid or expired code")
 
             # Clear code
@@ -938,23 +1084,36 @@ class StartAddWithCode(View):
             request.session["add_cred_state"] = state
             request.session["add_cred_user_id"] = str(user.id)
             request.session["add_cred_device_name"] = device_name
+            
+            forward_to_logger(request, 'start_add_with_code', 'success', metadata)
+            
             return JsonResponse(to_serializable(pk_options))
 
         except User.DoesNotExist:
+            forward_to_logger(request, 'start_add_with_code', 'fail', metadata)
             return JsonResponse({"error": "User not found"}, status=404)
         except ValueError as e:
+            forward_to_logger(request, 'start_add_with_code', 'fail', metadata)
             return JsonResponse({"error": str(e)}, status=400)
 
-@method_decorator(csrf_exempt, name='dispatch')
+@method_decorator(csrf_exempt, name="dispatch")
 class FinishAddCredential(View):
     def post(self, request):
+        try:
+            metadata = parse_metadata(request, None)
+        except InputError as e:
+            forward_to_logger(request, 'finish_add_credential', 'fail', {})
+            return JsonResponse({"error": str(e)}, status=e.status)
+        
         state = request.session.get("add_cred_state")
         user_id = request.session.get("add_cred_user_id")
         if not state or not user_id:
+            forward_to_logger(request, 'finish_add_credential', 'fail', metadata)
             return JsonResponse({"error": "No add in progress"}, status=400)
         try:
             user = User.objects.get(id=uuid.UUID(user_id))
         except User.DoesNotExist:
+            forward_to_logger(request, 'finish_add_credential', 'fail', metadata)
             return JsonResponse({"error": "User not found"}, status=404)
 
         response = json.loads(request.body)
@@ -992,15 +1151,24 @@ class FinishAddCredential(View):
             success=True,
             metadata={'privileges': 'add_device'}
         )
-
+        
+        forward_to_logger(request, 'finish_add_credential', 'success', metadata)
+        
         return JsonResponse({"status": "OK", "prf_enabled": prf_enabled})
 
 
 @method_decorator(csrf_exempt, name="dispatch")
-@method_decorator(login_required, name="dispatch")
+@method_decorator(login_required, name='dispatch')
 class EncryptDoctorPrivkey(View):
     def post(self, request):
+        try:
+            metadata = parse_metadata(request, request.user)
+        except InputError as e:
+            forward_to_logger(request, 'encrypt_doctor_privkey', 'fail', {})
+            return JsonResponse({"error": str(e)}, status=e.status)
+        
         if request.user.type != User.Type.DOCTOR:
+            forward_to_logger(request, 'encrypt_doctor_privkey', 'fail', metadata)
             return JsonResponse({"error": "Not doctor"}, status=403)
         data = json.loads(request.body)
         request.user.encrypted_doctor_privkey = data["encrypted"]
@@ -1014,16 +1182,26 @@ class EncryptDoctorPrivkey(View):
             success=True,
             metadata={'privileges': 'encrypt_privkey', 'request_size': len(request.body)}
         )
-
+        
+        forward_to_logger(request, 'encrypt_doctor_privkey', 'success', metadata)
+        
         return JsonResponse({"status": "OK"})
 
 @method_decorator(csrf_exempt, name='dispatch')
 @method_decorator(login_required, name='dispatch')
 class GetEncryptedPrivkey(View):
     def get(self, request):
+        try:
+            metadata = parse_metadata(request, request.user)
+        except InputError as e:
+            forward_to_logger(request, 'get_encrypted_privkey', 'fail', {})
+            return JsonResponse({"error": str(e)}, status=e.status)
+        
         if request.user.type != User.Type.DOCTOR:
+            forward_to_logger(request, 'get_encrypted_privkey', 'fail', metadata)
             return JsonResponse({"error": "Not doctor"}, status=403)
         if not request.user.encrypted_doctor_privkey:
+            forward_to_logger(request, 'get_encrypted_privkey', 'fail', metadata)
             return JsonResponse({"error": "No key stored"}, status=404)
 
         # Log fetch for anomaly detection
@@ -1033,61 +1211,70 @@ class GetEncryptedPrivkey(View):
             success=True,
             metadata={'privileges': 'fetch_privkey'}
         )
-
+        
+        forward_to_logger(request, 'get_encrypted_privkey', 'success', metadata)
+        
         return JsonResponse({
             "encrypted": request.user.encrypted_doctor_privkey,
             "iv": request.user.privkey_iv
         })
 
 
-@method_decorator(csrf_exempt, name='dispatch')
+@method_decorator(csrf_exempt, name="dispatch")
 class AuthStatus(View):
     def get(self, request):
+        try:
+            metadata = parse_metadata(request, None)
+        except InputError as e:
+            forward_to_logger(request, 'auth_status', 'fail', {})
+            return JsonResponse({"error": str(e)}, status=e.status)
+        
+        forward_to_logger(request, 'auth_status', 'success', metadata)
+        
         return JsonResponse({
             'authenticated': request.user.is_authenticated
         })
 
-@method_decorator(csrf_exempt, name='dispatch')
+@method_decorator(csrf_exempt, name="dispatch")
 class LogoutView(View):
     def post(self, request):
+        try:
+            metadata = parse_metadata(request, request.user if request.user.is_authenticated else None)
+        except InputError as e:
+            forward_to_logger(request, 'logout', 'fail', {})
+            return JsonResponse({"error": str(e)}, status=e.status)
+        
         response = JsonResponse({"status": "OK"})
         if request.user.is_authenticated:
             logout(request)
             request.session.flush()
+            forward_to_logger(request, 'logout', 'success', metadata)
         else:
             request.session.flush()
+            forward_to_logger(request, 'logout', 'success', metadata)  # Still log
         response.delete_cookie('sessionid')
         response.delete_cookie('csrftoken')
         return response
 
 
-def is_primary_device(request):
-    if not request.user.is_authenticated:
-        return False
-
-    cid = request.session.get('used_credential_id')
-    if not cid:
-        return False
-
-    try:
-        WebAuthnCredential.objects.get(
-            credential_id=websafe_decode(cid),
-            user=request.user,
-            is_primary=True,
-        )
-        return True
-    except WebAuthnCredential.DoesNotExist:
-        return False
-
-
 class UserCredentials(View):
     @method_decorator(login_required)
     def get(self, request):
+        try:
+            metadata = parse_metadata(request, request.user)
+        except InputError as e:
+            forward_to_logger(request, 'get_user_credentials', 'fail', {})
+            return JsonResponse({"error": str(e)}, status=e.status)
+        
         if not is_primary_device(request):
+            forward_to_logger(request, 'get_user_credentials', 'fail', metadata)
             return JsonResponse({'error': 'Access restricted to primary device'}, status=403)
         creds = request.user.webauthn_credentials.all()
+        
+        forward_to_logger(request, 'get_user_credentials', 'success', metadata)
+        
         return JsonResponse([{
-            'id': websafe_encode(cred.credential_id),  # Use websafe_encode for string id
+            'id': websafe_encode(cred.credential_id),
             'name': cred.name,
             'created_at': cred.created_at.isoformat(),
             'prf_enabled': cred.prf_enabled,
@@ -1098,9 +1285,19 @@ class UserCredentials(View):
 class UserActivity(View):
     @method_decorator(login_required)
     def get(self, request):
+        try:
+            metadata = parse_metadata(request, request.user)
+        except InputError as e:
+            forward_to_logger(request, 'get_user_activity', 'fail', {})
+            return JsonResponse({"error": str(e)}, status=e.status)
+        
         if not is_primary_device(request):
+            forward_to_logger(request, 'get_user_activity', 'fail', metadata)
             return JsonResponse({'error': 'Access restricted to primary device'}, status=403)
         logs = AuthenticationLog.objects.filter(user=request.user).order_by('-timestamp')[:50]
+        
+        forward_to_logger(request, 'get_user_activity', 'success', metadata)
+        
         return JsonResponse([{
             'time': log.timestamp.isoformat(),
             'ip': log.ip_address,
@@ -1112,7 +1309,14 @@ class UserActivity(View):
 class DeleteCredential(View):
     @method_decorator(login_required)
     def delete(self, request, cred_id):
+        try:
+            metadata = parse_metadata(request, request.user)
+        except InputError as e:
+            forward_to_logger(request, 'delete_credential', 'fail', {})
+            return JsonResponse({"error": str(e)}, status=e.status)
+        
         if not is_primary_device(request):
+            forward_to_logger(request, 'delete_credential', 'fail', metadata)
             return JsonResponse({'error': 'Access restricted to primary device'}, status=403)
 
         try:
@@ -1120,11 +1324,16 @@ class DeleteCredential(View):
             cred = WebAuthnCredential.objects.get(user=request.user, credential_id=cred_id_bin)
 
             if cred.is_primary:
+                forward_to_logger(request, 'delete_credential', 'fail', metadata)
                 return JsonResponse({'error': 'Cannot delete primary device'}, status=403)
 
             cred.delete()
+            
+            forward_to_logger(request, 'delete_credential', 'success', metadata)
+            
             return JsonResponse({'status': 'OK'})
         except WebAuthnCredential.DoesNotExist:
+            forward_to_logger(request, 'delete_credential', 'fail', metadata)
             return JsonResponse({'error': 'Credential not found'}, status=404)
 
 
@@ -1132,6 +1341,14 @@ class DeleteCredential(View):
 @method_decorator(csrf_exempt, name="dispatch")
 class AuthStatus(View):
     def get(self, request):
+        try:
+            metadata = parse_metadata(request, None)
+        except InputError as e:
+            forward_to_logger(request, 'auth_status', 'fail', {})
+            return JsonResponse({"error": str(e)}, status=e.status)
+        
+        forward_to_logger(request, 'auth_status', 'success', metadata)
+        
         return JsonResponse({
             'authenticated': request.user.is_authenticated
         })
@@ -1139,12 +1356,20 @@ class AuthStatus(View):
 @method_decorator(csrf_exempt, name="dispatch")
 class LogoutView(View):
     def post(self, request):
+        try:
+            metadata = parse_metadata(request, request.user if request.user.is_authenticated else None)
+        except InputError as e:
+            forward_to_logger(request, 'logout', 'fail', {})
+            return JsonResponse({"error": str(e)}, status=e.status)
+        
         response = JsonResponse({"status": "OK"})
         if request.user.is_authenticated:
             logout(request)
             request.session.flush()
+            forward_to_logger(request, 'logout', 'success', metadata)
         else:
             request.session.flush()
+            forward_to_logger(request, 'logout', 'success', metadata)
         response.delete_cookie('sessionid')
         response.delete_cookie('csrftoken')
         return response

@@ -38,7 +38,7 @@ services:
   server:
     build: ./server
     container_name: server
-    command: sh -c "mkdir -p /app/logs && touch /app/logs/app.log && mkdir -p /tls && step ca certificate server.healthsecure.local /tls/server.crt /tls/server.key --provisioner healthsecure-provisioner --provisioner-password-file /ca/secrets/password --ca-url https://step-ca:9000 --root /ca/certs/root_ca.crt --san server --san server.healthsecure.local --san localhost --san 127.0.0.1 --san ::1 --not-after 8760h && cat /tls/server.crt /ca/certs/intermediate_ca.crt > /tls/fullchain.crt && uv run python manage.py migrate && uv run python manage.py collectstatic --noinput && uv run gunicorn --bind 0.0.0.0:8000 --certfile /tls/fullchain.crt --keyfile /tls/server.key --timeout 90 wsgi:application"
+    command: sh -c "mkdir -p /app/logs && touch /app/logs/app.log && mkdir -p /tls && step ca certificate server.healthsecure.local /tls/server.crt /tls/server.key --provisioner healthsecure-provisioner --provisioner-password-file /ca/secrets/password --ca-url https://step-ca:9000 --root /ca/certs/root_ca.crt --san server --san server.healthsecure.local --san localhost --san 127.0.0.1 --san ::1 --not-after 8760h && cat /tls/server.crt /ca/certs/intermediate_ca.crt > /tls/fullchain.crt && cat /ca/certs/intermediate_ca.crt /ca/certs/root_ca.crt > /tls/ca_chain.crt && uv run python manage.py migrate && uv run python manage.py collectstatic --noinput && uv run gunicorn --bind 0.0.0.0:8000 --certfile /tls/fullchain.crt --keyfile /tls/server.key --timeout 90 wsgi:application"
     volumes:
       - ./server:/app
       - stepca-data:/ca:ro
@@ -83,6 +83,20 @@ services:
       - "healthsecure.local:127.0.0.1"
       - "client.healthsecure.local:127.0.0.1"
 
+  logger:
+    build: ./logger
+    container_name: logger
+    volumes:
+      - ./pki/leafs/logger:/certs:ro
+      - logger_data:/data
+      - ./pki/roots/ca_chain.crt:/tls/ca_chain.crt:ro
+    environment:
+      - LOGGER_SIGNING_PRIVATE_KEY=qPF5+8zdvNKwcGtr/q2zqWNMMZ/d28waCgOfQZmBf9U=
+    expose:
+      - "5001"
+    depends_on:
+      - server
+  
   nginx:
     image: nginx:1.29-alpine
     container_name: nginx
@@ -104,3 +118,4 @@ volumes:
   postgres_data:
   stepca-data:
     external: true
+  logger_data:

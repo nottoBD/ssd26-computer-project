@@ -13,6 +13,8 @@ from cryptography.hazmat.primitives import hashes
 from datetime import datetime
 import os
 import logging
+import requests
+from cryptography.exceptions import InvalidSignature
 
 from accounts.models import User, PatientRecord, DoctorPatientLink, PendingRequest
 from django.db.models import Q
@@ -26,8 +28,8 @@ from cryptography.x509.oid import NameOID
 from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.exceptions import InvalidSignature
 from django.conf import settings
-
 from django.views.decorators.csrf import csrf_exempt
+from common.input_validation import parse_metadata, InputError
 
 # API handlers
 #
@@ -37,7 +39,40 @@ from django.views.decorators.csrf import csrf_exempt
 # The server stores ciphertext + wrapped DEKs but does not decrypt medical data
 #
 # Most endpoints emit small JSON metadata logs for later anomaly detection
+
 logger = logging.getLogger(__name__)
+
+def forward_to_logger(request, view_name, outcome, metadata=None):
+    """Forward log entry to logger service """
+    try:
+        log_entry = {
+            'user_id': str(request.user.id) if request.user.is_authenticated else 'anonymous',
+            'action': view_name,
+            'outcome': outcome,
+            'metadata': metadata or {},
+            'timestamp': timezone.now().isoformat(),
+            'ip': request.META.get('REMOTE_ADDR'),
+            'user_agent': request.META.get('HTTP_USER_AGENT', ''),
+        }
+        
+        # Optional: Sign with server key
+        if hasattr(settings, 'SERVER_SIGN_PRIV'):
+            msg = json.dumps(log_entry, sort_keys=True).encode('utf-8')
+            sig = settings.SERVER_SIGN_PRIV.sign(msg)
+            log_entry['server_signature'] = base64.b64encode(sig).decode('utf-8')
+        
+        # Send to logger
+        response = requests.post(
+            settings.LOGGER_URL + 'log',
+            json=log_entry,
+            cert=(settings.SERVER_CERT, settings.SERVER_KEY),
+            verify=settings.CA_CHAIN,
+            timeout=5
+        )
+        if response.status_code != 201:
+            logger.warning(f"Logger forward failed: {response.text}")
+    except Exception as e:
+        logger.error(f"Logger forward error: {str(e)}")
 
 
 # Returns the authenticated user's profile summary for the frontend
@@ -46,6 +81,11 @@ logger = logging.getLogger(__name__)
 @api_view(['GET'])
 @permission_classes([IsAuthenticated])
 def get_current_user(request):
+    try:
+        metadata = parse_metadata(request, request.user)
+    except InputError as e:
+        forward_to_logger(request, 'get_current_user', 'fail')
+        return Response({'error': str(e)}, status=e.status)
     user = request.user
     data = {
         'id': str(user.id),
@@ -56,13 +96,9 @@ def get_current_user(request):
         data['dob'] = user.date_of_birth.isoformat() if user.date_of_birth else None
     elif user.type == User.Type.DOCTOR:
         data['org'] = user.medical_organization
-    metadata = {
-        'time': timezone.now().isoformat(),
-        'size': 0,
-        'privileges': 'read_own_profile',
-        'tree_depth': 1,
-    }
-    logger.info(json.dumps(metadata))
+    
+    forward_to_logger(request, 'get_current_user', 'success', metadata) 
+    
     return Response(data)
 
 @api_view(['GET'])
@@ -71,18 +107,20 @@ def get_current_user(request):
 # Server returns ciphertext + encrypted DEKs map + record signature
 # No decryption happens here, client is responsible for crypto
 def get_my_record(request):
+    try:
+        metadata = parse_metadata(request, request.user)
+    except InputError as e:
+        forward_to_logger(request, 'get_my_record', 'fail')
+        return Response({'error': str(e)}, status=e.status)
+    
     if request.user.type != User.Type.PATIENT:
+        forward_to_logger(request, 'get_my_record', 'fail', metadata)
         return Response({'error': 'Only patients have records'}, status=403)
 
     record = request.user.medical_record
-    metadata = {
-        'time': timezone.now().isoformat(),
-        'size': len(record.encrypted_data) if record.encrypted_data else 0,
-        'privileges': 'read_own_record',
-        'tree_depth': 1,  # flat record
-    }
-    logger.info(json.dumps(metadata))  # anomaly detec ready
-
+    
+    forward_to_logger(request, 'get_my_record', 'success', metadata)
+    
     return Response({
         'encrypted_data': base64.b64encode(record.encrypted_data).decode('utf-8') if record.encrypted_data else None,
         'encrypted_deks': record.encrypted_deks,
@@ -95,7 +133,14 @@ def get_my_record(request):
 # Expects base64 ciphertext and signature generated client-side
 # Treats the payload as opaque, stores it, logs the write event
 def update_my_record(request):
+    try:
+        metadata = parse_metadata(request, request.user)
+    except InputError as e:
+        forward_to_logger(request, 'update_my_record', 'fail')
+        return Response({'error': str(e)}, status=e.status)
+    
     if request.user.type != User.Type.PATIENT:
+        forward_to_logger(request, 'update_my_record', 'fail', metadata)
         return Response({'error': 'Only patients can update'}, status=403)
 
     data = request.data
@@ -104,15 +149,9 @@ def update_my_record(request):
     record.encrypted_deks = data['encrypted_deks']
     record.record_signature = base64.b64decode(data['signature'])
     record.save()
-
-    metadata = {
-        'time': timezone.now().isoformat(),
-        'size': len(record.encrypted_data),
-        'privileges': 'write_own_record',
-        'tree_depth': 1,
-    }
-    logger.info(json.dumps(metadata))
-
+    
+    forward_to_logger(request, 'update_my_record', 'success', metadata)
+    
     return Response({'status': 'OK'})
 
 @api_view(['POST'])
@@ -121,7 +160,14 @@ def update_my_record(request):
 # Link is stored in DoctorPatientLink
 # If encrypted_dek is provided, it is inserted into the record.encrypted_deks map under doctor_id
 def appoint_doctor(request, doctor_id):
+    try:
+        metadata = parse_metadata(request, request.user)
+    except InputError as e:
+        forward_to_logger(request, 'appoint_doctor', 'fail')
+        return Response({'error': str(e)}, status=e.status)
+    
     if request.user.type != User.Type.PATIENT:
+        forward_to_logger(request, 'appoint_doctor', 'fail', metadata)
         return Response({'error': 'Only patients appoint'}, status=403)
 
     encrypted_dek = request.data.get('encrypted_dek')
@@ -129,6 +175,7 @@ def appoint_doctor(request, doctor_id):
     try:
         doctor = User.objects.get(id=doctor_id, type=User.Type.DOCTOR)
     except User.DoesNotExist:
+        forward_to_logger(request, 'appoint_doctor', 'fail', metadata)
         return Response({'error': 'Invalid doctor'}, status=404)
 
     DoctorPatientLink.objects.create(doctor=doctor, patient=request.user)
@@ -137,15 +184,9 @@ def appoint_doctor(request, doctor_id):
         record = request.user.medical_record
         record.encrypted_deks[str(doctor_id)] = encrypted_dek
         record.save()
-
-    metadata = {
-        'time': timezone.now().isoformat(),
-        'size': len(encrypted_dek) if encrypted_dek else 0,
-        'privileges': 'appoint_doctor',
-        'tree_depth': 2,  # record + appointment
-    }
-    logger.info(json.dumps(metadata))
-
+    
+    forward_to_logger(request, 'appoint_doctor', 'success', metadata)
+    
     return Response({'status': 'OK'})
 
 @api_view(['GET'])
@@ -154,33 +195,36 @@ def appoint_doctor(request, doctor_id):
 # Requires an existing DoctorPatientLink (appointment gate)
 # Returns ciphertext plus the DEK entry wrapped for the requesting doctor
 def get_patient_record(request, patient_id):
-  if request.user.type != User.Type.DOCTOR:
-    return Response({'error': 'Only doctors access'}, status=403)
+    try:
+        metadata = parse_metadata(request, request.user)
+    except InputError as e:
+        forward_to_logger(request, 'get_patient_record', 'fail')
+        return Response({'error': str(e)}, status=e.status)
+    
+    if request.user.type != User.Type.DOCTOR:
+        forward_to_logger(request, 'get_patient_record', 'fail', metadata)
+        return Response({'error': 'Only doctors access'}, status=403)
 
-  try:
-    link = DoctorPatientLink.objects.get(doctor=request.user, patient_id=patient_id)
-  except DoctorPatientLink.DoesNotExist:
-    return Response({'error': 'Not appointed'}, status=403)
+    try:
+        link = DoctorPatientLink.objects.get(doctor=request.user, patient_id=patient_id)
+    except DoctorPatientLink.DoesNotExist:
+        forward_to_logger(request, 'get_patient_record', 'fail', metadata)
+        return Response({'error': 'Not appointed'}, status=403)
 
-  record = PatientRecord.objects.get(patient_id=patient_id)
-  encrypted_dek = record.encrypted_deks.get(str(request.user.id))
-  metadata = {
-    'time': timezone.now().isoformat(),
-    'size': len(record.encrypted_data) if record.encrypted_data else 0,
-    'privileges': 'read_patient_record',
-    'tree_depth': 2,
-  }
-  logger.info(json.dumps(metadata))
-
-  return Response({
-    'encrypted_data': base64.b64encode(record.encrypted_data).decode('utf-8') if record.encrypted_data else None,
-    'encrypted_dek': encrypted_dek if encrypted_dek else None,
-    'signature': base64.b64encode(record.record_signature).decode('utf-8') if record.record_signature else None,
-    'patient': {
-      'name': f"{record.patient.first_name} {record.patient.last_name}",
-      'dob': record.patient.date_of_birth.isoformat() if record.patient.date_of_birth else None
-    }
-  })
+    record = PatientRecord.objects.get(patient_id=patient_id)
+    encrypted_dek = record.encrypted_deks.get(str(request.user.id))
+    
+    forward_to_logger(request, 'get_patient_record', 'success', metadata)
+    
+    return Response({
+        'encrypted_data': base64.b64encode(record.encrypted_data).decode('utf-8') if record.encrypted_data else None,
+        'encrypted_dek': encrypted_dek if encrypted_dek else None,
+        'signature': base64.b64encode(record.record_signature).decode('utf-8') if record.record_signature else None,
+        'patient': {
+            'name': f"{record.patient.first_name} {record.patient.last_name}",
+            'dob': record.patient.date_of_birth.isoformat() if record.patient.date_of_birth else None
+        }
+    })
 
 
 @api_view(['DELETE'])
@@ -189,7 +233,14 @@ def get_patient_record(request, patient_id):
 # Deletes the appointment link and revokes DEK access by removing the doctor entry from encrypted_deks
 # Also revokes any previously approved appointment PendingRequest to keep state consistent
 def remove_doctor(request, doctor_id):
+    try:
+        metadata = parse_metadata(request, request.user)
+    except InputError as e:
+        forward_to_logger(request, 'remove_doctor', 'fail')
+        return Response({'error': str(e)}, status=e.status)
+    
     if request.user.type != User.Type.PATIENT:
+        forward_to_logger(request, 'remove_doctor', 'fail', metadata)
         return Response({'error': 'Only patients can remove doctors'}, status=403)
 
     try:
@@ -207,18 +258,13 @@ def remove_doctor(request, doctor_id):
         if pending:
             pending.status = 'revoked'
             pending.save()
-
-        metadata = {
-            'time': timezone.now().isoformat(),
-            'size': 0,  # No data size for removal
-            'privileges': 'remove_doctor',
-            'tree_depth': 2,  # Consistent with appointment
-        }
-        logger.info(json.dumps(metadata))
-
+        
+        forward_to_logger(request, 'remove_doctor', 'success', metadata)
+        
         return Response({'status': 'OK'})
 
     except (User.DoesNotExist, DoctorPatientLink.DoesNotExist):
+        forward_to_logger(request, 'remove_doctor', 'fail', metadata)
         return Response({'error': 'Invalid doctor or not appointed'}, status=404)
 
 @api_view(['GET'])
@@ -226,7 +272,14 @@ def remove_doctor(request, doctor_id):
 # Patient-only list of currently appointed doctors
 # Used by the UI to display trusted doctors and manage revocation
 def get_my_doctors(request):
+    try:
+        metadata = parse_metadata(request, request.user)
+    except InputError as e:
+        forward_to_logger(request, 'get_my_doctors', 'fail')
+        return Response({'error': str(e)}, status=e.status)
+    
     if request.user.type != User.Type.PATIENT:
+        forward_to_logger(request, 'get_my_doctors', 'fail', metadata)
         return Response({'error': 'Only patients can view appointed doctors'}, status=403)
 
     links = DoctorPatientLink.objects.filter(patient=request.user)
@@ -238,15 +291,9 @@ def get_my_doctors(request):
         }
         for link in links
     ]
-
-    metadata = {
-        'time': timezone.now().isoformat(),
-        'size': len(doctors),  # Number of doc
-        'privileges': 'read_appointed_doctors',
-        'tree_depth': 1,  # Flat list
-    }
-    logger.info(json.dumps(metadata))
-
+    
+    forward_to_logger(request, 'get_my_doctors', 'success', metadata)
+    
     return Response({'doctors': doctors})
 
 @api_view(['GET'])
@@ -254,7 +301,14 @@ def get_my_doctors(request):
 # Doctor-only list of currently appointed patients
 # Used by doctor portal to view records and send file requests
 def get_my_patients(request):
+    try:
+        metadata = parse_metadata(request, request.user)
+    except InputError as e:
+        forward_to_logger(request, 'get_my_patients', 'fail')
+        return Response({'error': str(e)}, status=e.status)
+    
     if request.user.type != User.Type.DOCTOR:
+        forward_to_logger(request, 'get_my_patients', 'fail', metadata)
         return Response({'error': 'Only doctors can view appointed patients'}, status=403)
 
     links = DoctorPatientLink.objects.filter(doctor=request.user)
@@ -267,15 +321,9 @@ def get_my_patients(request):
         }
         for link in links
     ]
-
-    metadata = {
-        'time': timezone.now().isoformat(),
-        'size': len(patients),
-        'privileges': 'read_appointed_patients',
-        'tree_depth': 1,
-    }
-    logger.info(json.dumps(metadata))
-
+    
+    forward_to_logger(request, 'get_my_patients', 'success', metadata)
+    
     return Response({'patients': patients})
 
 @api_view(['GET'])
@@ -283,7 +331,14 @@ def get_my_patients(request):
 # Patient-only doctor search directory
 # Simple name/org filtering, returns minimal identifying info for appointment requests
 def search_doctors(request):
+    try:
+        metadata = parse_metadata(request, request.user)
+    except InputError as e:
+        forward_to_logger(request, 'search_doctors', 'fail')
+        return Response({'error': str(e)}, status=e.status)
+    
     if request.user.type != User.Type.PATIENT:
+        forward_to_logger(request, 'search_doctors', 'fail', metadata)
         return Response({'error': 'Only patients can search doctors'}, status=403)
 
     q = request.GET.get('q', '')
@@ -297,15 +352,9 @@ def search_doctors(request):
             'org': d.medical_organization
         } for d in doctors
     ]
-
-    metadata = {
-        'time': timezone.now().isoformat(),
-        'size': len(data),
-        'privileges': 'search_doctors',
-        'tree_depth': 1,
-    }
-    logger.info(json.dumps(metadata))
-
+    
+    forward_to_logger(request, 'search_doctors', 'success', metadata)
+    
     return Response({'doctors': data})
 
 @api_view(['GET'])
@@ -313,7 +362,14 @@ def search_doctors(request):
 # Doctor-only patient search
 # Used when requesting an appointment, does not return record data
 def search_patients(request):
+    try:
+        metadata = parse_metadata(request, request.user)
+    except InputError as e:
+        forward_to_logger(request, 'search_patients', 'fail')
+        return Response({'error': str(e)}, status=e.status)
+    
     if request.user.type != User.Type.DOCTOR:
+        forward_to_logger(request, 'search_patients', 'fail', metadata)
         return Response({'error': 'Only doctors can search patients'}, status=403)
 
     q = request.GET.get('q', '')
@@ -327,15 +383,9 @@ def search_patients(request):
             'dob': p.date_of_birth.isoformat() if p.date_of_birth else None,
         } for p in patients
     ]
-
-    metadata = {
-        'time': timezone.now().isoformat(),
-        'size': len(data),
-        'privileges': 'search_patients',
-        'tree_depth': 1,
-    }
-    logger.info(json.dumps(metadata))
-
+    
+    forward_to_logger(request, 'search_patients', 'success', metadata)
+    
     return Response({'patients': data})
 
 # Stores user key material generated on the client
@@ -346,6 +396,12 @@ def search_patients(request):
 @api_view(['POST'])
 @permission_classes([IsAuthenticated])
 def update_user_keys(request):
+    try:
+        metadata = parse_metadata(request, request.user)
+    except InputError as e:
+        forward_to_logger(request, 'update_user_keys', 'fail')
+        return Response({'error': str(e)}, status=e.status)
+    
     user = request.user
     data = request.data
 
@@ -356,6 +412,7 @@ def update_user_keys(request):
             user.encryption_public_key = public_key_bytes
             logger.info(f"Public key updated for user {user.email} during registration")
         except (ValueError, binascii.Error):
+            forward_to_logger(request, 'update_user_keys', 'fail', metadata)
             logger.error(f"Invalid public key during registration for {user.email}")
             return Response({'error': 'Invalid public key'}, status=400)
 
@@ -366,6 +423,7 @@ def update_user_keys(request):
             user.signing_public_key = signing_public_key_bytes
             logger.info(f"Signing public key updated for user {user.email}")
         except (ValueError, binascii.Error):
+            forward_to_logger(request, 'update_user_keys', 'fail', metadata)
             logger.error(f"Invalid signing public key for user {user.email}")
             return Response({'error': 'Invalid signing public key'}, status=400)
 
@@ -377,6 +435,7 @@ def update_user_keys(request):
             user.encrypted_priv = encrypted_priv_bytes
             logger.info(f"Encrypted private key updated for user {user.email}")
         except ValueError:
+            forward_to_logger(request, 'update_user_keys', 'fail', metadata)
             logger.error(f"Invalid encrypted private key for user {user.email}")
             return Response({'error': 'Invalid encrypted private key'}, status=400)
 
@@ -386,15 +445,9 @@ def update_user_keys(request):
 
     user.save()
     logger.info(f"User {user.email} saved after key update")
-
-    metadata = {
-        'time': timezone.now().isoformat(),
-        'size': len(data.get('public_key', '')) + len(data.get('encrypted_priv', '')),
-        'privileges': 'update_keys',
-        'tree_depth': 1,
-    }
-    logger.info(json.dumps(metadata))
-
+    
+    forward_to_logger(request, 'update_user_keys', 'success', metadata)
+    
     return Response({'status': 'OK'})
 
 @api_view(['POST'])
@@ -404,7 +457,14 @@ def update_user_keys(request):
 # Enforces a short timestamp window to reduce replay risk
 # Stores the pending request for patient approval
 def request_appointment(request):
+    try:
+        metadata = parse_metadata(request, request.user)
+    except InputError as e:
+        forward_to_logger(request, 'request_appointment', 'fail')
+        return Response({'error': str(e)}, status=e.status)
+    
     if request.user.type != User.Type.DOCTOR:
+        forward_to_logger(request, 'request_appointment', 'fail', metadata)
         return Response({'error': 'Doctors only'}, status=403)
     data = request.data
     patient_id = data.get('patient_id')
@@ -412,6 +472,7 @@ def request_appointment(request):
     cert_pem = data.get('cert')  # Single doctor cert PEM
     timestamp = data.get('timestamp')
     if not timestamp:
+        forward_to_logger(request, 'request_appointment', 'fail', metadata)
         return Response({'error': 'Missing timestamp'}, status=400)
 
     try:
@@ -439,9 +500,11 @@ def request_appointment(request):
         now = timezone.now()
         req_time = datetime.fromisoformat(timestamp)
         if abs((now - req_time).total_seconds()) > 300:  # 5 minutes
+            forward_to_logger(request, 'request_appointment', 'fail', metadata)
             return Response({'error': 'Request timestamp too old'}, status=400)
 
         if PendingRequest.objects.filter(requester=request.user, target=patient, type='appointment', status='pending').exists():
+            forward_to_logger(request, 'request_appointment', 'fail', metadata)
             return Response({'error': 'Pending request already exists'}, status=400)
 
         # Store with cert for non-repudiation
@@ -453,19 +516,15 @@ def request_appointment(request):
             signature=signature,
             cert_chain={'doctor': cert_pem}  # doctor cert
         )
-
-        metadata = {
-            'time': timezone.now().isoformat(),
-            'size': len(signature),
-            'privileges': 'request_appointment',
-            'tree_depth': 2,
-        }
-        logger.info(json.dumps(metadata))
-
+        
+        forward_to_logger(request, 'request_appointment', 'success', metadata)
+        
         return Response({'status': 'OK'})
     except InvalidSignature:
+        forward_to_logger(request, 'request_appointment', 'fail', metadata)
         return Response({'error': 'Invalid signature'}, status=400)
     except Exception as e:
+        forward_to_logger(request, 'request_appointment', 'fail', metadata)
         logger.exception("Appointment request failed")
         return Response({'error': str(e)}, status=400)
 
@@ -474,10 +533,20 @@ def request_appointment(request):
 # Doctor-only view of requests created by the doctor
 # Used for status tracking in the doctor portal
 def get_pending_requests(request):
+    try:
+        metadata = parse_metadata(request, request.user)
+    except InputError as e:
+        forward_to_logger(request, 'get_pending_requests', 'fail')
+        return Response({'error': str(e)}, status=e.status)
+    
     if request.user.type != User.Type.DOCTOR:
+        forward_to_logger(request, 'get_pending_requests', 'fail', metadata)
         return Response({'error': 'Doctors only'}, status=403)
     requests = PendingRequest.objects.filter(requester=request.user)
     data = [{'id': str(r.id), 'type': r.type, 'status': r.status, 'patient_id': str(r.target.id), 'patient_name': f"{r.target.first_name} {r.target.last_name}", 'timestamp': r.created_at.isoformat(), 'details': r.details} for r in requests]
+    
+    forward_to_logger(request, 'get_pending_requests', 'success', metadata)
+    
     return Response({'requests': data})
 
 @api_view(['GET'])
@@ -485,7 +554,14 @@ def get_pending_requests(request):
 # Doctor-only endpoint to retrieve the local CA chain plus the user's stored doctor certificate
 # This is used by the frontend to attach cert material to signed actions
 def get_my_cert_chain(request):
+    try:
+        metadata = parse_metadata(request, request.user)
+    except InputError as e:
+        forward_to_logger(request, 'get_my_cert_chain', 'fail')
+        return Response({'error': str(e)}, status=e.status)
+    
     if request.user.type != User.Type.DOCTOR:
+        forward_to_logger(request, 'get_my_cert_chain', 'fail', metadata)
         return Response({'error': 'Doctors only'}, status=403)
     try:
         
@@ -495,16 +571,22 @@ def get_my_cert_chain(request):
             intermediate_pem = f.read()
         doctor_pem = request.user.certificate
         if not doctor_pem:
+            forward_to_logger(request, 'get_my_cert_chain', 'fail', metadata)
             return Response({'error': 'No certificate stored'}, status=400)
+        
+        forward_to_logger(request, 'get_my_cert_chain', 'success', metadata)
+        
         return Response({
             'root_pem': root_pem,
             'intermediate_pem': intermediate_pem,
             'doctor_pem': doctor_pem,
         })
     except FileNotFoundError as e:
+        forward_to_logger(request, 'get_my_cert_chain', 'fail', metadata)
         logger.error(f"FileNotFoundError: {str(e)}")
         return Response({'error': 'CA chain files missing'}, status=500)
     except Exception as e:
+        forward_to_logger(request, 'get_my_cert_chain', 'fail', metadata)
         logger.error(f"Unexpected error: {str(e)}")
         return Response({'error': str(e)}, status=500)
 
@@ -570,7 +652,14 @@ def verify_signature(pub_key, signature: bytes, data: bytes, hash_alg=hashes.SHA
 # Appointment link is checked first
 # Payload is signed and verified with the presented certificate public key before storing
 def create_pending_request(request):
+    try:
+        metadata = parse_metadata(request, request.user)
+    except InputError as e:
+        forward_to_logger(request, 'create_pending_request', 'fail')
+        return Response({'error': str(e)}, status=e.status)
+    
     if request.user.type != User.Type.DOCTOR:
+        forward_to_logger(request, 'create_pending_request', 'fail', metadata)
         return Response({'error': 'Doctors only'}, status=403)
 
     data = request.data
@@ -584,6 +673,7 @@ def create_pending_request(request):
     try:
         patient = User.objects.get(id=patient_id, type=User.Type.PATIENT)
         if not DoctorPatientLink.objects.filter(doctor=request.user, patient=patient).exists():
+            forward_to_logger(request, 'create_pending_request', 'fail', metadata)
             return Response({'error': 'Not appointed to this patient'}, status=403)
 
         signature = base64.b64decode(signature_b64)
@@ -616,20 +706,16 @@ def create_pending_request(request):
             signature=signature,
             cert_chain={"root": "", "intermediate": "", "doctor": cert_pem},
         )
-
-        metadata = {
-            'time': timezone.now().isoformat(),
-            'size': len(signature),
-            'privileges': 'create_pending_file_request',
-            'tree_depth': details.get('path', '').count('/') + 2 if isinstance(details, dict) else 2,
-        }
-        logger.info(json.dumps(metadata))
-
+        
+        forward_to_logger(request, 'create_pending_request', 'success', metadata)
+        
         return Response({'status': 'OK'})
 
     except InvalidSignature:
+        forward_to_logger(request, 'create_pending_request', 'fail', metadata)
         return Response({'error': 'Invalid signature'}, status=400)
     except Exception as e:
+        forward_to_logger(request, 'create_pending_request', 'fail', metadata)
         logger.exception("File change request failed")
         return Response({'error': str(e)}, status=400)
     
@@ -639,13 +725,23 @@ def create_pending_request(request):
 # Used to wrap DEKs and verify signatures client-side
 def get_user_public_key(request, user_id):
     try:
+        metadata = parse_metadata(request, request.user)
+    except InputError as e:
+        forward_to_logger(request, 'get_user_public_key', 'fail')
+        return Response({'error': str(e)}, status=e.status)
+    
+    try:
         user = User.objects.get(id=user_id)
         response_data = {
             'public_key': user.encryption_public_key.hex() if user.encryption_public_key else None,
             'signing_public_key': user.signing_public_key.hex() if user.signing_public_key else None
         }
+        
+        forward_to_logger(request, 'get_user_public_key', 'success', metadata)
+        
         return Response(response_data)
     except User.DoesNotExist:
+        forward_to_logger(request, 'get_user_public_key', 'fail', metadata)
         return Response({'error': 'User not found'}, status=404)
     
 
@@ -654,6 +750,12 @@ def get_user_public_key(request, user_id):
 # Lists pending requests addressed to the current user
 # Patient uses this to approve or deny incoming requests
 def get_pending_received(request):
+    try:
+        metadata = parse_metadata(request, request.user)
+    except InputError as e:
+        forward_to_logger(request, 'get_pending_received', 'fail')
+        return Response({'error': str(e)}, status=e.status)
+    
     requests = PendingRequest.objects.filter(target=request.user, status=PendingRequest.StatusChoices.PENDING)
     data = [{
         'id': str(r.id),
@@ -662,20 +764,23 @@ def get_pending_received(request):
         'details': r.details,
         'timestamp': r.created_at.isoformat(),
     } for r in requests]
-    metadata = {
-        'time': timezone.now().isoformat(),
-        'size': len(data),
-        'privileges': 'get_pending_received',
-        'tree_depth': 1,
-    }
-    logger.info(json.dumps(metadata))
+    
+    forward_to_logger(request, 'get_pending_received', 'success', metadata)
+    
     return Response({'requests': data})
 
 @api_view(['GET'])
 @permission_classes([IsAuthenticated])
 # Patient-only view of pending appointment requests
 def get_pending_appointments(request):
+    try:
+        metadata = parse_metadata(request, request.user)
+    except InputError as e:
+        forward_to_logger(request, 'get_pending_appointments', 'fail')
+        return Response({'error': str(e)}, status=e.status)
+    
     if request.user.type != User.Type.PATIENT:
+        forward_to_logger(request, 'get_pending_appointments', 'fail', metadata)
         return Response({'error': 'Patients only'}, status=403)
 
     requests = PendingRequest.objects.filter(target=request.user, type='appointment', status='pending')
@@ -684,13 +789,23 @@ def get_pending_appointments(request):
         'requester': {'id': str(r.requester.id), 'name': f"{r.requester.first_name} {r.requester.last_name}"},
         'timestamp': r.created_at.isoformat(),
     } for r in requests]
+    
+    forward_to_logger(request, 'get_pending_appointments', 'success', metadata)
+    
     return Response({'requests': data})
 
 @api_view(['GET'])
 @permission_classes([IsAuthenticated])
 # Patient-only view of pending file requests from currently appointed doctors
 def get_pending_file_requests(request):
+    try:
+        metadata = parse_metadata(request, request.user)
+    except InputError as e:
+        forward_to_logger(request, 'get_pending_file_requests', 'fail')
+        return Response({'error': str(e)}, status=e.status)
+    
     if request.user.type != User.Type.PATIENT:
+        forward_to_logger(request, 'get_pending_file_requests', 'fail', metadata)
         return Response({'error': 'Patients only'}, status=403)
 
     appointed_doctors = [link.doctor.id for link in DoctorPatientLink.objects.filter(patient=request.user)]
@@ -703,6 +818,9 @@ def get_pending_file_requests(request):
         'details': r.details,
         'timestamp': r.created_at.isoformat(),
     } for r in requests]
+    
+    forward_to_logger(request, 'get_pending_file_requests', 'success', metadata)
+    
     return Response({'requests': data})
 
 @api_view(['POST'])
@@ -711,17 +829,26 @@ def get_pending_file_requests(request):
 # For appointments: stores the DEK wrapped for the doctor and ensures the appointment link exists
 # For file requests: backend only updates status, client applies record changes after approval
 def approve_pending(request, pk):
+    try:
+        metadata = parse_metadata(request, request.user)
+    except InputError as e:
+        forward_to_logger(request, 'approve_pending', 'fail')
+        return Response({'error': str(e)}, status=e.status)
+    
     if request.user.type != User.Type.PATIENT:
+        forward_to_logger(request, 'approve_pending', 'fail', metadata)
         return Response({'error': 'Patients only'}, status=403)
     try:
         pending = PendingRequest.objects.get(id=pk, target=request.user, status=PendingRequest.StatusChoices.PENDING)
     except PendingRequest.DoesNotExist:
+        forward_to_logger(request, 'approve_pending', 'fail', metadata)
         return Response({'error': 'Request not found'}, status=404)
 
     # Type-specific
     if pending.type == 'appointment':
         encrypted_dek = request.data.get('encrypted_dek')
         if not encrypted_dek:
+            forward_to_logger(request, 'approve_pending', 'fail', metadata)
             return Response({'error': 'Missing encrypted_dek'}, status=400)
         record = request.user.medical_record
         record.encrypted_deks[str(pending.requester.id)] = encrypted_dek
@@ -731,36 +858,34 @@ def approve_pending(request, pk):
 
     pending.status = PendingRequest.StatusChoices.APPROVED
     pending.save()
-
-    metadata = {
-        'time': timezone.now().isoformat(),
-        'size': len(request.data) if request.data else 0,
-        'privileges': f'approve_{pending.type}',
-        'tree_depth': 2,
-    }
-    logger.info(json.dumps(metadata))
-
+    
+    forward_to_logger(request, 'approve_pending', 'success', metadata)
+    
     return Response({'status': 'approved'})
 
 @api_view(['POST'])
 @permission_classes([IsAuthenticated])
 # Patient denies a pending request, status becomes rejected
 def deny_pending(request, pk):
+    try:
+        metadata = parse_metadata(request, request.user)
+    except InputError as e:
+        forward_to_logger(request, 'deny_pending', 'fail')
+        return Response({'error': str(e)}, status=e.status)
+    
     if request.user.type != User.Type.PATIENT:
+        forward_to_logger(request, 'deny_pending', 'fail', metadata)
         return Response({'error': 'Patients only'}, status=403)
     try:
         pending = PendingRequest.objects.get(id=pk, target=request.user, status='pending')
     except PendingRequest.DoesNotExist:
+        forward_to_logger(request, 'deny_pending', 'fail', metadata)
         return Response({'error': 'Request not found'}, status=404)
     pending.status = 'rejected'
     pending.save()
-    metadata = {
-        'time': timezone.now().isoformat(),
-        'size': 0,
-        'privileges': f'deny_{pending.type}',
-        'tree_depth': 2,
-    }
-    logger.info(json.dumps(metadata))
+    
+    forward_to_logger(request, 'deny_pending', 'success', metadata)
+    
     return Response({'status': 'rejected'})
 
 @api_view(['POST'])
@@ -768,35 +893,47 @@ def deny_pending(request, pk):
 # Patient initializes the "self" DEK entry once
 # Used during first-time setup so the record can be encrypted and later shared via wrapped DEKs
 def init_dek(request):
+    try:
+        metadata = parse_metadata(request, request.user)
+    except InputError as e:
+        forward_to_logger(request, 'init_dek', 'fail')
+        return Response({'error': str(e)}, status=e.status)
+    
     if request.user.type != User.Type.PATIENT:
+        forward_to_logger(request, 'init_dek', 'fail', metadata)
         return Response({'error': 'Patients only'}, status=403)
 
     encrypted_dek_self = request.data.get('encrypted_dek_self')
     if not encrypted_dek_self:
+        forward_to_logger(request, 'init_dek', 'fail', metadata)
         return Response({'error': 'Missing encrypted_dek_self'}, status=400)
 
     try:
         record, created = PatientRecord.objects.get_or_create(patient=request.user)
     except Exception as e:
+        forward_to_logger(request, 'init_dek', 'fail', metadata)
         logger.exception("Failed to get or create PatientRecord")
         return Response({'error': 'Record access failed'}, status=500)
 
     if "self" in record.encrypted_deks:
+        forward_to_logger(request, 'init_dek', 'fail', metadata)
         return Response({'error': 'DEK already initialized'}, status=400)
 
     record.encrypted_deks["self"] = encrypted_dek_self
     record.save()
-
-    metadata = {
-        'time': timezone.now().isoformat(),
-        'size': len(encrypted_dek_self),
-        'privileges': 'init_dek',
-        'tree_depth': 1,
-    }
-    logger.info(json.dumps(metadata))
-
+    
+    forward_to_logger(request, 'init_dek', 'success', metadata)
+    
     return Response({'status': 'DEK initialized'})
 
 @api_view(['GET'])
 def health(request):
+    header = request.headers.get('X-Metadata', '{}')
+    try:
+        metadata = json.loads(base64.b64decode(header.split('|')[0]).decode('utf-8'))
+    except:
+        metadata = {}
+    
+    forward_to_logger(request, 'health', 'success', metadata)
+    
     return Response({"status": "ok", "message": "Backend is running!"})

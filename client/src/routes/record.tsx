@@ -38,17 +38,18 @@ import { useState, useEffect, useMemo } from 'react'
 import { createFileRoute, Link, useNavigate, useSearch, Outlet } from '@tanstack/react-router'
 import { Input } from '@/components/ui/input'
 import { Button } from '@/components/ui/button'
-import { Card, CardContent, CardFooter, CardHeader, CardTitle } from '@/components/ui/card'
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table'
 import { Textarea } from '@/components/ui/textarea'
 import { redirect } from '@tanstack/react-router'
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogTrigger, DialogFooter, DialogDescription } from '@/components/ui/dialog'
+import { Card, CardContent, CardDescription, CardFooter, CardTitle, CardHeader} from "@/components/ui/card";
 import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuTrigger, DropdownMenuSeparator, DropdownMenuSub, DropdownMenuSubContent, DropdownMenuSubTrigger, DropdownMenuPortal, DropdownMenuLabel } from '@/components/ui/dropdown-menu'
 import { ChevronDown, ChevronRight, Folder, FileText, MoreVertical, Plus, Upload, Edit, Trash, User, Calendar, Shield, Key, Stethoscope } from 'lucide-react'
 import { encryptAES, decryptAES, signEd25519, verifyEd25519, ecdhSharedSecret, deriveEd25519FromX25519, randomBytes, bytesToHex, hexToBytes, generateX25519Keypair, getX25519PublicFromPrivate, bytesToBase64, base64ToBytes } from '../components/CryptoUtils'
 import { useAuth } from './__root'
 import { Document, Page, pdfjs } from 'react-pdf';
 import { saveKey, getKey } from "../lib/key-store";
+import { generateMetadata, prepareMetadata } from '../lib/metadata'; // New import for metadata
 
 
 interface RecordNode {
@@ -105,9 +106,15 @@ interface CertChain {
 export const Route = createFileRoute('/record')({
   beforeLoad: async () => {
     try {
+      // Generate metadata for auth status check (auth-specific, no tree depth)
+      const authPayload = {}; // Empty body
+      const authMetadata = generateMetadata(authPayload, ['user', 'auth_status'], 'GET');
+      const authMetadataHeader = await prepareMetadata(authMetadata, window.__SIGN_PRIV__); // Sign if available
+
       const response = await fetch('/api/webauthn/auth/status/', {
         method: 'GET',
         credentials: 'include',
+        headers: { "X-Metadata": authMetadataHeader } // Attach as header
       });
       if (!response.ok) {
         throw new Error('Not authenticated');
@@ -256,7 +263,13 @@ const fixTree = (node: RecordNode): RecordNode => {
   useEffect(() => {
     const fetchUser = async () => {
       try {
-        const r = await fetch('/api/user/me/');
+        // Generate metadata for user me fetch (user-specific, no tree depth)
+        const meMetadata = generateMetadata({}, ['user', 'get_me'], 'GET');
+        const meMetadataHeader = await prepareMetadata(meMetadata, window.__SIGN_PRIV__); // Sign if available
+
+        const r = await fetch('/api/user/me/', {
+          headers: { "X-Metadata": meMetadataHeader } // Attach as header
+        });
         if (!r.ok) throw new Error(await r.text());
         const data = await r.json();
         setUser(data);
@@ -274,7 +287,13 @@ useEffect(() => {
   (async () => {
     if (window.__MY_PRIV__) {
       try {
-        const rOwnPub = await fetch(`/api/user/public_key/${user.id}`);
+        // Generate metadata for own public key fetch (user-specific, no tree depth)
+        const ownPubMetadata = generateMetadata({}, ['user', 'get_public_key'], 'GET');
+        const ownPubMetadataHeader = await prepareMetadata(ownPubMetadata, window.__SIGN_PRIV__); // Sign available
+
+        const rOwnPub = await fetch(`/api/user/public_key/${user.id}`, {
+          headers: { "X-Metadata": ownPubMetadataHeader } // Attach as header
+        });
         if (!rOwnPub.ok) throw new Error('Failed to fetch own public key');
         const ownData = await rOwnPub.json();
         const ownPub = hexToBytes(ownData.public_key);
@@ -309,7 +328,13 @@ useEffect(() => {
     } else if (user.type === 'doctor') {
       if (patientId) {
         // Fetch patient pub first, then record
-        const rPub = await fetch(`/api/user/public_key/${patientId}?_=${refreshKey}`); // Cache bust
+        // Generate metadata for patient public key fetch (doctor-specific, no tree depth)
+        const patientPubMetadata = generateMetadata({}, ['doctor', 'get_patient_public_key'], 'GET');
+        const patientPubMetadataHeader = await prepareMetadata(patientPubMetadata, window.__SIGN_PRIV__); // Sign available
+
+        const rPub = await fetch(`/api/user/public_key/${patientId}?_=${refreshKey}`, {
+          headers: { "X-Metadata": patientPubMetadataHeader } // Attach as header
+        }); // Cache bust
         if (!rPub.ok) {
           const errText = await rPub.text();
           throw new Error('Failed to fetch patient public key: ' + errText);
@@ -361,7 +386,13 @@ useEffect(() => {
 
   const fetchRecord = async (url: string, isSelf: boolean, patientPubBytes?: Uint8Array, patientSignPubBytes?: Uint8Array) => {
     try {
-      const r = await fetch(url)
+      // Generate metadata for record fetch (role-specific, tree depth 0 for root)
+      const recordMetadata = generateMetadata({}, [user?.type || 'user', 'get_record'], 'GET', 0);
+      const recordMetadataHeader = await prepareMetadata(recordMetadata, window.__SIGN_PRIV__); // Sign if available
+
+      const r = await fetch(url, {
+        headers: { "X-Metadata": recordMetadataHeader } // Attach as header
+      })
       if (!r.ok) {
         const errorText = await r.text()
         throw new Error('Fetch record failed: ' + errorText)
@@ -537,8 +568,14 @@ try {
   window.__MY_PRIV__ = newPriv
   sessionStorage.setItem('x25519_priv_b64', inputPriv);
 
+  // Generate metadata for own public key fetch (user-specific, no tree depth)
+  const ownPubMetadata = generateMetadata({}, ['user', 'get_public_key'], 'GET');
+  const ownPubMetadataHeader = await prepareMetadata(ownPubMetadata); // No signing yet
+
   // Verify private key matches server public key
-  const rPub = await fetch(`/api/user/public_key/${user!.id}`);
+  const rPub = await fetch(`/api/user/public_key/${user!.id}`, {
+    headers: { "X-Metadata": ownPubMetadataHeader } // Attach as header
+  });
   if (!rPub.ok) throw new Error('Failed to fetch own public key');
   const { public_key } = await rPub.json();
   if (!public_key) throw new Error('No public key on server');
@@ -554,13 +591,21 @@ try {
   if (window.__KEK__) {
     const encryptedPriv = await encryptAES(newPriv, window.__KEK__)
     const encryptedPrivStr = bytesToBase64(new Uint8Array([...encryptedPriv.iv, ...encryptedPriv.ciphertext, ...encryptedPriv.tag]))
+
+    // Generate metadata for keys update (user-specific, tree depth 0)
+    const updatePayload = { encrypted_priv: encryptedPrivStr };
+    const updateMetadata = generateMetadata(updatePayload, ['user', 'update_keys'], 'POST', 0);
+    const updateMetadataHeader = await prepareMetadata(updateMetadata, window.__SIGN_PRIV__); // Sign available
+
     const r = await fetch('/api/user/keys/update/', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'X-CSRFToken': getCookie('csrftoken') || '' },
+      headers: { 
+        'Content-Type': 'application/json', 
+        'X-CSRFToken': getCookie('csrftoken') || '',
+        "X-Metadata": updateMetadataHeader // Attach as header
+      },
       credentials: 'include',
-      body: JSON.stringify({
-        encrypted_priv: encryptedPrivStr
-      })
+      body: JSON.stringify(updatePayload)
     })
     if (!r.ok) console.error('Failed to update encrypted priv')
   }
@@ -573,7 +618,13 @@ try {
   if (isSelf) {
     await fetchRecord('/api/record/my/', true)
   } else if (patientId) {
-    const rPub = await fetch(`/api/user/public_key/${patientId}`);
+    // Generate metadata for patient public key fetch (doctor-specific, no tree depth)
+    const patientPubMetadata = generateMetadata({}, ['doctor', 'get_patient_public_key'], 'GET');
+    const patientPubMetadataHeader = await prepareMetadata(patientPubMetadata, window.__SIGN_PRIV__); // Sign available
+
+    const rPub = await fetch(`/api/user/public_key/${patientId}`, {
+      headers: { "X-Metadata": patientPubMetadataHeader } // Attach as header
+    });
     if (!rPub.ok) throw new Error('Failed to fetch patient public key');
     const pubData = await rPub.json();
     const pubBytes = hexToBytes(pubData.public_key);
@@ -601,7 +652,13 @@ const handleCertPrivInput = async () => {
 
 const fetchCertChain = async () => {
   try {
-    const r = await fetch("/api/ca/my_chain/");
+    // Generate metadata for cert chain fetch (doctor-specific, no tree depth)
+    const certMetadata = generateMetadata({}, ['doctor', 'get_cert_chain'], 'GET');
+    const certMetadataHeader = await prepareMetadata(certMetadata, window.__SIGN_PRIV__); // Sign if available
+
+    const r = await fetch("/api/ca/my_chain/", {
+      headers: { "X-Metadata": certMetadataHeader } // Attach as header
+    });
     if (!r.ok) throw new Error(await r.text());
     const data = await r.json();
     setCertChain({
@@ -622,7 +679,7 @@ const fetchCertChain = async () => {
  *      Retrieves the list of doctors currently appointed by the authenticated patient.
  *      This list is used for:
  *        - Displaying "Appointed Doctors" in the UI
- *        - Computing DEK wrapping targets during updateRecord() (sharing DEK with each doctor)
+ *        - Computing DEK wrapping targets during updateRecord() (sharing DEK with each)
  *
  * FLOW:
  *  1) GET /api/appoint/doctors/ with session cookies.
@@ -638,7 +695,13 @@ const fetchCertChain = async () => {
 
   const fetchAppointedDoctors = async () => {
     try {
-      const r = await fetch('/api/appoint/doctors/')
+      // Generate metadata for appointed doctors fetch (patient-specific, no tree depth)
+      const doctorsMetadata = generateMetadata({}, ['patient', 'get_appointed_doctors'], 'GET');
+      const doctorsMetadataHeader = await prepareMetadata(doctorsMetadata, window.__SIGN_PRIV__); // Sign available
+
+      const r = await fetch('/api/appoint/doctors/', {
+        headers: { "X-Metadata": doctorsMetadataHeader } // Attach as header
+      })
       if (!r.ok) throw new Error(await r.text())
       const { doctors } = await r.json()
       setAppointedDoctors(doctors)
@@ -654,7 +717,7 @@ const fetchCertChain = async () => {
  *
  * PURPOSE:
  *      Retrieves the list of patients that have appointed the authenticated doctor.
- *      Used in the doctor portal to populate the "Appointed Patients" table and allow
+ *      Used in the doctor portal to populate the "Appointed Patients" table to allow
  *      navigation to a specific patient record view.
  *
  * FLOW:
@@ -669,7 +732,13 @@ const fetchCertChain = async () => {
  */
   const fetchAppointedPatients = async () => {
     try {
-      const r = await fetch('/api/appoint/patients/')
+      // Generate metadata for appointed patients fetch (doctor-specific, no tree depth)
+      const patientsMetadata = generateMetadata({}, ['doctor', 'get_appointed_patients'], 'GET');
+      const patientsMetadataHeader = await prepareMetadata(patientsMetadata, window.__SIGN_PRIV__); // Sign available
+
+      const r = await fetch('/api/appoint/patients/', {
+        headers: { "X-Metadata": patientsMetadataHeader } // Attach as header
+      })
       if (!r.ok) throw new Error(await r.text())
       const { patients } = await r.json()
       setAppointedPatients(patients)
@@ -685,7 +754,7 @@ const fetchCertChain = async () => {
  *
  * PURPOSE:
  *      Encrypts and signs the current record tree, wraps the DEK for all authorized readers,
- *      and uploads only ciphertext + wrapped keys to the server.
+ *      and uploads only ciphertext to the server.
  *
  * INPUT:
  *  - rotate (default false):
@@ -747,7 +816,13 @@ const updateRecord = async (rotate = false) => {
     deks['self'] = bytesToBase64(new Uint8Array([...encryptedSelfDek.iv, ...encryptedSelfDek.ciphertext, ...encryptedSelfDek.tag]))
     // Doctors
     for (const doc of appointedDoctors) {
-      const docPubRes = await fetch(`/api/user/public_key/${doc.id}`)
+      // Generate metadata for doctor public key fetch (patient-specific, no tree depth)
+      const docPubMetadata = generateMetadata({}, ['patient', 'get_doctor_public_key'], 'GET');
+      const docPubMetadataHeader = await prepareMetadata(docPubMetadata, window.__SIGN_PRIV__); // Sign available
+
+      const docPubRes = await fetch(`/api/user/public_key/${doc.id}`, {
+        headers: { "X-Metadata": docPubMetadataHeader } // Attach as header
+      })
       if (!docPubRes.ok) continue
       const { public_key } = await docPubRes.json()
       const docPubBytes = hexToBytes(public_key)
@@ -761,16 +836,26 @@ const updateRecord = async (rotate = false) => {
       privileges: 'patient',
       tree_depth: calculateMaxDepth(record),
     }
+
+    // Generate metadata for record update (patient-specific, tree depth from max)
+    const updatePayload = {
+      encrypted_data: bytesToBase64(concatenated),
+      encrypted_deks: deks,
+      signature: bytesToBase64(sig),
+      metadata,
+    };
+    const updateMetadataObj = generateMetadata(updatePayload, ['patient', 'update_record'], 'POST', calculateMaxDepth(record));
+    const updateMetadataHeader = await prepareMetadata(updateMetadataObj, window.__SIGN_PRIV__); // Sign available
+
     const r = await fetch('/api/record/update/', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'X-CSRFToken': getCookie('csrftoken') || '' },
+      headers: { 
+        'Content-Type': 'application/json', 
+        'X-CSRFToken': getCookie('csrftoken') || '',
+        "X-Metadata": updateMetadataHeader // Attach as header
+      },
       credentials: 'include',
-      body: JSON.stringify({
-        encrypted_data: bytesToBase64(concatenated),
-        encrypted_deks: deks,
-        signature: bytesToBase64(sig),
-        metadata,
-      }),
+      body: JSON.stringify(updatePayload),
     })
     if (!r.ok) throw new Error('Update error: ' + await r.text())
     if (rotate) {
@@ -779,9 +864,18 @@ const updateRecord = async (rotate = false) => {
         const encryptedPriv = await encryptAES(priv, window.__KEK__)
         body.encrypted_priv = bytesToBase64(new Uint8Array([...encryptedPriv.iv, ...encryptedPriv.ciphertext, ...encryptedPriv.tag]))
       }
+
+      // Generate metadata for keys update (patient-specific, tree depth 0)
+      const keysUpdateMetadata = generateMetadata(body, ['patient', 'update_keys'], 'POST', 0);
+      const keysUpdateMetadataHeader = await prepareMetadata(keysUpdateMetadata, window.__SIGN_PRIV__); // Sign available
+
       const kr = await fetch('/api/user/keys/update/', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json', 'X-CSRFToken': getCookie('csrftoken') || '' },
+        headers: { 
+          'Content-Type': 'application/json', 
+          'X-CSRFToken': getCookie('csrftoken') || '',
+          "X-Metadata": keysUpdateMetadataHeader // Attach as header
+        },
         credentials: 'include',
         body: JSON.stringify(body)
       })
@@ -856,10 +950,18 @@ const updateRecord = async (rotate = false) => {
  */
 
   const removeDoctor = async (doctorId: string) => {
+    if (!confirm('Remove this doctor? You may need to rotate keys to fully revoke access.')) return;
     try {
+      // Generate metadata for remove doctor (patient-specific, no tree depth)
+      const removeMetadata = generateMetadata({}, ['patient', 'remove_doctor'], 'DELETE');
+      const removeMetadataHeader = await prepareMetadata(removeMetadata, window.__SIGN_PRIV__); // Sign available
+
       const res = await fetch(`/api/appoint/remove/${doctorId}/`, { 
         method: 'DELETE',
-        headers: { 'X-CSRFToken': getCookie('csrftoken') || '' },
+        headers: { 
+          'X-CSRFToken': getCookie('csrftoken') || '',
+          "X-Metadata": removeMetadataHeader // Attach as header
+        },
         credentials: 'include'
       })
       if (!res.ok) throw new Error('Remove failed: ' + await res.text())
@@ -873,7 +975,13 @@ const updateRecord = async (rotate = false) => {
   const searchDoctors = async (q: string) => {
     if (!q) return
     try {
-      const r = await fetch(`/api/doctors/search/?q=${encodeURIComponent(q)}`)
+      // Generate metadata for doctors search (patient-specific, no tree depth)
+      const searchMetadata = generateMetadata({}, ['patient', 'search_doctors'], 'GET');
+      const searchMetadataHeader = await prepareMetadata(searchMetadata, window.__SIGN_PRIV__); // Sign available
+
+      const r = await fetch(`/api/doctors/search/?q=${encodeURIComponent(q)}`, {
+        headers: { "X-Metadata": searchMetadataHeader } // Attach as header
+      })
       if (!r.ok) throw new Error(await r.text())
       const { doctors } = await r.json()
       setSearchedDoctors(doctors)
@@ -909,9 +1017,13 @@ const updateRecord = async (rotate = false) => {
     }
 
     try {
-      const docPubRes = await fetch(`/api/user/public_key/${doctorId}`)
-      let encryptedDekStr: string | null = null
+      // Generate metadata for doctor public key fetch (patient-specific, no tree depth)
+      const docPubMetadata = generateMetadata({}, ['patient', 'get_doctor_public_key'], 'GET');
+      const docPubMetadataHeader = await prepareMetadata(docPubMetadata, window.__SIGN_PRIV__); // Sign available
 
+      const docPubRes = await fetch(`/api/user/public_key/${doctorId}`, {
+        headers: { "X-Metadata": docPubMetadataHeader } // Attach as header
+      })
       if (docPubRes.status === 404) {
         throw new Error('Doctor not found')
       }
@@ -932,18 +1044,27 @@ console.log(`Patient-side shared hash for doctor ${doctorId}: ${sharedHash}`);
         }
         
         const encryptedDek = await encryptAES(dek, shared)
-        encryptedDekStr = bytesToBase64(new Uint8Array([...encryptedDek.iv, ...encryptedDek.ciphertext, ...encryptedDek.tag]))
-      }
+        const encryptedDekStr = bytesToBase64(new Uint8Array([...encryptedDek.iv, ...encryptedDek.ciphertext, ...encryptedDek.tag]))
 
-      const res = await fetch(`/api/appoint/${doctorId}/`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json', 'X-CSRFToken': getCookie('csrftoken') || '' },
-        credentials: 'include',
-        body: JSON.stringify({ encrypted_dek: encryptedDekStr })
-      })
-      if (!res.ok) throw new Error('Appoint failed: ' + await res.text())
-      fetchAppointedDoctors()
-      setAddDoctorDialogOpen(false)
+        // Generate metadata for appoint doctor (patient-specific, no tree depth)
+        const appointPayload = { encrypted_dek: encryptedDekStr };
+        const appointMetadata = generateMetadata(appointPayload, ['patient', 'appoint_doctor'], 'POST');
+        const appointMetadataHeader = await prepareMetadata(appointMetadata, window.__SIGN_PRIV__); // Sign available
+
+        const res = await fetch(`/api/appoint/${doctorId}/`, {
+          method: 'POST',
+          headers: { 
+            'Content-Type': 'application/json', 
+            'X-CSRFToken': getCookie('csrftoken') || '',
+            "X-Metadata": appointMetadataHeader // Attach as header
+          },
+          credentials: 'include',
+          body: JSON.stringify(appointPayload)
+        })
+        if (!res.ok) throw new Error('Appoint failed: ' + await res.text())
+        fetchAppointedDoctors()
+        setAddDoctorDialogOpen(false)
+      }
     } catch (err) {
       console.error('Appoint doctor failed:', err)
       setError(err.message)
@@ -1305,14 +1426,20 @@ const handleRequest = async () => {
       metadata,
     };
 
+    // Generate metadata for pending create (doctor-specific, tree depth from selection)
+    const pendingPayload = body;
+    const pendingMetadata = generateMetadata(pendingPayload, ['doctor', 'create_pending'], 'POST', treeDepth);
+    const pendingMetadataHeader = await prepareMetadata(pendingMetadata, window.__SIGN_PRIV__); // Sign available
+
     const res = await fetch("/api/pending/create/", {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
         "X-CSRFToken": getCookie("csrftoken") || "",
+        "X-Metadata": pendingMetadataHeader // Attach as header
       },
       credentials: "include",
-      body: JSON.stringify(body),
+      body: JSON.stringify(pendingPayload),
     });
     if (!res.ok) throw new Error(await res.text());
     alert("File request sent. Awaiting patient approval.");
@@ -1334,8 +1461,7 @@ const handleRequest = async () => {
 
   const isPatient = user.type === 'patient'
   const header = isPatient ? `Medical Record ${patientInfo?.name || ''}` : patientId ? `Patient Record: ${patientInfo?.name || ''} (DOB: ${patientInfo?.dob || ''})` : 'My Appointed Patients'
-  const selectedNode = record ? findNode(record, selectedPath) : null  
-
+  const selectedNode = record ? findNode(record, selectedPath) : null
 
   return (
     <div className="max-w-6xl mx-auto p-4 sm:p-6 lg:p-8">

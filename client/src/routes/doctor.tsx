@@ -86,6 +86,7 @@ import {
   decryptAES,
 } from "../components/CryptoUtils";
 import { saveKey, getKey } from "../lib/key-store";
+import { generateMetadata, prepareMetadata } from '../lib/metadata'; // New import for metadata
 
 /**
  * FUNCTION: getCookie
@@ -210,9 +211,15 @@ const decryptDEK = async (
 export const Route = createFileRoute("/doctor")({
   beforeLoad: async () => {
     try {
+      // Generate metadata for auth status check (auth-specific, no tree depth)
+      const authPayload = {}; // Empty body
+      const authMetadata = generateMetadata(authPayload, ['user', 'auth_status'], 'GET');
+      const authMetadataHeader = await prepareMetadata(authMetadata, window.__SIGN_PRIV__); // Sign if available
+
       const response = await fetch("/api/webauthn/auth/status/", {
         method: "GET",
         credentials: "include",
+        headers: { "X-Metadata": authMetadataHeader } // Attach as header
       });
       if (!response.ok) {
         throw new Error("Not authenticated");
@@ -285,7 +292,13 @@ function UserPortal() {
 
   const fetchUser = async () => {
     try {
-      const r = await fetch("/api/user/me/");
+      // Generate metadata for user me fetch (user-specific, no tree depth)
+      const meMetadata = generateMetadata({}, ['user', 'get_me'], 'GET');
+      const meMetadataHeader = await prepareMetadata(meMetadata, window.__SIGN_PRIV__); // Sign if available
+
+      const r = await fetch("/api/user/me/", {
+        headers: { "X-Metadata": meMetadataHeader } // Attach as header
+      });
       if (!r.ok) throw new Error(await r.text());
       const data = await r.json();
       setUser(data);
@@ -301,6 +314,25 @@ function UserPortal() {
       window.__MY_PRIV__ = newPriv;
       sessionStorage.setItem("x25519_priv_b64", inputPriv);
 
+      // Generate metadata for own public key fetch (user-specific, no tree depth)
+      const ownPubMetadata = generateMetadata({}, ['user', 'get_public_key'], 'GET');
+      const ownPubMetadataHeader = await prepareMetadata(ownPubMetadata); // No signing yet
+
+      // Verify private key matches server public key
+      const rPub = await fetch(`/api/user/public_key/${user!.id}`, {
+        headers: { "X-Metadata": ownPubMetadataHeader } // Attach as header
+      });
+      if (!rPub.ok) throw new Error('Failed to fetch own public key');
+      const { public_key } = await rPub.json();
+      if (!public_key) throw new Error('No public key on server');
+      const serverPub = hexToBytes(public_key);
+      const derivedPub = getX25519PublicFromPrivate(newPriv);  // Derive pub from entered priv
+      const match = derivedPub.every((val, i) => val === serverPub[i]);
+      if (!match) {
+        throw new Error('Private key does not match the public key on the server. Please enter the correct key or rotate if needed.');
+      }
+      console.log('Private key verified successfully');
+
       if (window.__KEK__) {
         const encryptedPriv = await encryptAES(newPriv, window.__KEK__);
         const encryptedPrivStr = bytesToBase64(
@@ -310,14 +342,21 @@ function UserPortal() {
             ...encryptedPriv.tag,
           ]),
         );
+
+        // Generate metadata for keys update (user-specific, tree depth 0)
+        const updatePayload = { encrypted_priv: encryptedPrivStr };
+        const updateMetadata = generateMetadata(updatePayload, ['user', 'update_keys'], 'POST', 0);
+        const updateMetadataHeader = await prepareMetadata(updateMetadata, window.__SIGN_PRIV__); // Sign available
+
         const r = await fetch("/api/user/keys/update/", {
           method: "POST",
           headers: {
             "Content-Type": "application/json",
             "X-CSRFToken": getCookie("csrftoken") || "",
+            "X-Metadata": updateMetadataHeader // Attach as header
           },
           credentials: "include",
-          body: JSON.stringify({ encrypted_priv: encryptedPrivStr }),
+          body: JSON.stringify(updatePayload),
         });
         if (!r.ok) console.error("Failed to update encrypted priv");
       }
@@ -343,7 +382,13 @@ function UserPortal() {
 
   const fetchAppointedPatients = async () => {
     try {
-      const r = await fetch("/api/appoint/patients/");
+      // Generate metadata for appointed patients fetch (doctor-specific, no tree depth)
+      const patientsMetadata = generateMetadata({}, ['doctor', 'get_appointed_patients'], 'GET');
+      const patientsMetadataHeader = await prepareMetadata(patientsMetadata, window.__SIGN_PRIV__); // Sign available
+
+      const r = await fetch("/api/appoint/patients/", {
+        headers: { "X-Metadata": patientsMetadataHeader } // Attach as header
+      });
       if (!r.ok) throw new Error(await r.text());
       const { patients } = await r.json();
       setAppointedPatients(patients);
@@ -355,7 +400,13 @@ function UserPortal() {
 
   const fetchPendingRequests = async () => {
     try {
-      const r = await fetch("/api/pending/my_requests/");
+      // Generate metadata for pending requests fetch (doctor-specific, no tree depth)
+      const requestsMetadata = generateMetadata({}, ['doctor', 'get_pending_requests'], 'GET');
+      const requestsMetadataHeader = await prepareMetadata(requestsMetadata, window.__SIGN_PRIV__); // Sign available
+
+      const r = await fetch("/api/pending/my_requests/", {
+        headers: { "X-Metadata": requestsMetadataHeader } // Attach as header
+      });
       if (!r.ok) throw new Error(await r.text());
       const { requests } = await r.json();
       setPendingRequests(requests);
@@ -367,7 +418,13 @@ function UserPortal() {
 
   const fetchCertChain = async () => {
     try {
-      const r = await fetch("/api/ca/my_chain/");
+      // Generate metadata for cert chain fetch (doctor-specific, no tree depth)
+      const certMetadata = generateMetadata({}, ['doctor', 'get_cert_chain'], 'GET');
+      const certMetadataHeader = await prepareMetadata(certMetadata, window.__SIGN_PRIV__); // Sign available
+
+      const r = await fetch("/api/ca/my_chain/", {
+        headers: { "X-Metadata": certMetadataHeader } // Attach as header
+      });
       if (!r.ok) throw new Error(await r.text());
       const data = await r.json();
       setCertChain({
@@ -387,7 +444,13 @@ function UserPortal() {
       return;
     }
     try {
-      const r = await fetch(`/api/patients/search/?q=${encodeURIComponent(q)}`);
+      // Generate metadata for patients search (doctor-specific, no tree depth)
+      const searchMetadata = generateMetadata({}, ['doctor', 'search_patients'], 'GET');
+      const searchMetadataHeader = await prepareMetadata(searchMetadata, window.__SIGN_PRIV__); // Sign available
+
+      const r = await fetch(`/api/patients/search/?q=${encodeURIComponent(q)}`, {
+        headers: { "X-Metadata": searchMetadataHeader } // Attach as header
+      });
       if (!r.ok) throw new Error(await r.text());
       const { patients } = await r.json();
       setSearchedPatients(patients);
@@ -456,14 +519,20 @@ function UserPortal() {
         timestamp: timestamp,
       };
 
+      // Generate metadata for appointment request (doctor-specific, no tree depth)
+      const appointPayload = body;
+      const appointMetadata = generateMetadata(appointPayload, ['doctor', 'request_appointment'], 'POST');
+      const appointMetadataHeader = await prepareMetadata(appointMetadata, window.__SIGN_PRIV__); // Sign available
+
       const res = await fetch("/api/appoint/request/", {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
           "X-CSRFToken": getCookie("csrftoken") || "",
+          "X-Metadata": appointMetadataHeader // Attach as header
         },
         credentials: "include",
-        body: JSON.stringify(body),
+        body: JSON.stringify(appointPayload),
       });
       if (!res.ok) throw new Error(await res.text());
       alert("Appointment request sent. Awaiting patient approval.");
@@ -481,7 +550,13 @@ function UserPortal() {
 
   const fetchPendingAppointments = async () => {
     try {
-      const r = await fetch("/api/pending/appointments/");
+      // Generate metadata for pending appointments fetch (patient-specific, no tree depth)
+      const appointmentsMetadata = generateMetadata({}, ['patient', 'get_pending_appointments'], 'GET');
+      const appointmentsMetadataHeader = await prepareMetadata(appointmentsMetadata, window.__SIGN_PRIV__); // Sign available
+
+      const r = await fetch("/api/pending/appointments/", {
+        headers: { "X-Metadata": appointmentsMetadataHeader } // Attach as header
+      });
       if (!r.ok) throw new Error(await r.text());
       const { requests } = await r.json();
       setPendingAppointments(requests);
@@ -493,7 +568,13 @@ function UserPortal() {
 
   const fetchPendingFileRequests = async () => {
     try {
-      const r = await fetch("/api/pending/file_requests/");
+      // Generate metadata for pending file requests fetch (patient-specific, no tree depth)
+      const fileRequestsMetadata = generateMetadata({}, ['patient', 'get_pending_file_requests'], 'GET');
+      const fileRequestsMetadataHeader = await prepareMetadata(fileRequestsMetadata, window.__SIGN_PRIV__); // Sign available
+
+      const r = await fetch("/api/pending/file_requests/", {
+        headers: { "X-Metadata": fileRequestsMetadataHeader } // Attach as header
+      });
       if (!r.ok) throw new Error(await r.text());
       const { requests } = await r.json();
       setPendingFileRequests(requests);
@@ -509,8 +590,14 @@ function UserPortal() {
       return;
     }
     try {
+      // Generate metadata for record fetch (patient-specific, tree depth 0 for root)
+      const recordMetadata = generateMetadata({}, ['patient', 'get_record'], 'GET', 0);
+      const recordMetadataHeader = await prepareMetadata(recordMetadata, window.__SIGN_PRIV__); // Sign available
+
       // Load current DEK from patient's record
-      const recordRes = await fetch("/api/record/my/");
+      const recordRes = await fetch("/api/record/my/", {
+        headers: { "X-Metadata": recordMetadataHeader } // Attach as header
+      });
       if (!recordRes.ok) throw new Error("Failed to fetch record");
       const recordData = await recordRes.json();
       const encDekSelf = recordData.encrypted_deks["self"];
@@ -518,8 +605,14 @@ function UserPortal() {
       const masterKEK = await deriveMasterKEK(window.__MY_PRIV__);
       const dek = await decryptDEK(encDekSelf, masterKEK);
 
+      // Generate metadata for doctor public key fetch (patient-specific, no tree depth)
+      const docPubMetadata = generateMetadata({}, ['patient', 'get_doctor_public_key'], 'GET');
+      const docPubMetadataHeader = await prepareMetadata(docPubMetadata, window.__SIGN_PRIV__); // Sign available
+
       // Fetch doctor's public key
-      const pubRes = await fetch(`/api/user/public_key/${req.requester.id}`);
+      const pubRes = await fetch(`/api/user/public_key/${req.requester.id}`, {
+        headers: { "X-Metadata": docPubMetadataHeader } // Attach as header
+      });
       if (!pubRes.ok) throw new Error("Failed to fetch doctor public key");
       const { public_key } = await pubRes.json();
       const docPub = hexToBytes(public_key);
@@ -535,15 +628,21 @@ function UserPortal() {
         ]),
       );
 
+      // Generate metadata for approve (patient-specific, no tree depth)
+      const approvePayload = { encrypted_dek: encDekStr };
+      const approveMetadata = generateMetadata(approvePayload, ['patient', 'approve_appointment'], 'POST');
+      const approveMetadataHeader = await prepareMetadata(approveMetadata, window.__SIGN_PRIV__); // Sign available
+
       // Send to backend for approval
       const approveRes = await fetch(`/api/pending/${req.id}/approve/`, {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
           "X-CSRFToken": getCookie("csrftoken") || "",
+          "X-Metadata": approveMetadataHeader // Attach as header
         },
         credentials: "include",
-        body: JSON.stringify({ encrypted_dek: encDekStr }),
+        body: JSON.stringify(approvePayload),
       });
       if (!approveRes.ok) throw new Error(await approveRes.text());
       alert("Appointment approved successfully!");
@@ -557,9 +656,16 @@ function UserPortal() {
   const denyAppointment = async (reqId: string) => {
     if (!confirm("Deny this appointment request?")) return;
     try {
+      // Generate metadata for deny (patient-specific, no tree depth)
+      const denyMetadata = generateMetadata({}, ['patient', 'deny_appointment'], 'POST');
+      const denyMetadataHeader = await prepareMetadata(denyMetadata, window.__SIGN_PRIV__); // Sign available
+
       const res = await fetch(`/api/pending/${reqId}/deny/`, {
         method: "POST",
-        headers: { "X-CSRFToken": getCookie("csrftoken") || "" },
+        headers: { 
+          "X-CSRFToken": getCookie("csrftoken") || "",
+          "X-Metadata": denyMetadataHeader // Attach as header
+        },
         credentials: "include",
       });
       if (!res.ok) throw new Error(await res.text());
@@ -577,8 +683,14 @@ const approveFileRequest = async (req: PendingFileRequest) => {
     return;
   }
   try {
+    // Generate metadata for record fetch (patient-specific, tree depth 0 for root)
+    const recordMetadata = generateMetadata({}, ['patient', 'get_record'], 'GET', 0);
+    const recordMetadataHeader = await prepareMetadata(recordMetadata, window.__SIGN_PRIV__); // Sign available
+
     // Fetch current record
-    const recordRes = await fetch("/api/record/my/");
+    const recordRes = await fetch("/api/record/my/", {
+      headers: { "X-Metadata": recordMetadataHeader } // Attach as header
+    });
     if (!recordRes.ok) throw new Error("Failed to fetch record");
     const recordData = await recordRes.json();
     const encDekSelf = recordData.encrypted_deks["self"];
@@ -641,8 +753,14 @@ const approveFileRequest = async (req: PendingFileRequest) => {
       }
     } else {
       // File types: add_text, add_binary, edit_text, edit_binary
+      // Generate metadata for doctor public key fetch (patient-specific, no tree depth)
+      const docPubMetadata = generateMetadata({}, ['patient', 'get_doctor_public_key'], 'GET');
+      const docPubMetadataHeader = await prepareMetadata(docPubMetadata, window.__SIGN_PRIV__); // Sign available
+
       // Fetch doctor's public key for shared secret
-      const pubRes = await fetch(`/api/user/public_key/${req.requester.id}`);
+      const pubRes = await fetch(`/api/user/public_key/${req.requester.id}`, {
+        headers: { "X-Metadata": docPubMetadataHeader } // Attach as header
+      });
       if (!pubRes.ok) throw new Error("Failed to fetch doctor public key");
       const { public_key } = await pubRes.json();
       const docPub = hexToBytes(public_key);
@@ -715,28 +833,40 @@ const approveFileRequest = async (req: PendingFileRequest) => {
       privileges: 'patient',
       tree_depth: calculateMaxDepth(dir),
     };
+
+    // Generate metadata for record update (patient-specific, tree depth from max)
+    const updatePayload = {
+      encrypted_data: newEncB64,
+      encrypted_deks: recordData.encrypted_deks,
+      signature: newSigB64,
+      metadata,
+    };
+    const updateMetadataObj = generateMetadata(updatePayload, ['patient', 'update_record'], 'POST', calculateMaxDepth(dir));
+    const updateMetadataHeader = await prepareMetadata(updateMetadataObj, window.__SIGN_PRIV__); // Sign available
+
     // Update record
     const updateRes = await fetch("/api/record/update/", {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
         "X-CSRFToken": getCookie("csrftoken") || "",
+        "X-Metadata": updateMetadataHeader // Attach as header
       },
       credentials: "include",
-      body: JSON.stringify({
-        encrypted_data: newEncB64,
-        encrypted_deks: recordData.encrypted_deks,
-        signature: newSigB64,
-        metadata,
-      }),
+      body: JSON.stringify(updatePayload),
     });
     if (!updateRes.ok) throw new Error("Failed to update record");
+    // Generate metadata for approve (patient-specific, no tree depth)
+    const approveMetadata = generateMetadata({}, ['patient', 'approve_file_request'], 'POST');
+    const approveMetadataHeader = await prepareMetadata(approveMetadata, window.__SIGN_PRIV__); // Sign available
+
     // Approve request
     const approveRes = await fetch(`/api/pending/${req.id}/approve/`, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
         "X-CSRFToken": getCookie("csrftoken") || "",
+        "X-Metadata": approveMetadataHeader // Attach as header
       },
       credentials: "include",
     });
@@ -777,9 +907,16 @@ function getParent(root: any, parts: string[]): any {
   const denyFileRequest = async (reqId: string) => {
     if (!confirm("Deny this file change request?")) return;
     try {
+      // Generate metadata for deny (patient-specific, no tree depth)
+      const denyMetadata = generateMetadata({}, ['patient', 'deny_file_request'], 'POST');
+      const denyMetadataHeader = await prepareMetadata(denyMetadata, window.__SIGN_PRIV__); // Sign available
+
       const res = await fetch(`/api/pending/${reqId}/deny/`, {
         method: "POST",
-        headers: { "X-CSRFToken": getCookie("csrftoken") || "" },
+        headers: { 
+          "X-CSRFToken": getCookie("csrftoken") || "",
+          "X-Metadata": denyMetadataHeader // Attach as header
+        },
         credentials: "include",
       });
       if (!res.ok) throw new Error(await res.text());
