@@ -1,14 +1,5 @@
-# Secure Medical Records System
 
-## Group Members
-
-| Matricule | Name              |
-|-----------|-------------------|
-| 519237    | Peetroons Simon   |
-| 604350    | Andrianirina Mino |
-| 615056    | Botton David      |
-| 616822    | Gerday Léandre    |
-| 617441    | Varga Ferenc      |
+<img width="2523" height="1479" alt="image" src="https://github.com/user-attachments/assets/3ce4938e-37e7-47ea-bb84-eda689b4ee81" />
 
 ## Prerequisites
 
@@ -27,7 +18,9 @@ To build and run this project, you must fulfill certain requirements:
 
 The project is designed to build and run on an x64 Ubuntu 22.04 distribution or an x64 Windows 10 machine.
 
+
 ## Building and Running the Project
+
 
 1. Clone the repository to your local machine.
 
